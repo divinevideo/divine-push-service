@@ -1,4 +1,4 @@
-use crate::{config::FcmSettings, error::Result, models::FcmPayload};
+use crate::{error::Result, models::FcmPayload};
 use async_trait::async_trait;
 use firebase_messaging_rs::{
     fcm::{FCMApi, FCMError as FirebaseFCMError, Message, Notification},
@@ -190,12 +190,10 @@ pub struct FcmClient {
 }
 
 impl FcmClient {
-    // Updated new to initialize with the RealFcmClient implementation
-    pub fn new(settings: &FcmSettings) -> Result<Self, FcmError> {
-        // Pass the project_id to RealFcmClient
-        // The library will use this instead of GOOGLE_CLOUD_PROJECT env var
-        let real_client = RealFcmClient::new(&settings.project_id)?;
-        tracing::info!("Initialized FCM client for project: {}", settings.project_id);
+    /// Create a new FCM client for the given project ID
+    pub fn new(project_id: &str) -> Result<Self, FcmError> {
+        let real_client = RealFcmClient::new(project_id)?;
+        tracing::info!("Initialized FCM client for project: {}", project_id);
         Ok(FcmClient {
             client: Box::new(real_client),
         })

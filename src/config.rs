@@ -8,82 +8,100 @@ pub struct Settings {
     pub nostr: NostrSettings,
     pub service: ServiceSettings,
     pub redis: RedisSettings,
-    pub apps: Vec<AppConfig>,
+    pub app: AppConfig,  // Single app instead of Vec<AppConfig>
     pub cleanup: CleanupSettings,
     #[serde(default = "default_server_settings")]
     pub server: ServerSettings,
     #[serde(default)]
-    pub notification: Option<NotificationSettings>,
+    pub notification: NotificationSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NostrSettings {
     pub relay_url: String,
-    pub cache_expiration: Option<u64>,
+    #[serde(default)]
+    pub profile_relays: Vec<String>,
+    #[serde(default = "default_profile_cache_ttl")]
+    pub profile_cache_ttl_secs: u64,
+    #[serde(default = "default_query_timeout")]
+    pub query_timeout_secs: u64,
+}
+
+fn default_profile_cache_ttl() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_query_timeout() -> u64 {
+    3
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServiceSettings {
     pub private_key_hex: Option<String>,
+    #[serde(default = "default_process_window_days")]
     pub process_window_days: i64,
+    #[serde(default = "default_processed_event_ttl")]
     pub processed_event_ttl_secs: u64,
-    pub control_kinds: Vec<u64>,  // Push control events (3079-3082)
-    pub dm_kinds: Vec<u64>,        // DM kinds to monitor globally (1059, 14)
+}
+
+fn default_process_window_days() -> i64 {
+    7
+}
+
+fn default_processed_event_ttl() -> u64 {
+    604800 // 7 days
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RedisSettings {
-    pub url: String, // Loaded via env var typically
+    pub url: String,
+    #[serde(default = "default_pool_size")]
     pub connection_pool_size: u32,
 }
 
+fn default_pool_size() -> u32 {
+    10
+}
+
 #[derive(Debug, Deserialize, Clone)]
-pub struct FrontendConfig {
-    pub api_key: String,
-    pub auth_domain: String,
+pub struct FirebaseConfig {
     pub project_id: String,
-    pub storage_bucket: String,
-    pub messaging_sender_id: String,
-    pub app_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub measurement_id: Option<String>,
-    pub vapid_public_key: String,
+    pub credentials_path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub name: String,
-    pub frontend_config: FrontendConfig,
-    pub credentials_path: String,  // Required - must be specified in config
-    #[serde(default)]
-    pub allowed_subscription_kinds: Vec<u64>,  // Whitelist for user subscriptions per app
-}
-
-// Keep FcmSettings for backward compatibility with FcmClient
-#[derive(Debug, Deserialize, Clone)]
-pub struct FcmSettings {
-    pub project_id: String,
+    pub package: String,  // App package name (e.g., co.openvine.app)
+    pub firebase: FirebaseConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CleanupSettings {
+    #[serde(default = "default_cleanup_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_cleanup_interval")]
     pub interval_secs: u64,
+    #[serde(default = "default_token_max_age")]
     pub token_max_age_days: i64,
+}
+
+fn default_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_cleanup_interval() -> u64 {
+    86400 // 1 day
+}
+
+fn default_token_max_age() -> i64 {
+    90
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerSettings {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct NotificationSettings {
-    pub profile_relays: Vec<String>,
-    pub profile_cache_ttl_secs: u64,
-    pub group_meta_cache_ttl_secs: u64,
-    pub query_timeout_secs: u64,
 }
 
 fn default_server_settings() -> ServerSettings {
@@ -96,26 +114,76 @@ fn default_listen_addr() -> String {
     "0.0.0.0:8000".to_string()
 }
 
+/// Notification configuration for diVine
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct NotificationSettings {
+    /// Event kinds to subscribe to for notifications
+    #[serde(default = "default_event_kinds")]
+    pub event_kinds: Vec<u64>,
+    /// Default notification preferences for new users
+    #[serde(default)]
+    pub default_preferences: DefaultPreferences,
+}
+
+fn default_event_kinds() -> Vec<u64> {
+    vec![
+        1,     // Text notes (comments, mentions)
+        3,     // Contact list (follows)
+        7,     // Reactions/likes (NIP-25)
+        16,    // Generic reposts (NIP-18)
+        30023, // Long-form content (mentions)
+    ]
+}
+
+/// Default notification preferences
+#[derive(Debug, Deserialize, Clone)]
+pub struct DefaultPreferences {
+    #[serde(default = "default_true")]
+    pub likes: bool,
+    #[serde(default = "default_true")]
+    pub comments: bool,
+    #[serde(default = "default_true")]
+    pub follows: bool,
+    #[serde(default = "default_true")]
+    pub mentions: bool,
+    #[serde(default = "default_true")]
+    pub reposts: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for DefaultPreferences {
+    fn default() -> Self {
+        Self {
+            likes: true,
+            comments: true,
+            follows: true,
+            mentions: true,
+            reposts: true,
+        }
+    }
+}
+
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         let config_dir = std::env::current_dir().expect("Failed to get current dir");
-        
+
         // Default to development environment for safety
         let env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
-        
+
         // Select config file based on environment
         let config_filename = match env.as_str() {
             "production" => "settings.yaml",
             "development" => "settings.development.yaml",
             other => {
                 // For any other environment, try settings.{env}.yaml
-                // This allows for staging, test, etc.
                 &format!("settings.{}.yaml", other)
             }
         };
-        
+
         let config_path = config_dir.join("config").join(config_filename);
-        
 
         let s = config::Config::builder()
             .add_source(config::File::from(config_path).required(true))
@@ -126,19 +194,11 @@ impl Settings {
         s.try_deserialize()
     }
 
-    // Helper method to get service keys (for relay auth and NIP-44 encryption)
+    /// Get service keys for relay auth and NIP-44 encryption
     pub fn get_service_keys(&self) -> Option<nostr_sdk::Keys> {
-        // It will be overridden by NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX if set.
         let key_hex = self.service.private_key_hex.as_deref()?;
         let secret_key = nostr_sdk::SecretKey::from_hex(key_hex).ok()?;
         Some(nostr_sdk::Keys::new(secret_key))
-    }
-
-    // Helper method to get the private key for NIP-29
-    pub fn get_nostr_private_key(&self) -> Option<nostr_sdk::SecretKey> {
-        // Use the same private_key_hex from ServiceSettings
-        let key_hex = self.service.private_key_hex.as_deref()?;
-        nostr_sdk::SecretKey::from_hex(key_hex).ok()
     }
 }
 
@@ -147,36 +207,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_config_loads_with_new_fields() {
-        // This test verifies that the config loads with the new frontend_config structure
-        let result = Settings::new();
-        
-        match result {
-            Ok(settings) => {
-                // Verify control_kinds contains the push control events
-                assert_eq!(settings.service.control_kinds, vec![3079, 3080, 3081, 3082]);
-                
-                // Verify dm_kinds contains the encrypted DM kinds
-                assert_eq!(settings.service.dm_kinds, vec![1059, 4]);
-                
-                // Verify frontend_config for nostrpushdemo app
-                let nostrpushdemo = settings.apps.iter().find(|app| app.name == "nostrpushdemo").unwrap();
-                assert_eq!(nostrpushdemo.frontend_config.project_id, "plur-push-local");
-                assert_eq!(nostrpushdemo.frontend_config.api_key, "AIzaSyBVZr13kC2niDhmJX2E0oMhGRlDqmC1wSA");
-                assert_eq!(nostrpushdemo.frontend_config.vapid_public_key, "BPVz4oPf--UKQHFkooAq1SROioo2AmaQ_e98wwjTtsHnfhB_wV2VL1cLzgTZKl3p9c-Ueev_0BNeMIvoCUz2LrM");
-                assert_eq!(nostrpushdemo.allowed_subscription_kinds, vec![4, 9, 1059]);
-                
-                // Verify frontend_config for universes app
-                let universes = settings.apps.iter().find(|app| app.name == "universes").unwrap();
-                assert_eq!(universes.frontend_config.project_id, "universes-2bc44");
-                assert_eq!(universes.frontend_config.api_key, "AIzaSyACtVJJqIGM-lIsALzXggdGJRpxl31U0iQ");
-                assert_eq!(universes.frontend_config.vapid_public_key, "BNPu0TK2qLDu-TiW09NqNU8QGeQuLSyZ87fPJm9wMwYsIA2bt6Bzi5IfmA0NmhQNa5jaSnH_tsmLEw6t5OMR4H8");
-                assert_eq!(universes.allowed_subscription_kinds, vec![3, 4, 6, 7, 1059, 1111, 4552, 30023, 34550, 34551, 34552, 34553, 9735]);
-                
-            }
-            Err(e) => {
-                panic!("Failed to load config: {}", e);
-            }
-        }
+    fn test_default_preferences() {
+        let prefs = DefaultPreferences::default();
+        assert!(prefs.likes);
+        assert!(prefs.comments);
+        assert!(prefs.follows);
+        assert!(prefs.mentions);
+        assert!(prefs.reposts);
+    }
+
+    #[test]
+    fn test_default_event_kinds() {
+        let kinds = default_event_kinds();
+        assert!(kinds.contains(&1));   // Text notes
+        assert!(kinds.contains(&3));   // Contact list
+        assert!(kinds.contains(&7));   // Reactions
+        assert!(kinds.contains(&16));  // Reposts
+        assert!(kinds.contains(&30023)); // Long-form
     }
 }

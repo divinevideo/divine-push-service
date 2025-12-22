@@ -40,7 +40,7 @@ redis = { version = "0.29.5", features = ["connection-manager", "tls-rustls", "t
 bb8-redis = { version = "0.21.0" }
 
 # --- Nostr ---
-nostr-sdk = { version = "0.41.0", features = ["nip44"] }
+nostr-sdk = { version = "0.44", features = ["nip44"] }
 hex = "0.4.3"
 url = "2.5"
 regex = "1.10"
@@ -71,7 +71,7 @@ url = "2.5"
 # Remove nostr-relay
 # nostr-relay = { version = "0.4.7", package = "nostr-relay" }
 # Add nostr-relay-builder back
-nostr-relay-builder = { version = "0.40.0", package = "nostr-relay-builder" }
+nostr-relay-builder = { version = "0.44", package = "nostr-relay-builder" }
 nostr_push_service = { path = "." }
 # serial_test = "3.2.0" # Removed - tests now run in parallel with isolated Redis databases
 # testcontainers = "0.20.0" # Removed

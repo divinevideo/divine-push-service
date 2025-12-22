@@ -75,6 +75,23 @@ impl MentionParserService {
         }
     }
 
+    /// Get the display name for a pubkey (hex format).
+    ///
+    /// Returns the display_name or name from profile, or None if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis connection fails.
+    pub async fn get_display_name(&self, pubkey_hex: &str) -> Result<Option<String>> {
+        let profiles = self.fetch_profiles_batch(&[pubkey_hex.to_string()]).await?;
+
+        if let Some(profile) = profiles.get(pubkey_hex) {
+            Ok(profile.display_name.clone().or_else(|| profile.name.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Format content by replacing npub mentions with friendly names.
     ///
     /// Extracts mentions, fetches profiles (with caching), and replaces

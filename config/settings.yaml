@@ -1,97 +1,49 @@
+# diVine Push Service - Production Configuration
+
 nostr:
-  relay_url: "wss://communities2.nos.social" # URL of the NIP-29 relay to connect to
-  # Relay's private key (needed for NIP-29 access - !! HANDLE SECURELY !!)
-  # It's better to load this from env var or secrets manager
-  # relay_private_key_hex: "relay_private_key_hex_here"
+  relay_url: "wss://relay.divine.video"
+  profile_relays:
+    - wss://relay.divine.video
+    - wss://purplepag.es
+  profile_cache_ttl_secs: 300
+  query_timeout_secs: 3
 
 service:
-  # Service's own keypair (used for NIP-42 auth if needed, separate from relay's key)
-  # Better to load from env var or secrets manager
-  # service_private_key_hex: "service_private_key_hex_here"
-  control_kinds: # Push control events (globally subscribed)
-    - 3079  # Push token registration
-    - 3080  # Push token deregistration
-    - 3081  # Notification filter upsert
-    - 3082  # Notification filter delete
-  dm_kinds: # Direct message kinds (globally subscribed, can't filter by author due to encryption)
-    - 1059  # NIP-44 gift-wrapped DMs
-    - 4     # NIP-4 private DMs
-  process_window_days: 7 # How far back to look for missed events on startup
-  processed_event_ttl_secs: 604800 # 7 days TTL for processed event IDs
+  # Service's own keypair for NIP-42 auth and NIP-44 encryption
+  # Load from env: NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX
+  process_window_days: 7
+  processed_event_ttl_secs: 604800  # 7 days
 
 redis:
-  url: "redis://127.0.0.1:6379" # Default URL, overridden by REDIS_URL env var if set
+  url: "redis://127.0.0.1:6379"  # Override with NOSTR_PUSH__REDIS__URL
   connection_pool_size: 10
 
-apps:
-  - name: "nostrpushdemo"
-    frontend_config:
-      api_key: "AIzaSyBVZr13kC2niDhmJX2E0oMhGRlDqmC1wSA"
-      auth_domain: "plur-push-local.firebaseapp.com"
-      project_id: "plur-push-local"
-      storage_bucket: "plur-push-local.firebasestorage.app"
-      messaging_sender_id: "103876204196"
-      app_id: "1:103876204196:web:d7a1a1bebbdf6e6b75b831"
-      vapid_public_key: "BPVz4oPf--UKQHFkooAq1SROioo2AmaQ_e98wwjTtsHnfhB_wV2VL1cLzgTZKl3p9c-Ueev_0BNeMIvoCUz2LrM"
-    # K8s: /app/secrets/firebase-nostrpushdemo.json
-    # Local: ./firebase-service-account-nostrpushdemo.json
-    credentials_path: "/app/secrets/firebase-nostrpushdemo.json"
-    allowed_subscription_kinds: # Kinds this app can subscribe to via user filters
-      - 9
-
-  - name: "universes"
-    frontend_config:
-      api_key: "AIzaSyACtVJJqIGM-lIsALzXggdGJRpxl31U0iQ"
-      auth_domain: "universes-2bc44.firebaseapp.com"
-      project_id: "universes-2bc44"
-      storage_bucket: "universes-2bc44.firebasestorage.app"
-      messaging_sender_id: "139132462562"
-      app_id: "1:139132462562:web:59ef4ec6aab3791cba05bb"
-      vapid_public_key: "BNPu0TK2qLDu-TiW09NqNU8QGeQuLSyZ87fPJm9wMwYsIA2bt6Bzi5IfmA0NmhQNa5jaSnH_tsmLEw6t5OMR4H8"
-    # K8s: /app/secrets/firebase-universes.json
-    # Local: ./firebase-service-account-universes.json
-    credentials_path: "/app/secrets/firebase-universes.json"
-    allowed_subscription_kinds: # Kinds this app can subscribe to via user filters
-      - 3     # Contacts
-      - 4     # NIP-4 private DMs
-      - 6     # Reposts
-      - 7     # Reactions
-      - 1059  # NIP-44 gift-wrapped DMs
-      - 1111  # Comments/messages in communities (NIP-22)
-      - 4552  # Join requests (moderator notifications)
-      - 30023 # Long-form content
-      - 34550 # Community definitions (NIP-72)
-      - 34551 # Approved members list updates
-      - 34552 # Declined members list updates
-      - 34553 # Banned members list updates
-      - 9735  # Zaps
-
-  - name: "peek"
-    frontend_config:
-      api_key: "AIzaSyBh7apbudr8p4sAkaV22YqhofYLE3VrQo8"
-      auth_domain: "peek-afe3d.firebaseapp.com"
-      project_id: "peek-afe3d"
-      storage_bucket: "peek-afe3d.firebasestorage.app"
-      messaging_sender_id: "784762775027"
-      app_id: "1:784762775027:web:3fcfca122fc107d2655e86"
-      measurement_id: "G-YZV5FC13Q0"
-      vapid_public_key: "BJqaEQtkAj3PmdQ7iHleib_fA9Fpu4v5nPqGm-tw4AjS8HTOcGvsqjhhSHJo-S3Dp-zpQNyOj1uAxHLjuWsyJTw"
-    # K8s: /app/secrets/firebase-peek.json
-    # Local: ./firebase-service-account-peek.json
-    credentials_path: "/app/secrets/firebase-peek.json"
-    allowed_subscription_kinds: # Kinds this app can subscribe to via user filters
-      - 9     # Zap goals / fundraising events
+app:
+  name: "divine"
+  package: "co.openvine.app"  # Historical - required for Firebase integration
+  firebase:
+    project_id: "openvine-co"
+    credentials_path: "/app/secrets/firebase-divine.json"
 
 cleanup:
   enabled: true
-  interval_secs: 86400 # Run once a day
+  interval_secs: 86400  # Run once a day
   token_max_age_days: 90
 
 notification:
-  profile_relays:
-    - wss://relay.nos.social
-    - wss://purplepag.es
-    - wss://relay.damus.io
-  profile_cache_ttl_secs: 300 # 5 minutes (faster profile updates)
-  group_meta_cache_ttl_secs: 300 # 5 minutes (faster metadata updates)
-  query_timeout_secs: 3
+  # Event kinds to subscribe to for notification triggers
+  event_kinds:
+    - 1      # Text notes (comments, mentions)
+    - 3      # Contact list (follows)
+    - 7      # Reactions/likes (NIP-25)
+    - 16     # Generic reposts (NIP-18)
+    - 30023  # Long-form content (mentions)
+  default_preferences:
+    likes: true
+    comments: true
+    follows: true
+    mentions: true
+    reposts: true
+
+server:
+  listen_addr: "0.0.0.0:8000"

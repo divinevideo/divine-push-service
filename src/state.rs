@@ -1,36 +1,28 @@
+//! Application state for diVine Push Service
+
 use crate::{
     config::Settings,
     crypto::CryptoService,
     error::Result,
     fcm_sender::FcmClient,
-    handlers::CommunityHandler,
     redis_store::{self, RedisPool},
     services::mention_parser::MentionParserService,
-    subscriptions::SubscriptionManager,
 };
-use nostr_sdk::{Client, Keys, Options, SubscriptionId};
-use std::{collections::{HashMap, HashSet}, env, sync::Arc};
-use tokio::sync::RwLock;
+use nostr_sdk::{Client, ClientOptions, Keys};
+use std::{env, sync::Arc};
 use tracing::{info, warn};
 
 use crate::error::ServiceError;
-use crate::nostr::nip29::{init_nip29_client, Nip29Client};
 
-/// Shared application state
+/// Shared application state for diVine Push Service
 pub struct AppState {
     pub settings: Settings,
     pub redis_pool: RedisPool,
-    pub fcm_clients: HashMap<String, Arc<FcmClient>>,
-    pub supported_apps: HashSet<String>,
+    pub fcm_client: Arc<FcmClient>,
     pub service_keys: Option<Keys>,
     pub crypto_service: Option<CryptoService>,
-    pub nip29_client: Arc<Nip29Client>,
-    pub nostr_client: Arc<Client>,  // Shared nostr client for direct subscription management
-    pub profile_client: Arc<Client>,  // Dedicated client for profile/metadata queries
-    pub user_subscriptions: Arc<RwLock<HashMap<String, SubscriptionId>>>,  // filter_hash -> SubscriptionId
-    pub subscription_manager: Arc<SubscriptionManager>,
-    pub community_handler: Arc<CommunityHandler>,
-    pub notification_config: Option<crate::config::NotificationSettings>,
+    pub nostr_client: Arc<Client>,
+    pub profile_client: Arc<Client>,
     pub mention_parser_service: Option<Arc<MentionParserService>>,
 }
 
@@ -39,196 +31,112 @@ impl AppState {
         // Determine Redis URL: prioritize REDIS_URL env var over settings
         let redis_url = match env::var("REDIS_URL") {
             Ok(url_from_env) => {
-                tracing::info!("Using Redis URL from REDIS_URL environment variable");
+                info!("Using Redis URL from REDIS_URL environment variable");
                 url_from_env
             }
             Err(_) => {
-                tracing::info!(
-                    "REDIS_URL environment variable not set. Using Redis URL from settings"
-                );
+                info!("REDIS_URL not set, using Redis URL from settings");
                 settings.redis.url.clone()
             }
         };
 
         let redis_pool =
             redis_store::create_pool(&redis_url, settings.redis.connection_pool_size).await?;
-        
-        // Initialize FCM clients for each configured app
-        // 
-        // IMPORTANT: Credential Handling Workaround
-        // ==========================================
-        // The firebase-messaging-rs library uses gcloud-sdk which only supports reading credentials
-        // from environment variables (GOOGLE_APPLICATION_CREDENTIALS) via TokenSourceType::Default.
-        // 
-        // Since we need different service accounts for different Firebase projects (each project
-        // requires its own service account with appropriate permissions), we implement a sequential
-        // initialization workaround:
-        // 
-        // 1. Set GOOGLE_APPLICATION_CREDENTIALS for app N
-        // 2. Create FCM client for app N (reads credentials at creation time)
-        // 3. Clear/reset env var for next app
-        // 
-        // This is safe because:
-        // - It happens once at startup before any concurrent operations
-        // - Each FCM client captures its credentials during initialization
-        // - Once created, clients don't re-read the env var
-        // 
-        // TODO: This could be improved if firebase-messaging-rs exposed TokenSourceType::File
-        // or TokenSourceType::Json to allow passing credentials directly without env var manipulation.
-        // See: https://github.com/i10416/firebase-messaging-rs/issues/[TODO]
-        
-        let mut fcm_clients = HashMap::new();
-        let mut supported_apps = HashSet::new();
-        
-        for app_config in settings.apps.iter() {
-            // Use the credentials path from configuration (required field)
-            let credentials_path = &app_config.credentials_path;
-            
-            // Set GOOGLE_APPLICATION_CREDENTIALS for the library to use
-            env::set_var("GOOGLE_APPLICATION_CREDENTIALS", credentials_path);
-            tracing::info!("Setting credentials path for app '{}': {}", app_config.name, credentials_path);
-            
-            // Create FCM client for this app with its specific project_id
-            let fcm_settings = crate::config::FcmSettings {
-                project_id: app_config.frontend_config.project_id.clone(),
-            };
-            
-            match FcmClient::new(&fcm_settings) {
-                Ok(client) => {
-                    fcm_clients.insert(app_config.name.clone(), Arc::new(client));
-                    supported_apps.insert(app_config.name.clone());
-                    tracing::info!("Initialized FCM client for app '{}' with project '{}'", 
-                                 app_config.name, app_config.frontend_config.project_id);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to initialize FCM client for app {} (credentials: {}): {}", 
-                                  app_config.name, credentials_path, e);
-                }
-            }
-        }
-        
-        if fcm_clients.is_empty() {
-            tracing::error!("No FCM clients initialized - push notifications will not work");
-        } else {
-            tracing::info!("Initialized {} FCM client(s) for {} app(s)", 
-                         fcm_clients.len(), supported_apps.len());
-        }
+
+        // Initialize FCM client for diVine
+        let app_config = &settings.app;
+
+        // Set credentials from config
+        env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &app_config.firebase.credentials_path);
+        info!(
+            "Setting Firebase credentials for '{}': {}",
+            app_config.name, app_config.firebase.credentials_path
+        );
+
+        let fcm_client = FcmClient::new(&app_config.firebase.project_id)
+            .map_err(|e| {
+                ServiceError::Internal(format!(
+                    "Failed to initialize FCM client for {}: {}",
+                    app_config.name, e
+                ))
+            })?;
+
+        info!(
+            "Initialized FCM client for '{}' with project '{}'",
+            app_config.name, app_config.firebase.project_id
+        );
+
         let service_keys = settings.get_service_keys();
-        
+
         // Create crypto service if we have service keys
-        let crypto_service = service_keys.as_ref().map(|keys| {
-            CryptoService::new(keys.clone())
-        });
-        
-        let nip29_client = init_nip29_client(&settings).await.map_err(|e| {
-            ServiceError::Internal(format!("Failed to initialize Nip29Client: {}", e))
-        })?;
+        let crypto_service = service_keys.as_ref().map(|keys| CryptoService::new(keys.clone()));
 
-        if fcm_clients.is_empty() {
-            tracing::warn!("No FCM clients initialized. Push notifications will not work.");
-        }
-        
-        // Initialize subscription manager and community handler
-        let subscription_manager = Arc::new(SubscriptionManager::new());
-        let community_handler = Arc::new(CommunityHandler::new());
-        
-        // Get the nostr client from nip29_client
-        let nostr_client = nip29_client.client();
-
-        // Clone notification config for use in event handler
-        let notification_config = settings.notification.clone();
-
-        // Create dedicated profile client for metadata queries
-        let profile_client = if let Some(ref notification_config) = notification_config {
+        // Create nostr client for event subscriptions
+        let nostr_client = {
             let client = Client::default();
-            for relay_url in &notification_config.profile_relays {
-                if let Err(e) = client.add_relay(relay_url).await {
-                    warn!("Failed to add profile relay {}: {}", relay_url, e);
-                } else {
-                    info!("Added profile relay: {}", relay_url);
-                }
+            if let Err(e) = client.add_relay(&settings.nostr.relay_url).await {
+                warn!(
+                    relay_url = %settings.nostr.relay_url,
+                    error = %e,
+                    "Failed to add main relay"
+                );
+            } else {
+                info!(relay_url = %settings.nostr.relay_url, "Added main relay");
             }
-
-            // Connect to relays
             client.connect().await;
             Arc::new(client)
-        } else {
-            // Fallback to nip29 client if no profile config
-            warn!("No notification config - profile queries will use groups relay");
-            nip29_client.client()
         };
 
-        // Initialize the shared user subscriptions map
-        let user_subscriptions = Arc::new(RwLock::new(HashMap::new()));
+        // Create dedicated profile client for metadata queries
+        let profile_client = {
+            let profile_opts = ClientOptions::default();
 
-        // DEBUG: Log whether notification config loaded successfully
-        if let Some(ref config) = notification_config {
-            info!(
-                "✅ Notification config loaded - profile_relays: {:?}, profile_cache_ttl: {}s, group_cache_ttl: {}s",
-                config.profile_relays,
-                config.profile_cache_ttl_secs,
-                config.group_meta_cache_ttl_secs
-            );
-        } else {
-            warn!("⚠️  Notification config is None - rich notifications DISABLED. Check settings.yaml 'notification:' section");
-        }
+            let client = Client::builder().opts(profile_opts).build();
 
-        // Initialize mention parser service if notification config is available
-        let mention_parser_service = if let Some(ref config) = notification_config {
-            // Create a dedicated client for profile fetching with the configured relays
-            let profile_client_opts = Options::default()
-                .autoconnect(true)
-                .automatic_authentication(false);
-            
-            let profile_client = Client::builder()
-                .opts(profile_client_opts)
-                .build();
-            
-            // Add all profile relays
-            for relay_url in &config.profile_relays {
-                if let Err(e) = profile_client.add_relay(relay_url).await {
+            // Add profile relays
+            for relay_url in &settings.nostr.profile_relays {
+                if let Err(e) = client.add_relay(relay_url).await {
                     warn!(relay_url = %relay_url, error = %e, "Failed to add profile relay");
                 } else {
-                    info!(relay_url = %relay_url, "Added profile relay for mention parser");
+                    info!(relay_url = %relay_url, "Added profile relay");
                 }
             }
-            
-            // Connect to the relays
-            profile_client.connect().await;
-            
-            // Wait a bit for connections to establish
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            
-            Some(Arc::new(MentionParserService::new(
-                redis_pool.clone(),
-                Arc::new(profile_client),
-                config.profile_cache_ttl_secs,
-            )))
-        } else {
-            None
+
+            // Also add main relay as fallback
+            let _ = client.add_relay(&settings.nostr.relay_url).await;
+
+            client.connect().await;
+            Arc::new(client)
         };
 
-        if mention_parser_service.is_some() {
-            info!("✅ Mention parser service initialized with dedicated profile client");
-        } else {
-            warn!("⚠️  Mention parser service disabled - mentions will not be formatted in notifications");
-        }
+        // Initialize mention parser service
+        let mention_parser_service = {
+            // Wait a bit for connections to establish
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            Some(Arc::new(MentionParserService::new(
+                redis_pool.clone(),
+                profile_client.clone(),
+                settings.nostr.profile_cache_ttl_secs,
+            )))
+        };
+
+        info!("diVine Push Service state initialized successfully");
 
         Ok(AppState {
             settings,
             redis_pool,
-            fcm_clients,
-            supported_apps,
+            fcm_client: Arc::new(fcm_client),
             service_keys,
             crypto_service,
-            nip29_client,
             nostr_client,
             profile_client,
-            user_subscriptions,
-            subscription_manager,
-            community_handler,
-            notification_config,
             mention_parser_service,
         })
+    }
+
+    /// Get the service public key hex string
+    pub fn service_pubkey_hex(&self) -> Option<String> {
+        self.service_keys.as_ref().map(|k| k.public_key().to_hex())
     }
 }
