@@ -1,24 +1,39 @@
+# Build artifacts
 /target
+
+# Secrets and credentials
 /secrets/
-/local/
-/.claude/
-dump.rdb
-.env.local
-firebase-service-account.json
-firebase-service-account-*.json
+firebase-service-account*.json
 serviceAccountKey.json
 private-key.txt
+*.pem
+*.key
+
+# Deployment configs (keep local)
+/deploy/
+cloudbuild.yaml
+
+# Environment files
+.env*
+!.env.example
 
 # Development artifacts
+dump.rdb
 *.log
+*.rdb
 test_results.txt
 dm_event.json
 prompt-plan.md
-frontend/index_old.html
-frontend/*test*.png
-frontend/*initial*.png
-frontend/*fixed*.png
-frontend/ngrok-*.png
 
-# Documentation and unused files
-CHANGELOG.md
+# Claude Code
+/.claude/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

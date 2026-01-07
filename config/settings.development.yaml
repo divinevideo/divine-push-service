@@ -38,12 +38,14 @@ notification:
     - 7      # Reactions/likes (NIP-25)
     - 16     # Generic reposts (NIP-18)
     - 30023  # Long-form content (mentions)
+  # Default kinds users receive notifications for (can be customized via kind 3083)
   default_preferences:
-    likes: true
-    comments: true
-    follows: true
-    mentions: true
-    reposts: true
+    kinds:
+      - 1      # Text notes (comments, mentions)
+      - 3      # Contact list (follows)
+      - 7      # Reactions/likes
+      - 16     # Reposts
+      - 30023  # Long-form content
 
 server:
   listen_addr: "0.0.0.0:8000"

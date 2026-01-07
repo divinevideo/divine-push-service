@@ -844,4 +844,200 @@ mod tests {
         assert_eq!(truncate_string("hello world!", 5), "hello...");
         assert_eq!(truncate_string("", 5), "");
     }
+
+    // =========================================================================
+    // Recipient Finding Tests
+    // =========================================================================
+
+    #[test]
+    fn test_find_reaction_recipients_with_p_tag() {
+        let sender = Keys::generate();
+        let target = Keys::generate();
+
+        // Create a reaction event with p-tag pointing to target
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::public_key(target.public_key()))
+            .tag(Tag::event(EventId::all_zeros()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let recipients = find_reaction_recipients(&event);
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0], target.public_key());
+    }
+
+    #[test]
+    fn test_find_reaction_recipients_no_p_tag() {
+        let sender = Keys::generate();
+
+        // Create a reaction without p-tag (malformed)
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::event(EventId::all_zeros()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let recipients = find_reaction_recipients(&event);
+        assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn test_find_text_note_recipients_with_mentions() {
+        let sender = Keys::generate();
+        let mentioned1 = Keys::generate();
+        let mentioned2 = Keys::generate();
+
+        let event = EventBuilder::text_note("Hello @someone")
+            .tag(Tag::public_key(mentioned1.public_key()))
+            .tag(Tag::public_key(mentioned2.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let recipients = find_text_note_recipients(&event);
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&mentioned1.public_key()));
+        assert!(recipients.contains(&mentioned2.public_key()));
+    }
+
+    #[test]
+    fn test_find_text_note_recipients_no_mentions() {
+        let sender = Keys::generate();
+
+        let event = EventBuilder::text_note("Just a regular post")
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let recipients = find_text_note_recipients(&event);
+        assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn test_find_repost_recipients() {
+        let sender = Keys::generate();
+        let original_author = Keys::generate();
+
+        // Kind 16 repost with p-tag to original author
+        let event = EventBuilder::new(Kind::from(16), "")
+            .tag(Tag::public_key(original_author.public_key()))
+            .tag(Tag::event(EventId::all_zeros()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let recipients = find_repost_recipients(&event);
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0], original_author.public_key());
+    }
+
+    #[test]
+    fn test_find_mentioned_pubkeys_multiple() {
+        let sender = Keys::generate();
+        let user1 = Keys::generate();
+        let user2 = Keys::generate();
+        let user3 = Keys::generate();
+
+        let event = EventBuilder::text_note("Mentioning several people")
+            .tag(Tag::public_key(user1.public_key()))
+            .tag(Tag::public_key(user2.public_key()))
+            .tag(Tag::public_key(user3.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let pubkeys = find_mentioned_pubkeys(&event);
+        assert_eq!(pubkeys.len(), 3);
+    }
+
+    // =========================================================================
+    // Notification Type Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_comment_vs_mention_detection_comment() {
+        let sender = Keys::generate();
+        let target = Keys::generate();
+
+        // A reply (has e-tag) should be a Comment
+        let reply_event = EventBuilder::text_note("This is a reply")
+            .tag(Tag::event(EventId::all_zeros())) // e-tag makes it a reply
+            .tag(Tag::public_key(target.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let has_e_tag = reply_event.tags.find(TagKind::e()).is_some();
+        assert!(has_e_tag, "Reply should have e-tag");
+    }
+
+    #[test]
+    fn test_comment_vs_mention_detection_mention() {
+        let sender = Keys::generate();
+        let target = Keys::generate();
+
+        // A mention (no e-tag, only p-tag) should be a Mention
+        let mention_event = EventBuilder::text_note("Hey @user check this out")
+            .tag(Tag::public_key(target.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let has_e_tag = mention_event.tags.find(TagKind::e()).is_some();
+        assert!(!has_e_tag, "Mention should not have e-tag");
+    }
+
+    // =========================================================================
+    // Service Targeting Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_event_for_service_targeted() {
+        let sender = Keys::generate();
+        let service = Keys::generate();
+
+        let event = EventBuilder::new(Kind::from(KIND_REGISTRATION), "encrypted_content")
+            .tag(Tag::public_key(service.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        assert!(is_event_for_service(&event, &service.public_key()));
+    }
+
+    #[test]
+    fn test_is_event_for_service_not_targeted() {
+        let sender = Keys::generate();
+        let service = Keys::generate();
+        let other_service = Keys::generate();
+
+        // Event targeted to a different service
+        let event = EventBuilder::new(Kind::from(KIND_REGISTRATION), "encrypted_content")
+            .tag(Tag::public_key(other_service.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        assert!(!is_event_for_service(&event, &service.public_key()));
+    }
+
+    #[test]
+    fn test_is_event_for_service_no_p_tag() {
+        let sender = Keys::generate();
+        let service = Keys::generate();
+
+        // Event without p-tag
+        let event = EventBuilder::new(Kind::from(KIND_REGISTRATION), "encrypted_content")
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        assert!(!is_event_for_service(&event, &service.public_key()));
+    }
+
+    #[test]
+    fn test_is_event_for_service_multiple_p_tags() {
+        let sender = Keys::generate();
+        let service = Keys::generate();
+        let other = Keys::generate();
+
+        // Event with multiple p-tags, one of which is our service
+        let event = EventBuilder::new(Kind::from(KIND_REGISTRATION), "encrypted_content")
+            .tag(Tag::public_key(other.public_key()))
+            .tag(Tag::public_key(service.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        assert!(is_event_for_service(&event, &service.public_key()));
+    }
 }

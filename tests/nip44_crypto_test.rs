@@ -1,5 +1,5 @@
 /// Integration tests for NIP-44 encryption/decryption functionality
-use nostr_push_service::crypto::CryptoService;
+use divine_push_service::crypto::CryptoService;
 use nostr_sdk::prelude::*;
 use serde_json::json;
 

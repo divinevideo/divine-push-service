@@ -1,131 +1,110 @@
-# Nostr Push Service
+# diVine Push Service
 
-A service that implements encrypted push notifications for Nostr clients following the [NIP-XX Push Notifications draft specification](docs/nip-xx-push-notifications.md).
+Push notification service for the [diVine](https://divine.video) mobile app.
 
-## Overview
+Implements [NIP-XX Push Notifications](docs/nip-xx-push-notifications.md) to deliver real-time Nostr event notifications via Firebase Cloud Messaging (FCM).
 
-This service:
-- Listens for encrypted push token registrations from Nostr clients (kinds 3079-3082)
-- Monitors configured relays for events matching user-defined filters
-- Sends push notifications via Firebase Cloud Messaging (FCM) when relevant events occur
-- Supports multiple apps with isolated token management
-- Requires NIP-44 encryption for all tokens (plaintext tokens are rejected)
+## Features
+
+- **Encrypted registration**: NIP-44 encrypted push tokens (plaintext rejected)
+- **User preferences**: Enable/disable notifications by event kind (3083)
+- **Supported notifications**:
+  - Likes (kind 7)
+  - Comments/replies (kind 1)
+  - Follows (kind 3)
+  - Mentions (kind 1 with p-tags)
+  - Reposts (kind 16)
+- **Replay protection**: 7-day horizon ignores old events
+- **Deduplication**: Prevents duplicate notifications
 
 ## Protocol
 
-The service implements four Nostr event kinds:
+Three Nostr event kinds:
 
-- **3079**: Register push token (encrypted)
-- **3080**: Deregister push token (encrypted)  
-- **3081**: Add/update notification filter (encrypted)
-- **3082**: Delete notification filter (encrypted)
+| Kind | Purpose |
+|------|---------|
+| 3079 | Register push token (encrypted) |
+| 3080 | Deregister push token (encrypted) |
+| 3083 | Update notification preferences |
 
-All events must include a `p` tag with the service's public key and use NIP-44 encryption. See the [protocol specification](docs/nip-xx-push-notifications.md) for details.
+Events must include a `p` tag with the service's public key and use NIP-44 encryption.
+
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.85+
+- Redis
+- Firebase project with FCM enabled
+
+### Development
+
+```bash
+# Start Redis
+docker run -d -p 6379:6379 redis:7-alpine
+
+# Configure environment
+export NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX="<your_service_private_key>"
+export NOSTR_PUSH__REDIS__URL="redis://localhost:6379"
+
+# Place Firebase credentials
+cp firebase-service-account.json firebase-service-account-divine.json
+
+# Run
+cargo run
+```
+
+### Docker
+
+```bash
+docker compose up -d
+```
 
 ## Configuration
 
 ### Environment Variables
 
-```bash
-# Required
-NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX="<service_private_key>"  # For NIP-44 decryption
-REDIS_URL="redis://localhost:6379"                            # Token storage
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX` | Yes | Service's Nostr private key (hex) |
+| `NOSTR_PUSH__REDIS__URL` | Yes | Redis connection URL |
+| `RUST_LOG` | No | Log level (default: `info`) |
 
-#### Credential Configuration
+### Config Files
 
-```bash
-# LOCAL DEVELOPMENT - Point to local files:
-export NOSTR_PUSH__APPS__NOSTRPUSHDEMO__CREDENTIALS_PATH="./firebase-service-account-nostrpushdemo.json"
-export NOSTR_PUSH__APPS__UNIVERSES__CREDENTIALS_PATH="./firebase-service-account-universes.json"
-
-# Or just place files with these exact names (auto-detection):
-# - firebase-service-account-nostrpushdemo.json
-# - firebase-service-account-universes.json
-
-# PRODUCTION (K8s) - Point to mounted secret files:
-export NOSTR_PUSH__APPS__NOSTRPUSHDEMO__CREDENTIALS_PATH="/app/secrets/firebase-nostrpushdemo.json"
-export NOSTR_PUSH__APPS__UNIVERSES__CREDENTIALS_PATH="/app/secrets/firebase-universes.json"
-```
-
-### Application Configuration
-
-Configure supported apps in `config/settings.yaml`:
-
-```yaml
-apps:
-  - name: "nostrpushdemo"
-    fcm_project_id: "plur-push-local"
-    
-  - name: "universes"
-    fcm_project_id: "universes-push"  # Your Firebase project ID
-```
-
-Each app needs its own Firebase service account. See `setup-credentials.sh` for configuration options.
-
-## Running the Service
-
-### Docker
-
-```bash
-docker compose build
-docker compose up -d
-```
-
-### Development
-
-```bash
-cargo build --release
-cargo run --release
-```
-
-### Testing
-
-Visit `http://localhost:8000/` for a test interface that demonstrates:
-- Token registration with NIP-44 encryption
-- Subscription management
-- Push notification testing
+- `config/settings.yaml` - Default settings
+- `config/settings.production.yaml` - Production overrides
 
 ## Architecture
 
-1. **Clients** publish encrypted registration events to Nostr relays
-2. **Service** monitors relays and decrypts events targeted to its public key
-3. **Redis** stores pubkey→token mappings with app isolation
-4. **FCM** delivers push notifications to registered devices
-
-## NIP-29 Group Support
-
-The service supports NIP-29 relay-based groups with membership validation:
-
-### Group Membership Validation
-- Validates group membership before sending notifications for group events (h-tag)
-- Queries relay for kind 39002 (group members) events
-- Caches membership data (default: 5 minutes) to reduce relay queries
-- Supports both managed and unmanaged groups
-
-### Custom Subscriptions for Groups
-Users can subscribe to group messages via custom filters:
-```json
-{
-  "kinds": [9],
-  "#h": ["group-id"]
-}
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  diVine App │────▶│ Nostr Relays│◀────│ Push Service│
+└─────────────┘     └─────────────┘     └──────┬──────┘
+                                               │
+                    ┌─────────────┐     ┌──────▼──────┐
+                    │   Firebase  │◀────│    Redis    │
+                    │     FCM     │     │ (tokens)    │
+                    └──────┬──────┘     └─────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Mobile     │
+                    │  Device     │
+                    └─────────────┘
 ```
 
-### Automatic Cleanup
-- Orphaned subscriptions automatically removed when membership check fails
-- Only removes subscriptions specific to that single group (safe for multi-group filters)
-- Self-healing without monitoring moderation events
+1. **diVine app** registers push token via NIP-44 encrypted event to relays
+2. **Push service** monitors relays, decrypts registration, stores token in Redis
+3. **Push service** monitors relays for events matching user's subscriptions
+4. **Push service** sends notification to Firebase FCM
+5. **Firebase** delivers notification to mobile device
 
-### Relay Requirements
-Your NIP-29 relay must:
-- Publish kind 39002 events (group members list) signed by relay key
-- Publish kind 39001 events (group admins) for broadcast validation
-- Support standard NIP-29 group management events
+## API Endpoints
 
-## Security
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check |
 
-- All tokens must be NIP-44 encrypted (plaintext rejected)
-- Tokens are isolated by app ID to prevent cross-app access
-- Invalid tokens are automatically removed on FCM errors
-- Supports token transfer between pubkeys for account switching
+## License
+
+MIT

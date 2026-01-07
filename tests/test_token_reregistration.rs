@@ -1,4 +1,4 @@
-use nostr_push_service::redis_store;
+use divine_push_service::redis_store;
 use nostr_sdk::Keys;
 
 #[tokio::test]

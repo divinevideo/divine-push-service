@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  push-service:
+    build: .
+    container_name: divine-push-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=production
+      - NOSTR_PUSH__REDIS__URL=redis://redis:6379
+      - NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX=${SERVICE_PRIVATE_KEY}
+      - RUST_LOG=info
+    volumes:
+      - ./firebase-service-account-divine.json:/app/secrets/firebase-divine.json:ro
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: divine-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  redis-data:

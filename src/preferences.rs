@@ -1,4 +1,7 @@
 //! User notification preferences management for diVine
+//!
+//! Preferences are stored as a list of event kinds the user wants notifications for.
+//! This is more flexible than boolean fields and aligns with Nostr's kind-centric model.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,24 +9,23 @@ use crate::config::DefaultPreferences;
 use crate::error::{Result, ServiceError};
 use crate::redis_store::RedisPool;
 
-/// User notification preferences
+/// User notification preferences - list of kinds to receive notifications for
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserPreferences {
-    pub likes: bool,
-    pub comments: bool,
-    pub follows: bool,
-    pub mentions: bool,
-    pub reposts: bool,
+    /// Event kinds the user wants to receive notifications for
+    pub kinds: Vec<u16>,
 }
 
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
-            likes: true,
-            comments: true,
-            follows: true,
-            mentions: true,
-            reposts: true,
+            kinds: vec![
+                1,     // Text notes (comments, mentions)
+                3,     // Contact list (follows)
+                7,     // Reactions/likes
+                16,    // Reposts
+                30023, // Long-form content
+            ],
         }
     }
 }
@@ -31,16 +33,19 @@ impl Default for UserPreferences {
 impl From<&DefaultPreferences> for UserPreferences {
     fn from(defaults: &DefaultPreferences) -> Self {
         Self {
-            likes: defaults.likes,
-            comments: defaults.comments,
-            follows: defaults.follows,
-            mentions: defaults.mentions,
-            reposts: defaults.reposts,
+            kinds: defaults.kinds.clone(),
         }
     }
 }
 
-/// Notification type enum for matching events to preferences
+impl UserPreferences {
+    /// Check if a specific kind is enabled
+    pub fn is_kind_enabled(&self, kind: u16) -> bool {
+        self.kinds.contains(&kind)
+    }
+}
+
+/// Notification type enum for display purposes and kind mapping
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationType {
     Like,
@@ -51,15 +56,20 @@ pub enum NotificationType {
 }
 
 impl NotificationType {
+    /// Get the event kind this notification type corresponds to
+    pub fn kind(&self) -> u16 {
+        match self {
+            NotificationType::Like => 7,
+            NotificationType::Comment => 1,
+            NotificationType::Follow => 3,
+            NotificationType::Mention => 1, // Same as Comment - both are kind 1
+            NotificationType::Repost => 16,
+        }
+    }
+
     /// Check if this notification type is enabled for the user
     pub fn is_enabled(&self, prefs: &UserPreferences) -> bool {
-        match self {
-            NotificationType::Like => prefs.likes,
-            NotificationType::Comment => prefs.comments,
-            NotificationType::Follow => prefs.follows,
-            NotificationType::Mention => prefs.mentions,
-            NotificationType::Repost => prefs.reposts,
-        }
+        prefs.is_kind_enabled(self.kind())
     }
 
     /// Get a display name for the notification type
@@ -74,7 +84,7 @@ impl NotificationType {
     }
 }
 
-/// Redis keys for user preferences
+/// Redis key prefix for user preferences
 const PREFERENCES_KEY_PREFIX: &str = "user_preferences:";
 
 /// Build the Redis key for a user's preferences
@@ -90,34 +100,31 @@ pub async fn get_user_preferences(
 ) -> Result<UserPreferences> {
     use redis::AsyncCommands;
 
-    let mut conn = pool.get().await.map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
     let key = build_preferences_key(pubkey);
 
-    // Try to get all preference fields from the hash
-    let result: redis::RedisResult<Vec<Option<String>>> = conn
-        .hget(
-            &key,
-            &["likes", "comments", "follows", "mentions", "reposts"],
-        )
-        .await;
+    // Get JSON string from Redis
+    let result: Option<String> = conn.get(&key).await.map_err(ServiceError::Redis)?;
 
     match result {
-        Ok(values) => {
-            // If any values are present, use them; otherwise use defaults
-            let has_any = values.iter().any(|v| v.is_some());
-            if has_any {
-                Ok(UserPreferences {
-                    likes: values[0].as_ref().map(|v| v == "true").unwrap_or(defaults.likes),
-                    comments: values[1].as_ref().map(|v| v == "true").unwrap_or(defaults.comments),
-                    follows: values[2].as_ref().map(|v| v == "true").unwrap_or(defaults.follows),
-                    mentions: values[3].as_ref().map(|v| v == "true").unwrap_or(defaults.mentions),
-                    reposts: values[4].as_ref().map(|v| v == "true").unwrap_or(defaults.reposts),
-                })
-            } else {
-                Ok(UserPreferences::from(defaults))
+        Some(json_str) => {
+            // Parse JSON into UserPreferences
+            match serde_json::from_str(&json_str) {
+                Ok(prefs) => Ok(prefs),
+                Err(e) => {
+                    tracing::warn!(
+                        pubkey = pubkey,
+                        error = %e,
+                        "Failed to parse stored preferences, returning defaults"
+                    );
+                    Ok(UserPreferences::from(defaults))
+                }
             }
         }
-        Err(_) => Ok(UserPreferences::from(defaults)),
+        None => Ok(UserPreferences::from(defaults)),
     }
 }
 
@@ -129,38 +136,33 @@ pub async fn set_user_preferences(
 ) -> Result<()> {
     use redis::AsyncCommands;
 
-    let mut conn = pool.get().await.map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
     let key = build_preferences_key(pubkey);
 
-    let _: () = conn
-        .hset_multiple(
-            &key,
-            &[
-                ("likes", prefs.likes.to_string()),
-                ("comments", prefs.comments.to_string()),
-                ("follows", prefs.follows.to_string()),
-                ("mentions", prefs.mentions.to_string()),
-                ("reposts", prefs.reposts.to_string()),
-                ("updated_at", chrono::Utc::now().timestamp().to_string()),
-            ],
-        )
-        .await
-        .map_err(crate::error::ServiceError::Redis)?;
+    // Serialize to JSON
+    let json_str = serde_json::to_string(prefs)
+        .map_err(|e| ServiceError::Internal(format!("Failed to serialize preferences: {}", e)))?;
+
+    // Store in Redis (no expiration - preferences persist until deleted)
+    let _: () = conn.set(&key, &json_str).await.map_err(ServiceError::Redis)?;
 
     Ok(())
 }
 
 /// Delete user preferences from Redis (called on deregistration)
-pub async fn delete_user_preferences(
-    pool: &RedisPool,
-    pubkey: &str,
-) -> Result<()> {
+pub async fn delete_user_preferences(pool: &RedisPool, pubkey: &str) -> Result<()> {
     use redis::AsyncCommands;
 
-    let mut conn = pool.get().await.map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
     let key = build_preferences_key(pubkey);
 
-    let _: () = conn.del(&key).await.map_err(crate::error::ServiceError::Redis)?;
+    let _: () = conn.del(&key).await.map_err(ServiceError::Redis)?;
 
     Ok(())
 }
@@ -172,25 +174,75 @@ mod tests {
     #[test]
     fn test_default_preferences() {
         let prefs = UserPreferences::default();
-        assert!(prefs.likes);
-        assert!(prefs.comments);
-        assert!(prefs.follows);
-        assert!(prefs.mentions);
-        assert!(prefs.reposts);
+        assert!(prefs.kinds.contains(&1));
+        assert!(prefs.kinds.contains(&3));
+        assert!(prefs.kinds.contains(&7));
+        assert!(prefs.kinds.contains(&16));
+        assert!(prefs.kinds.contains(&30023));
+    }
+
+    #[test]
+    fn test_notification_type_kind_mapping() {
+        assert_eq!(NotificationType::Like.kind(), 7);
+        assert_eq!(NotificationType::Comment.kind(), 1);
+        assert_eq!(NotificationType::Follow.kind(), 3);
+        assert_eq!(NotificationType::Mention.kind(), 1);
+        assert_eq!(NotificationType::Repost.kind(), 16);
     }
 
     #[test]
     fn test_notification_type_enabled() {
-        let mut prefs = UserPreferences::default();
+        // All kinds enabled
+        let prefs = UserPreferences::default();
         assert!(NotificationType::Like.is_enabled(&prefs));
+        assert!(NotificationType::Comment.is_enabled(&prefs));
+        assert!(NotificationType::Mention.is_enabled(&prefs));
 
-        prefs.likes = false;
-        assert!(!NotificationType::Like.is_enabled(&prefs));
+        // Only kind 7 enabled
+        let prefs = UserPreferences { kinds: vec![7] };
+        assert!(NotificationType::Like.is_enabled(&prefs));
+        assert!(!NotificationType::Comment.is_enabled(&prefs));
+        assert!(!NotificationType::Mention.is_enabled(&prefs));
+        assert!(!NotificationType::Follow.is_enabled(&prefs));
+    }
+
+    #[test]
+    fn test_comment_and_mention_share_kind() {
+        // Both Comment and Mention are kind 1, so enabling/disabling kind 1 affects both
+        let prefs_with_1 = UserPreferences { kinds: vec![1, 7] };
+        assert!(NotificationType::Comment.is_enabled(&prefs_with_1));
+        assert!(NotificationType::Mention.is_enabled(&prefs_with_1));
+
+        let prefs_without_1 = UserPreferences { kinds: vec![7, 16] };
+        assert!(!NotificationType::Comment.is_enabled(&prefs_without_1));
+        assert!(!NotificationType::Mention.is_enabled(&prefs_without_1));
     }
 
     #[test]
     fn test_build_preferences_key() {
         let key = build_preferences_key("abc123");
         assert_eq!(key, "user_preferences:abc123");
+    }
+
+    #[test]
+    fn test_is_kind_enabled() {
+        let prefs = UserPreferences {
+            kinds: vec![1, 7, 30023],
+        };
+        assert!(prefs.is_kind_enabled(1));
+        assert!(prefs.is_kind_enabled(7));
+        assert!(prefs.is_kind_enabled(30023));
+        assert!(!prefs.is_kind_enabled(3));
+        assert!(!prefs.is_kind_enabled(16));
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let prefs = UserPreferences {
+            kinds: vec![1, 7, 16],
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        let parsed: UserPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(prefs, parsed);
     }
 }

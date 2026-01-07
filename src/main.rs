@@ -10,12 +10,12 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use nostr_push_service::cleanup_service;
-use nostr_push_service::config;
-use nostr_push_service::error::Result;
-use nostr_push_service::event_handler;
-use nostr_push_service::nostr_listener;
-use nostr_push_service::state;
+use divine_push_service::cleanup_service;
+use divine_push_service::config;
+use divine_push_service::error::Result;
+use divine_push_service::event_handler;
+use divine_push_service::nostr_listener;
+use divine_push_service::state;
 
 use nostr_sdk::prelude::Event;
 

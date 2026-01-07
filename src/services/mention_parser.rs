@@ -29,7 +29,7 @@ pub struct ProfileMetadata {
 /// # Examples
 ///
 /// ```no_run
-/// # use nostr_push_service::services::mention_parser::extract_npub_mentions;
+/// # use divine_push_service::services::mention_parser::extract_npub_mentions;
 /// let content = "Hey nostr:npub1abc...!";
 /// let mentions = extract_npub_mentions(content);
 /// assert_eq!(mentions.len(), 1);

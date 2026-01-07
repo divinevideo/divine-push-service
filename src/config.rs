@@ -135,33 +135,28 @@ fn default_event_kinds() -> Vec<u64> {
     ]
 }
 
-/// Default notification preferences
+/// Default notification preferences - kinds the user wants notifications for
 #[derive(Debug, Deserialize, Clone)]
 pub struct DefaultPreferences {
-    #[serde(default = "default_true")]
-    pub likes: bool,
-    #[serde(default = "default_true")]
-    pub comments: bool,
-    #[serde(default = "default_true")]
-    pub follows: bool,
-    #[serde(default = "default_true")]
-    pub mentions: bool,
-    #[serde(default = "default_true")]
-    pub reposts: bool,
+    /// Event kinds enabled by default for new users
+    #[serde(default = "default_preference_kinds")]
+    pub kinds: Vec<u16>,
 }
 
-fn default_true() -> bool {
-    true
+fn default_preference_kinds() -> Vec<u16> {
+    vec![
+        1,     // Text notes (comments, mentions)
+        3,     // Contact list (follows)
+        7,     // Reactions/likes
+        16,    // Reposts
+        30023, // Long-form content
+    ]
 }
 
 impl Default for DefaultPreferences {
     fn default() -> Self {
         Self {
-            likes: true,
-            comments: true,
-            follows: true,
-            mentions: true,
-            reposts: true,
+            kinds: default_preference_kinds(),
         }
     }
 }
@@ -209,11 +204,11 @@ mod tests {
     #[test]
     fn test_default_preferences() {
         let prefs = DefaultPreferences::default();
-        assert!(prefs.likes);
-        assert!(prefs.comments);
-        assert!(prefs.follows);
-        assert!(prefs.mentions);
-        assert!(prefs.reposts);
+        assert!(prefs.kinds.contains(&1));   // Text notes
+        assert!(prefs.kinds.contains(&3));   // Follows
+        assert!(prefs.kinds.contains(&7));   // Likes
+        assert!(prefs.kinds.contains(&16));  // Reposts
+        assert!(prefs.kinds.contains(&30023)); // Long-form
     }
 
     #[test]

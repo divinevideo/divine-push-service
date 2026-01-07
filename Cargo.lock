@@ -681,6 +681,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "divine_push_service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "bb8-redis",
+ "blake3",
+ "chrono",
+ "config",
+ "divine_push_service",
+ "dotenvy",
+ "firebase-messaging-rs",
+ "futures",
+ "futures-util",
+ "hex",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "once_cell",
+ "portpicker",
+ "redis",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util 0.6.10",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "validator",
+]
+
+[[package]]
 name = "dlv-list"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1712,44 +1750,6 @@ dependencies = [
  "nostr-relay-pool",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "nostr_push_service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "bb8-redis",
- "blake3",
- "chrono",
- "config",
- "dotenvy",
- "firebase-messaging-rs",
- "futures",
- "futures-util",
- "hex",
- "nostr-relay-builder",
- "nostr-sdk",
- "nostr_push_service",
- "once_cell",
- "portpicker",
- "redis",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util 0.6.10",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "validator",
 ]
 
 [[package]]
