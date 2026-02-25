@@ -46,12 +46,21 @@ impl AppState {
         // Initialize FCM client for diVine
         let app_config = &settings.app;
 
-        // Set credentials from config
-        env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &app_config.firebase.credentials_path);
-        info!(
-            "Setting Firebase credentials for '{}': {}",
-            app_config.name, app_config.firebase.credentials_path
-        );
+        // Set credentials from config if provided, otherwise rely on ADC (e.g. GKE Workload Identity)
+        if let Some(ref creds_path) = app_config.firebase.credentials_path {
+            if !creds_path.is_empty() {
+                env::set_var("GOOGLE_APPLICATION_CREDENTIALS", creds_path);
+                info!(
+                    "Setting Firebase credentials for '{}': {}",
+                    app_config.name, creds_path
+                );
+            }
+        } else {
+            info!(
+                "No Firebase credentials path for '{}', using Application Default Credentials",
+                app_config.name
+            );
+        }
 
         let fcm_client = FcmClient::new(&app_config.firebase.project_id)
             .map_err(|e| {

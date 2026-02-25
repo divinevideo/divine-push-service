@@ -66,7 +66,10 @@ fn default_pool_size() -> u32 {
 #[derive(Debug, Deserialize, Clone)]
 pub struct FirebaseConfig {
     pub project_id: String,
-    pub credentials_path: String,
+    /// Path to Firebase service account JSON. If empty/omitted, uses Application Default Credentials
+    /// (e.g. GKE Workload Identity).
+    #[serde(default)]
+    pub credentials_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -23,7 +23,7 @@ app:
   package: "co.openvine.app"  # Historical - required for Firebase integration
   firebase:
     project_id: "openvine-co"
-    credentials_path: "/app/secrets/firebase-divine.json"
+    # credentials_path: omitted — uses Application Default Credentials (GKE Workload Identity)
 
 cleanup:
   enabled: true
