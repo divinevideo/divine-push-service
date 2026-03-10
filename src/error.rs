@@ -102,7 +102,10 @@ impl IntoResponse for ServiceError {
             ServiceError::SerdeJson(e) => (StatusCode::BAD_REQUEST, format!("JSON error: {}", e)),
             ServiceError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ServiceError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
-            ServiceError::RelayError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Relay error: {}", msg)),
+            ServiceError::RelayError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Relay error: {}", msg),
+            ),
             ServiceError::Fcm(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("FCM error: {}", e),

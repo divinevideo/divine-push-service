@@ -51,9 +51,7 @@ async fn test_preferences_roundtrip() {
     assert!(prefs.kinds.contains(&16));
 
     // Set custom preferences - only likes and reposts
-    let custom_prefs = UserPreferences {
-        kinds: vec![7, 16],
-    };
+    let custom_prefs = UserPreferences { kinds: vec![7, 16] };
 
     preferences::set_user_preferences(&pool, &pubkey, &custom_prefs)
         .await
@@ -115,15 +113,13 @@ async fn test_notification_type_filtering_with_kinds() {
     // Test that NotificationType.is_enabled correctly filters based on kinds
 
     // Only likes (kind 7) and reposts (kind 16) enabled
-    let prefs = UserPreferences {
-        kinds: vec![7, 16],
-    };
+    let prefs = UserPreferences { kinds: vec![7, 16] };
 
-    assert!(NotificationType::Like.is_enabled(&prefs));      // kind 7 ✓
-    assert!(!NotificationType::Comment.is_enabled(&prefs));  // kind 1 ✗
-    assert!(!NotificationType::Follow.is_enabled(&prefs));   // kind 3 ✗
-    assert!(!NotificationType::Mention.is_enabled(&prefs));  // kind 1 ✗
-    assert!(NotificationType::Repost.is_enabled(&prefs));    // kind 16 ✓
+    assert!(NotificationType::Like.is_enabled(&prefs)); // kind 7 ✓
+    assert!(!NotificationType::Comment.is_enabled(&prefs)); // kind 1 ✗
+    assert!(!NotificationType::Follow.is_enabled(&prefs)); // kind 3 ✗
+    assert!(!NotificationType::Mention.is_enabled(&prefs)); // kind 1 ✗
+    assert!(NotificationType::Repost.is_enabled(&prefs)); // kind 16 ✓
 }
 
 #[tokio::test]
@@ -131,15 +127,11 @@ async fn test_comment_and_mention_share_kind_1() {
     // Both Comment and Mention are kind 1
     // Enabling kind 1 enables both, disabling disables both
 
-    let prefs_with_kind_1 = UserPreferences {
-        kinds: vec![1, 7],
-    };
+    let prefs_with_kind_1 = UserPreferences { kinds: vec![1, 7] };
     assert!(NotificationType::Comment.is_enabled(&prefs_with_kind_1));
     assert!(NotificationType::Mention.is_enabled(&prefs_with_kind_1));
 
-    let prefs_without_kind_1 = UserPreferences {
-        kinds: vec![7, 16],
-    };
+    let prefs_without_kind_1 = UserPreferences { kinds: vec![7, 16] };
     assert!(!NotificationType::Comment.is_enabled(&prefs_without_kind_1));
     assert!(!NotificationType::Mention.is_enabled(&prefs_without_kind_1));
 }
@@ -165,9 +157,7 @@ async fn test_preferences_update() {
         .expect("Should set initial preferences");
 
     // Update to fewer kinds
-    let updated = UserPreferences {
-        kinds: vec![7, 16],
-    };
+    let updated = UserPreferences { kinds: vec![7, 16] };
 
     preferences::set_user_preferences(&pool, &pubkey, &updated)
         .await
