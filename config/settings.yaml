@@ -13,6 +13,7 @@ service:
   # Load from env: NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX
   process_window_days: 7
   processed_event_ttl_secs: 604800  # 7 days
+  # allowed_pubkeys: [] — empty means no restriction (production default)
 
 redis:
   url: "redis://127.0.0.1:6379"  # Override with NOSTR_PUSH__REDIS__URL

@@ -42,6 +42,9 @@ pub struct ServiceSettings {
     pub process_window_days: i64,
     #[serde(default = "default_processed_event_ttl")]
     pub processed_event_ttl_secs: u64,
+    /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
+    #[serde(default)]
+    pub allowed_pubkeys: Vec<String>,
 }
 
 fn default_process_window_days() -> i64 {
@@ -186,7 +189,11 @@ impl Settings {
         let s = config::Config::builder()
             .add_source(config::File::from(config_path).required(true))
             // Eg.. `NOSTR_PUSH__REDIS__URL=redis://...` would override `redis.url`
-            .add_source(config::Environment::with_prefix("NOSTR_PUSH").separator("__"))
+            .add_source(
+                config::Environment::with_prefix("NOSTR_PUSH")
+                    .separator("__")
+                    .list_separator(","),
+            )
             .build()?;
 
         s.try_deserialize()
