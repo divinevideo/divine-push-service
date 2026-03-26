@@ -147,7 +147,10 @@ pub async fn set_user_preferences(
         .map_err(|e| ServiceError::Internal(format!("Failed to serialize preferences: {}", e)))?;
 
     // Store in Redis (no expiration - preferences persist until deleted)
-    let _: () = conn.set(&key, &json_str).await.map_err(ServiceError::Redis)?;
+    let _: () = conn
+        .set(&key, &json_str)
+        .await
+        .map_err(ServiceError::Redis)?;
 
     Ok(())
 }

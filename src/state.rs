@@ -60,13 +60,12 @@ impl AppState {
             );
         }
 
-        let fcm_client = FcmClient::new(&app_config.firebase.project_id)
-            .map_err(|e| {
-                ServiceError::Internal(format!(
-                    "Failed to initialize FCM client for {}: {}",
-                    app_config.name, e
-                ))
-            })?;
+        let fcm_client = FcmClient::new(&app_config.firebase.project_id).map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to initialize FCM client for {}: {}",
+                app_config.name, e
+            ))
+        })?;
 
         info!(
             "Initialized FCM client for '{}' with project '{}'",
@@ -76,7 +75,9 @@ impl AppState {
         let service_keys = settings.get_service_keys();
 
         // Create crypto service if we have service keys
-        let crypto_service = service_keys.as_ref().map(|keys| CryptoService::new(keys.clone()));
+        let crypto_service = service_keys
+            .as_ref()
+            .map(|keys| CryptoService::new(keys.clone()));
 
         // Create nostr client for event subscriptions
         let nostr_client = {

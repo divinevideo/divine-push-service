@@ -66,9 +66,10 @@ pub async fn add_or_update_token(pool: &RedisPool, pubkey: &PublicKey, token: &s
     let pubkey_hex = pubkey.to_hex();
     let user_tokens_key = build_user_tokens_key(pubkey);
 
-    let mut conn = pool.get().await.map_err(|e| {
-        ServiceError::Internal(format!("Failed to get Redis connection: {}", e))
-    })?;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
 
     // Check if this token is already associated with a different pubkey
     let existing_pubkey: Option<String> = redis::cmd("HGET")
@@ -340,10 +341,9 @@ mod tests {
 
     #[test]
     fn test_build_user_tokens_key() {
-        let pubkey = PublicKey::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .unwrap();
+        let pubkey =
+            PublicKey::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
         let key = build_user_tokens_key(&pubkey);
         assert!(key.starts_with("user_tokens:"));
         assert!(key.contains(&pubkey.to_hex()));

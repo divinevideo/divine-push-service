@@ -44,27 +44,30 @@ impl From<FirebaseFCMError> for FcmError {
             FirebaseFCMError::Unauthorized(reason) => FcmError::Unauthorized(reason),
             FirebaseFCMError::InvalidRequestDescriptive { reason } => {
                 // Try to parse FCM's JSON error response
-                let error_message = if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&reason) {
-                    // Extract the error message from FCM's JSON structure
-                    json_value.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or(&reason)
-                        .to_string()
-                } else {
-                    // If not JSON, use the raw reason
-                    reason.clone()
-                };
-                
+                let error_message =
+                    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&reason) {
+                        // Extract the error message from FCM's JSON structure
+                        json_value
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(&reason)
+                            .to_string()
+                    } else {
+                        // If not JSON, use the raw reason
+                        reason.clone()
+                    };
+
                 // Check for specific error conditions
                 if error_message.contains("invalid registration token")
-                    || error_message.contains("registration token is not a valid FCM registration token")
+                    || error_message
+                        .contains("registration token is not a valid FCM registration token")
                     || error_message.contains("BadDeviceToken")
                     || error_message.to_lowercase().contains("unregistered")
                     || error_message.to_lowercase().contains("not registered")
                 {
                     FcmError::TokenNotRegistered
-                } else if error_message.contains("SENDER_ID_MISMATCH") 
+                } else if error_message.contains("SENDER_ID_MISMATCH")
                     || error_message.contains("sender id mismatch")
                     || error_message.contains("project") && error_message.contains("mismatch")
                 {
@@ -76,9 +79,9 @@ impl From<FirebaseFCMError> for FcmError {
                     FcmError::InvalidRequest(error_message)
                 }
             }
-            FirebaseFCMError::InvalidRequest => {
-                FcmError::InvalidRequest("Unknown invalid request (no details provided)".to_string())
-            }
+            FirebaseFCMError::InvalidRequest => FcmError::InvalidRequest(
+                "Unknown invalid request (no details provided)".to_string(),
+            ),
             FirebaseFCMError::RetryableInternal { retry_after } => {
                 FcmError::RetryableInternal(retry_after)
             }
@@ -108,7 +111,7 @@ impl RealFcmClient {
         // Use new_with_project to specify the project ID explicitly
         // This allows multiple FCM clients with different projects
         let project_id_owned = project_id.to_string();
-        
+
         let client_result = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             rt.block_on(async { FirebaseClient::new_with_project(&project_id_owned).await })
@@ -117,7 +120,10 @@ impl RealFcmClient {
         .expect("Tokio runtime thread panicked");
 
         let client = client_result.map_err(|e| {
-            FcmError::Initialization(format!("Failed to initialize FirebaseClient for project {}: {}", project_id, e))
+            FcmError::Initialization(format!(
+                "Failed to initialize FirebaseClient for project {}: {}",
+                project_id, e
+            ))
         })?;
 
         Ok(RealFcmClient { client })
@@ -138,11 +144,11 @@ impl FcmSend for RealFcmClient {
             body: notif.body,
             image: None,
         });
-        
+
         let message = Message::Token {
             token: token.to_string(),
             name: None,
-            notification,  // Can be None for data-only messages
+            notification, // Can be None for data-only messages
             data: payload.data,
             android: None,
             apns: None,
@@ -170,7 +176,7 @@ impl FcmSend for RealFcmClient {
                     &token[..std::cmp::min(token.len(), 8)],
                     firebase_err
                 );
-                
+
                 let custom_error = FcmError::from(firebase_err);
                 tracing::error!(
                     "FCM send failed for token prefix {}: {}",
@@ -309,8 +315,7 @@ impl FcmSend for MockFcmSender {
 mod tests {
     use super::*; // Import items from parent module (fcm_sender)
     use crate::models::{FcmNotification, FcmPayload};
-    
-    
+
     use tokio; // Ensure tokio is available for async tests
 
     // Example test demonstrating how to use the mock

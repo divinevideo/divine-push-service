@@ -8,7 +8,7 @@ pub struct Settings {
     pub nostr: NostrSettings,
     pub service: ServiceSettings,
     pub redis: RedisSettings,
-    pub app: AppConfig,  // Single app instead of Vec<AppConfig>
+    pub app: AppConfig, // Single app instead of Vec<AppConfig>
     pub cleanup: CleanupSettings,
     #[serde(default = "default_server_settings")]
     pub server: ServerSettings,
@@ -78,7 +78,7 @@ pub struct FirebaseConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub name: String,
-    pub package: String,  // App package name (e.g., co.openvine.app)
+    pub package: String, // App package name (e.g., co.openvine.app)
     pub firebase: FirebaseConfig,
 }
 
@@ -214,20 +214,20 @@ mod tests {
     #[test]
     fn test_default_preferences() {
         let prefs = DefaultPreferences::default();
-        assert!(prefs.kinds.contains(&1));   // Text notes
-        assert!(prefs.kinds.contains(&3));   // Follows
-        assert!(prefs.kinds.contains(&7));   // Likes
-        assert!(prefs.kinds.contains(&16));  // Reposts
+        assert!(prefs.kinds.contains(&1)); // Text notes
+        assert!(prefs.kinds.contains(&3)); // Follows
+        assert!(prefs.kinds.contains(&7)); // Likes
+        assert!(prefs.kinds.contains(&16)); // Reposts
         assert!(prefs.kinds.contains(&30023)); // Long-form
     }
 
     #[test]
     fn test_default_event_kinds() {
         let kinds = default_event_kinds();
-        assert!(kinds.contains(&1));   // Text notes
-        assert!(kinds.contains(&3));   // Contact list
-        assert!(kinds.contains(&7));   // Reactions
-        assert!(kinds.contains(&16));  // Reposts
+        assert!(kinds.contains(&1)); // Text notes
+        assert!(kinds.contains(&3)); // Contact list
+        assert!(kinds.contains(&7)); // Reactions
+        assert!(kinds.contains(&16)); // Reposts
         assert!(kinds.contains(&30023)); // Long-form
     }
 }
