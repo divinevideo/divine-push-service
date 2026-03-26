@@ -537,6 +537,17 @@ async fn send_notification_to_user(
     let event_id = event.id;
     let pubkey_hex = target_pubkey.to_hex();
 
+    // Check pubkey allowlist (for non-production environments)
+    let allowed = &state.settings.service.allowed_pubkeys;
+    if !allowed.is_empty() && !allowed.contains(&pubkey_hex) {
+        debug!(
+            event_id = %event_id,
+            target_pubkey = %pubkey_hex,
+            "Skipping notification - pubkey not in allowed list"
+        );
+        return Ok(());
+    }
+
     // Check if user has tokens registered
     let tokens = tokio::select! {
         biased;
