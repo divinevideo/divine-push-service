@@ -18,7 +18,6 @@ use std::time::Duration;
 pub type RedisPool = Pool<RedisConnectionManager>;
 
 // Redis key constants
-const PROCESSED_EVENTS_SET: &str = "processed_nostr_events";
 const STALE_TOKENS_ZSET: &str = "stale_tokens";
 const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
 
@@ -248,47 +247,33 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
 // Event Processing
 // =============================================================================
 
-/// Checks if an event has already been processed.
-pub async fn is_event_processed(pool: &RedisPool, event_id: &EventId) -> Result<bool> {
+/// Atomically claims an event for processing using SET NX EX.
+/// Returns true if the event was newly claimed (not yet processed).
+/// Returns false if the event was already claimed by another replica.
+pub async fn try_claim_event(
+    pool: &RedisPool,
+    event_id: &EventId,
+    ttl_seconds: u64,
+) -> Result<bool> {
     let mut conn = pool
         .get()
         .await
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
 
-    let processed: bool = redis::cmd("SISMEMBER")
-        .arg(PROCESSED_EVENTS_SET)
-        .arg(event_id.to_hex())
+    let key = format!("dedup:{}", event_id.to_hex());
+
+    let result: Option<String> = redis::cmd("SET")
+        .arg(&key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_seconds)
         .query_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
 
-    Ok(processed)
-}
-
-/// Marks an event as processed with a time-to-live (TTL).
-pub async fn mark_event_processed(
-    pool: &RedisPool,
-    event_id: &EventId,
-    ttl_seconds: u64,
-) -> Result<()> {
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
-
-    let ttl_i64: i64 = ttl_seconds
-        .try_into()
-        .map_err(|_| ServiceError::Internal("TTL value too large".to_string()))?;
-
-    let mut pipe = redis::pipe();
-    pipe.atomic()
-        .sadd(PROCESSED_EVENTS_SET, event_id.to_hex())
-        .expire(PROCESSED_EVENTS_SET, ttl_i64);
-
-    pipe.query_async::<Value>(&mut *conn)
-        .await
-        .map(|_| ())
-        .map_err(ServiceError::Redis)
+    // SET NX returns "OK" if the key was set, None if it already existed
+    Ok(result.is_some())
 }
 
 // =============================================================================

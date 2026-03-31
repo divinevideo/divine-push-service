@@ -94,28 +94,31 @@ pub async fn run(
                     continue;
                 }
 
-                // Check if already processed
-                tokio::select! {
+                // Atomically claim the event to prevent duplicate processing across replicas
+                let claimed = tokio::select! {
                     biased;
                     _ = token.cancelled() => {
-                        info!("Event handler cancelled while checking if event {} was processed.", event_id);
+                        info!("Event handler cancelled while claiming event {}.", event_id);
                         break;
                     }
-                    processed_result = redis_store::is_event_processed(&state.redis_pool, &event_id) => {
-                        match processed_result {
-                            Ok(true) => {
-                                trace!(event_id = %event_id, "Skipping already processed event");
-                                continue;
-                            }
-                            Ok(false) => {
-                                // Not processed, continue handling
-                            }
+                    claim_result = redis_store::try_claim_event(
+                        &state.redis_pool,
+                        &event_id,
+                        state.settings.service.processed_event_ttl_secs,
+                    ) => {
+                        match claim_result {
+                            Ok(claimed) => claimed,
                             Err(e) => {
-                                error!(event_id = %event_id, error = %e, "Failed to check if event was processed");
+                                error!(event_id = %event_id, error = %e, "Failed to claim event");
                                 continue;
                             }
                         }
                     }
+                };
+
+                if !claimed {
+                    trace!(event_id = %event_id, "Skipping already claimed event");
+                    continue;
                 }
 
                 // Route the event based on its type
@@ -124,28 +127,9 @@ pub async fn run(
                 match handler_result {
                     Ok(_) => {
                         trace!(event_id = %event_id, kind = %event_kind, "Handler finished successfully");
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => {
-                                info!("Event handler cancelled before marking event {} as processed.", event_id);
-                                break;
-                            }
-                            mark_result = redis_store::mark_event_processed(
-                                &state.redis_pool,
-                                &event_id,
-                                state.settings.service.processed_event_ttl_secs,
-                            ) => {
-                                if let Err(e) = mark_result {
-                                    error!(event_id = %event_id, error = %e, "Failed to mark event as processed");
-                                } else {
-                                    debug!(event_id = %event_id, "Successfully marked event as processed");
-                                }
-                            }
-                        }
                     }
                     Err(e) => {
                         error!(event_id = %event_id, error = %e, "Failed to handle event");
-                        // Continue processing other events
                     }
                 }
 
