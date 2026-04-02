@@ -46,20 +46,26 @@ impl AppState {
         // Initialize FCM client for diVine
         let app_config = &settings.app;
 
-        // Set credentials from config
-        env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &app_config.firebase.credentials_path);
-        info!(
-            "Setting Firebase credentials for '{}': {}",
-            app_config.name, app_config.firebase.credentials_path
-        );
+        // Set credentials from config, or fall back to ADC (e.g. GKE Workload Identity)
+        if let Some(ref creds_path) = app_config.firebase.credentials_path {
+            env::set_var("GOOGLE_APPLICATION_CREDENTIALS", creds_path);
+            info!(
+                "Setting Firebase credentials for '{}': {}",
+                app_config.name, creds_path
+            );
+        } else {
+            info!(
+                "No credentials_path configured for '{}', using Application Default Credentials",
+                app_config.name
+            );
+        }
 
-        let fcm_client = FcmClient::new(&app_config.firebase.project_id)
-            .map_err(|e| {
-                ServiceError::Internal(format!(
-                    "Failed to initialize FCM client for {}: {}",
-                    app_config.name, e
-                ))
-            })?;
+        let fcm_client = FcmClient::new(&app_config.firebase.project_id).map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to initialize FCM client for {}: {}",
+                app_config.name, e
+            ))
+        })?;
 
         info!(
             "Initialized FCM client for '{}' with project '{}'",
@@ -69,7 +75,9 @@ impl AppState {
         let service_keys = settings.get_service_keys();
 
         // Create crypto service if we have service keys
-        let crypto_service = service_keys.as_ref().map(|keys| CryptoService::new(keys.clone()));
+        let crypto_service = service_keys
+            .as_ref()
+            .map(|keys| CryptoService::new(keys.clone()));
 
         // Create nostr client for event subscriptions
         let nostr_client = {

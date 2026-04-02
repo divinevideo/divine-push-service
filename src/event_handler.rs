@@ -521,6 +521,17 @@ async fn send_notification_to_user(
     let event_id = event.id;
     let pubkey_hex = target_pubkey.to_hex();
 
+    // Check pubkey allowlist (for non-production environments)
+    let allowed = &state.settings.service.allowed_pubkeys;
+    if !allowed.is_empty() && !allowed.contains(&pubkey_hex) {
+        debug!(
+            event_id = %event_id,
+            target_pubkey = %pubkey_hex,
+            "Skipping notification - pubkey not in allowed list"
+        );
+        return Ok(());
+    }
+
     // Check if user has tokens registered
     let tokens = tokio::select! {
         biased;
@@ -735,7 +746,10 @@ async fn create_fcm_payload(
     };
 
     // Build data payload
-    data.insert("type".to_string(), notification_type.display_name().to_string());
+    data.insert(
+        "type".to_string(),
+        notification_type.display_name().to_string(),
+    );
     data.insert("eventId".to_string(), event.id.to_hex());
     data.insert("title".to_string(), title.clone());
     data.insert("body".to_string(), body.clone());
@@ -755,7 +769,10 @@ async fn create_fcm_payload(
     // Add e-tag reference if present (for comments/reactions)
     if let Some(e_tag) = event.tags.find(TagKind::e()) {
         if let Some(referenced_event_id) = e_tag.content() {
-            data.insert("referencedEventId".to_string(), referenced_event_id.to_string());
+            data.insert(
+                "referencedEventId".to_string(),
+                referenced_event_id.to_string(),
+            );
         }
     }
 
@@ -811,10 +828,9 @@ mod tests {
 
     #[test]
     fn test_format_short_npub() {
-        let sk = SecretKey::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .unwrap();
+        let sk =
+            SecretKey::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
         let keys = Keys::new(sk);
         let short = format_short_npub(&keys.public_key());
         assert!(short.starts_with("npub"));

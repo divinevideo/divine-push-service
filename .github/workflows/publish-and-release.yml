@@ -1,58 +1,39 @@
-name: Publish Image and Release Deployment
+# Builds once, pushes to all GCP Artifact Registry environments via docker-push-gcp.
+# Production push only on version tags (v*). Dispatch to IAC repo triggers ArgoCD sync.
+#
+# Required GitHub Variables (repo-level):
+#   Per environment: WORKLOAD_IDENTITY_PROVIDER_{ENV}, SERVICE_ACCOUNT_{ENV}, GCP_PROJECT_ID_{ENV}
+#
+# Required GitHub Secrets (staging environment):
+#   CORECONFIG_DISPATCH_APP_ID, CORECONFIG_DISPATCH_APP_PRIVATE_KEY
+
+name: Build, Test & Push
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 on:
-  workflow_dispatch:
   push:
-    branches: ['main']
+    branches: [main]
+    tags:
+      - 'v*'
   pull_request:
-    branches: ['main']
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      include_production:
+        description: 'Also push to production registry'
+        required: false
+        default: false
+        type: boolean
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
+  GCP_REGION: us-central1
 
 jobs:
-  get_version:
-    name: Determine Version
-    runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      contents: write
-      id-token: write
-      pull-requests: write
-      security-events: write
-      statuses: write
-    outputs:
-      SemVer: ${{ steps.get-version.outputs.SemVer }}
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine Version
-        id: get-version
-        run: |
-          # Use timestamp and short SHA for unique versioning
-          # Format: 0.1.YYYYMMDD-HHMM-SHA
-          TIMESTAMP=$(date -u +"%Y%m%d-%H%M")
-          SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)
-          VERSION="0.1.${TIMESTAMP}-${SHORT_SHA}"
-          echo "SemVer=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Generated version: ${VERSION}"
-
-      - name: Output Version
-        run: |
-          echo "# Version:" >> $GITHUB_STEP_SUMMARY
-          echo ${{ steps.get-version.outputs.SemVer }} >> $GITHUB_STEP_SUMMARY
-
   test:
-    name: Run Tests
     runs-on: ubuntu-latest
     services:
       redis:
@@ -64,132 +45,177 @@ jobs:
           --health-retries 5
           --health-start-period 10s
         ports:
-          - 6379:6379 # Map port to be accessible from the host as localhost:6379
+          - 6379:6379
     env:
-      CI: true # Ensure CI flag is set
-      RUST_LOG: debug # Higher log level for more information
+      CI: true
+      RUST_LOG: debug
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache Cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
-      - name: Cache Cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-target-
+          components: clippy, rustfmt
 
       - name: Run tests
-        # Point tests to the Redis service container via localhost on the mapped port
         env:
           REDIS_HOST: localhost
           REDIS_PORT: 6379
           RUST_BACKTRACE: 1
-          # Tests now use unique data for isolation, so parallel execution is safe
         run: cargo test --verbose
 
-  push_to_registry:
-    needs: [get_version, test] # Add dependency on the test job
-    if: github.ref == 'refs/heads/main'
-    name: Push Docker image to GHCR
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  docker:
+    name: Build & Push
+    needs: test
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     permissions:
+      id-token: write
       contents: read
       packages: write
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+
     steps:
+      - uses: actions/checkout@v6
 
-      - name: Check out the repo
-        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Log in to the Github Container registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate image tags
+        id: tags
+        uses: divinevideo/divine-github-actions/generate-docker-tags@v1
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ needs.get_version.outputs.SemVer }}
-            type=raw,value=latest
-
-      - name: Build and push Docker image
-        id: build-and-push-image
+      - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: false
+          load: true
+          tags: divine-push-service:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Output Image Details
-        if: steps.build-and-push-image.outcome == 'success'
-        run: |
-          echo "# Built and pushed the following images:" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
-
-  merge_to_release:
-    name: Merge to Release
-    needs: [ push_to_registry, get_version ]
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
-    steps:
-
-      - name: Check Out the Repo
-        uses: actions/checkout@v4
+      - name: Push to POC
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
         with:
-          fetch-depth: 0
+          image-name: divine-push-service:local
+          registry-image: divine-push-service
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_POC }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_POC }}
+          project-id: ${{ vars.GCP_PROJECT_ID_POC }}
+          repository: containers-poc
+          region: ${{ env.GCP_REGION }}
 
-      - name: Merge main Branch Locally
-        shell: bash
-        run: |
-          git config --global user.name "verse-ci"
-          git config --global user.email "ci@verse.app"
-          git checkout release
-          git merge -Xtheirs --no-commit origin/main
-          # Reset workflow files to avoid permission issues
-          git reset HEAD .github/workflows/
-          git checkout -- .github/workflows/
+      - name: Push to Test
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: divine-push-service:local
+          registry-image: divine-push-service
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_TEST }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_TEST }}
+          project-id: ${{ vars.GCP_PROJECT_ID_TEST }}
+          repository: containers-test
+          region: ${{ env.GCP_REGION }}
 
-      - name: Apply Newest Version
-        shell: bash
-        run: |
-          echo "Image tag being patched to manifests:"
-          echo ${{ needs.get_version.outputs.SemVer }}
-          yq -i '.version = "${{ needs.get_version.outputs.SemVer }}"' ./deployment/nostr-push/Chart.yaml
-          yq -i '.appVersion = "${{ needs.get_version.outputs.SemVer }}"' ./deployment/nostr-push/Chart.yaml
-          yq -i '.image.tag = "${{ needs.get_version.outputs.SemVer }}"' ./deployment/nostr-push/values.yaml
+      - name: Push to Staging
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: divine-push-service:local
+          registry-image: divine-push-service
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_STAGING }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_STAGING }}
+          project-id: ${{ vars.GCP_PROJECT_ID_STAGING }}
+          repository: containers-staging
+          region: ${{ env.GCP_REGION }}
 
-      - name: Commit and Push to Trigger Release
-        shell: bash
+      - name: Push to Production
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_production)
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: divine-push-service:local
+          registry-image: divine-push-service
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_PRODUCTION }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_PRODUCTION }}
+          project-id: ${{ vars.GCP_PROJECT_ID_PRODUCTION }}
+          repository: containers-production
+          region: ${{ env.GCP_REGION }}
+
+      - name: Summary
         run: |
-          git add ./deployment/nostr-push/Chart.yaml ./deployment/nostr-push/values.yaml
-          git commit -m "Deploy version ${{ needs.get_version.outputs.SemVer }}"
-          git push
+          echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** divine-push-service" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** ${{ steps.tags.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environments:**" >> $GITHUB_STEP_SUMMARY
+          echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Test: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_TEST }}/containers-test/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Staging: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/containers-staging/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
+            echo "- Production: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_PRODUCTION }}/containers-production/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  deploy:
+    name: Trigger Deploy
+    needs: docker
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    environment: staging
+
+    steps:
+      - name: Determine environments
+        id: envs
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
+            echo 'environments=["poc","test","staging","production"]' >> $GITHUB_OUTPUT
+          else
+            echo 'environments=["poc","test","staging"]' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CORECONFIG_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.CORECONFIG_DISPATCH_APP_PRIVATE_KEY }}
+          owner: divinevideo
+          repositories: divine-iac-coreconfig
+
+      - name: Trigger image deploy
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          cat <<EOF | gh api repos/divinevideo/divine-iac-coreconfig/dispatches --input -
+          {
+            "event_type": "image-deploy",
+            "client_payload": {
+              "application": "divine-push-service",
+              "environments": ${{ steps.envs.outputs.environments }},
+              "images": [{"name": "divine-push-service", "tag": "${SHORT_SHA}"}],
+              "source_repo": "${{ github.repository }}",
+              "source_sha": "${{ github.sha }}",
+              "source_ref": "${{ github.ref_name }}"
+            }
+          }
+          EOF
+
+          echo "## Deploy Dispatched" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | divine-push-service |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environments | ${{ steps.envs.outputs.environments }} |" >> $GITHUB_STEP_SUMMARY

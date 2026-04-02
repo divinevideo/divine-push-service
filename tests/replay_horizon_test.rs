@@ -1,5 +1,5 @@
-use nostr_sdk::prelude::*;
 use divine_push_service::event_handler;
+use nostr_sdk::prelude::*;
 use std::time::Duration;
 
 #[test]

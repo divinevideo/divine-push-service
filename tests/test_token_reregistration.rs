@@ -4,7 +4,8 @@ use nostr_sdk::Keys;
 #[tokio::test]
 async fn test_token_reregistration_by_different_pubkey() {
     // Skip test if Redis is not available
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
     let pool = match redis_store::create_pool(&redis_url, 5).await {
         Ok(pool) => pool,
@@ -32,20 +33,38 @@ async fn test_token_reregistration_by_different_pubkey() {
     assert!(result.is_ok(), "User 1 should be able to register token");
 
     // Verify user 1 has the token
-    let user1_tokens = redis_store::get_tokens_for_pubkey(&pool, &user1_pubkey).await.unwrap();
-    assert!(user1_tokens.contains(&token.to_string()), "User 1 should have the token");
+    let user1_tokens = redis_store::get_tokens_for_pubkey(&pool, &user1_pubkey)
+        .await
+        .unwrap();
+    assert!(
+        user1_tokens.contains(&token.to_string()),
+        "User 1 should have the token"
+    );
 
     // User 2 registers the same token (this should now succeed and transfer ownership)
     let result = redis_store::add_or_update_token(&pool, &user2_pubkey, token).await;
-    assert!(result.is_ok(), "User 2 should be able to register the same token");
+    assert!(
+        result.is_ok(),
+        "User 2 should be able to register the same token"
+    );
 
     // Verify user 2 now has the token
-    let user2_tokens = redis_store::get_tokens_for_pubkey(&pool, &user2_pubkey).await.unwrap();
-    assert!(user2_tokens.contains(&token.to_string()), "User 2 should now have the token");
+    let user2_tokens = redis_store::get_tokens_for_pubkey(&pool, &user2_pubkey)
+        .await
+        .unwrap();
+    assert!(
+        user2_tokens.contains(&token.to_string()),
+        "User 2 should now have the token"
+    );
 
     // Verify user 1 no longer has the token
-    let user1_tokens = redis_store::get_tokens_for_pubkey(&pool, &user1_pubkey).await.unwrap();
-    assert!(!user1_tokens.contains(&token.to_string()), "User 1 should no longer have the token");
+    let user1_tokens = redis_store::get_tokens_for_pubkey(&pool, &user1_pubkey)
+        .await
+        .unwrap();
+    assert!(
+        !user1_tokens.contains(&token.to_string()),
+        "User 1 should no longer have the token"
+    );
 
     // Clean up
     let _ = redis_store::remove_token(&pool, &user2_pubkey, token).await;

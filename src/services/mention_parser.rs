@@ -86,7 +86,10 @@ impl MentionParserService {
         let profiles = self.fetch_profiles_batch(&[pubkey_hex.to_string()]).await?;
 
         if let Some(profile) = profiles.get(pubkey_hex) {
-            Ok(profile.display_name.clone().or_else(|| profile.name.clone()))
+            Ok(profile
+                .display_name
+                .clone()
+                .or_else(|| profile.name.clone()))
         } else {
             Ok(None)
         }
@@ -194,7 +197,7 @@ impl MentionParserService {
                 .query_async(&mut *conn)
                 .await
                 .unwrap_or(None);
-            
+
             match cached_json {
                 Some(json) => {
                     if let Ok(profile) = serde_json::from_str::<ProfileMetadata>(&json) {
@@ -259,7 +262,8 @@ impl MentionParserService {
             .limit(pubkeys.len());
 
         let timeout = std::time::Duration::from_secs(5);
-        let events = self.nostr_client
+        let events = self
+            .nostr_client
             .fetch_events(filter, timeout)
             .await
             .map_err(|e| ServiceError::RelayError(format!("Failed to fetch events: {}", e)))?;
@@ -300,7 +304,8 @@ mod tests {
 
     #[test]
     fn test_extract_npub_mentions() {
-        let content = "Hello nostr:npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6!";
+        let content =
+            "Hello nostr:npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6!";
         let mentions = extract_npub_mentions(content);
         assert_eq!(mentions.len(), 1);
         assert_eq!(
