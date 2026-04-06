@@ -1,7 +1,25 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 // Re-export config crate error if needed, or use custom error
 pub use config::ConfigError;
+
+fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        String(String),
+        Vec(Vec<String>),
+    }
+
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Vec(v) => Ok(v),
+        StringOrVec::String(s) if s.is_empty() => Ok(Vec::new()),
+        StringOrVec::String(s) => Ok(s.split(',').map(|p| p.trim().to_string()).collect()),
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
@@ -43,7 +61,8 @@ pub struct ServiceSettings {
     #[serde(default = "default_processed_event_ttl")]
     pub processed_event_ttl_secs: u64,
     /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
-    #[serde(default)]
+    /// Accepts a comma-separated string (from env vars) or a YAML list.
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
     pub allowed_pubkeys: Vec<String>,
 }
 
