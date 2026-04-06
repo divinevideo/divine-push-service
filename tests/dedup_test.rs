@@ -50,10 +50,14 @@ async fn test_dedup_single_event_claimed_once() {
 
     let event_id = generate_event_id();
 
-    let first_claim = redis_store::try_claim_event(&pool, &event_id, 30).await.unwrap();
+    let first_claim = redis_store::try_claim_event(&pool, &event_id, 30)
+        .await
+        .unwrap();
     assert!(first_claim, "first claim should succeed");
 
-    let second_claim = redis_store::try_claim_event(&pool, &event_id, 30).await.unwrap();
+    let second_claim = redis_store::try_claim_event(&pool, &event_id, 30)
+        .await
+        .unwrap();
     assert!(!second_claim, "second claim should be rejected");
 }
 
@@ -65,13 +69,20 @@ async fn test_dedup_ttl_expiry_allows_reprocessing() {
 
     let event_id = generate_event_id();
 
-    let first_claim = redis_store::try_claim_event(&pool, &event_id, 1).await.unwrap();
+    let first_claim = redis_store::try_claim_event(&pool, &event_id, 1)
+        .await
+        .unwrap();
     assert!(first_claim, "initial claim should succeed");
 
     sleep(Duration::from_secs(2)).await;
 
-    let second_claim = redis_store::try_claim_event(&pool, &event_id, 1).await.unwrap();
-    assert!(second_claim, "claim should succeed again after TTL expiration");
+    let second_claim = redis_store::try_claim_event(&pool, &event_id, 1)
+        .await
+        .unwrap();
+    assert!(
+        second_claim,
+        "claim should succeed again after TTL expiration"
+    );
 }
 
 #[tokio::test]
@@ -85,7 +96,6 @@ async fn test_dedup_concurrent_claims_only_one_wins() {
 
     let tasks = (0..task_count).map(|_| {
         let pool = pool.clone();
-        let event_id = event_id;
         tokio::spawn(async move { redis_store::try_claim_event(&pool, &event_id, 30).await })
     });
 
