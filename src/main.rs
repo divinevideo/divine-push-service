@@ -3,7 +3,7 @@
 //! Push notification service for the diVine mobile app.
 //! Listens to Nostr events and sends FCM notifications.
 
-use axum::{http::StatusCode, routing::get, Router};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
@@ -45,12 +45,23 @@ impl SimpleTaskTracker {
     }
 }
 
-async fn health_check() -> (StatusCode, &'static str) {
-    (StatusCode::OK, "OK")
+async fn health_check(
+    State(app_state): State<Arc<state::AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let pubkey = app_state.service_pubkey_hex();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "pubkey": pubkey,
+        })),
+    )
 }
 
 async fn run_server(app_state: Arc<state::AppState>, token: CancellationToken) {
-    let app = Router::new().route("/health", get(health_check));
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .with_state(app_state.clone());
 
     let listen_addr_str = &app_state.settings.server.listen_addr;
     let addr: SocketAddr = match listen_addr_str.parse() {
