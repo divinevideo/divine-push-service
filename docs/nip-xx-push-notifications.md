@@ -10,11 +10,11 @@ Define a standard for registering push tokens and receiving notifications when c
 
 ## Abstract
 
-Clients register encrypted push tokens with a push service and may post encrypted, per-app filters. Services watch relays and deliver notifications to registered devices.
+Clients register encrypted push tokens with a push service. Services watch relays and deliver notifications to registered devices.
 
 ## Motivation
 
-Avoid always-on connections (battery), deliver timely alerts, isolate multiple apps, and enable secure token management through encryption.
+Avoid always-on connections (battery), deliver timely alerts, and enable secure token management through encryption.
 
 ## Specification
 
@@ -22,10 +22,9 @@ Avoid always-on connections (battery), deliver timely alerts, isolate multiple a
 
 - `3079`: Push token registration
 - `3080`: Push token deregistration
-- `3081`: Notification filter upsert
-- `3082`: Notification filter delete
+- `3083`: Notification preferences (optional)
 
-All event content fields MUST contain NIP-44 ciphertext strings (no "nip44:" prefix). The decrypted payload structure is implementation-specific between client and service.
+All event content fields MUST contain NIP-44 ciphertext strings. The decrypted payload structure is defined below.
 
 ### Registration (kind 3079)
 
@@ -57,7 +56,8 @@ The content field contains the NIP-44 encrypted token payload. Example plaintext
 
 ### Deregistration (kind 3080)
 
-Same structure and rules as 3079. Example with minimal payload:
+Same structure and rules as 3079.
+
 ```json
 {
   "kind": 3080,
@@ -72,78 +72,48 @@ Same structure and rules as 3079. Example with minimal payload:
 }
 ```
 
-### Filter Upsert (kind 3081)
+### Notification Preferences (kind 3083) — optional
+
+Clients MAY send a preferences event to control which notification types they receive. Without this, the service sends all notification types it supports.
 
 ```json
 {
-  "kind": 3081,
-  "pubkey": "<client-pubkey>",
-  "tags": [
-    ["p", "<push-service-pubkey>"],
-    ["app", "<app-id>"],
-    ["expiration", "<unix-seconds>"]
-  ],
-  "content": nip44_encrypt(filter_payload),
-  "sig": "<signature>"
-}
-```
-
-Example minimal payload (implementation-specific):
-
-```json
-{
-  "filter": {
-    "kinds": [1, 7, 9735],
-    "#p": ["<my-pubkey-hex>"]
-  }
-}
-```
-
-**Rules:** same tag+expiration rules as 3079; servers MUST ignore expired filters.
-
-### Filter Delete (kind 3082)
-
-```json
-{
-  "kind": 3082,
+  "kind": 3083,
   "pubkey": "<client-pubkey>",
   "tags": [
     ["p", "<push-service-pubkey>"],
     ["app", "<app-id>"]
   ],
-  "content": nip44_encrypt(filter_payload),
+  "content": nip44_encrypt({"kinds": [1, 3, 7, 16]}),
   "sig": "<signature>"
 }
 ```
 
-Example minimal payload (implementation-specific):
+The decrypted content is a JSON object with a `kinds` array listing the event kinds the user wants notifications for:
 ```json
-{
-  "filter": {
-    "kinds": [1, 7, 9735],
-    "#p": ["<my-pubkey-hex>"]
-  }
-}
+{ "kinds": [1, 3, 7, 16] }
 ```
 
-Services define how filters are identified and deleted. This is implementation specific and can be normalized and hashed for internal implementations.
+An empty `kinds` array disables all notifications. Services SHOULD define sensible defaults for users who have not sent a preferences event.
 
 ## Notification Triggers
 
-Services MAY implement fixed notification triggers (e.g., DMs, mentions) and/or dynamic triggers based on user-defined filters from kind 3081 events.
+Services define which events trigger notifications. A typical single-app service watches for specific event kinds (reactions, replies, follows, mentions, reposts) and notifies users who are tagged or referenced.
+
+Services MAY support additional trigger logic beyond kind matching.
 
 ## Implementation Requirements
 
 ### Push Service
 
-1. **Encryption**: Reject plaintext for all event kinds (3079/3080/3081/3082). Content must be valid NIP-44 ciphertext.
-2. **App isolation**: Partition by app; ignore events with unknown app.
+1. **Encryption**: Reject plaintext for all event kinds. Content must be valid NIP-44 ciphertext.
+2. **App isolation**: Partition by app tag; ignore events with unknown app.
 3. **Expiration**: Ignore expired events (NIP-40).
 4. **Multiple devices**: Support multiple tokens per (pubkey, app).
-5. **Idempotency**: At most one notification per (recipient_pubkey, app, event_id); aggregate reasons internally.
+5. **Idempotency**: At most one notification per (recipient_pubkey, app, event_id).
 6. **Error handling**: Remove invalid tokens on provider errors.
 7. **Token security**: Protect stored tokens; redact in logs.
-8. **Targeting**: If `p` present and not this service's pubkey, ignore.
+8. **Targeting**: If `p` tag is present and not this service's pubkey, ignore.
 
 ### Client
 
@@ -158,16 +128,15 @@ Services MAY implement fixed notification triggers (e.g., DMs, mentions) and/or 
 - **Token privacy**: Publishing {pubkey ↔ token} enables correlation; NIP-44 mitigates.
 - **Replay**: Expiration (NIP-40) bounds replays.
 - **Rotation**: Refresh/rotate tokens to limit exposure.
-- **Isolation**: `app` prevents cross-app misuse.
+- **Isolation**: `app` tag prevents cross-app misuse.
 
 ## Examples
 
-Examples use `nip44_encrypt(...)` as pseudocode; actual content MUST be the ciphertext string. Payload structures shown are examples - services define their own requirements.
+Examples use `nip44_encrypt(...)` as pseudocode; actual content MUST be the ciphertext string.
 
 ### Register (JS sketch)
 
 ```javascript
-// Minimal example - service defines required fields
 const tokenPayload = { token: fcmToken };
 
 const event = {
@@ -180,47 +149,21 @@ const event = {
     ["expiration", String(Math.floor(Date.now() / 1000) + 7776000)]
   ],
   content: await nip44.encrypt(
-    pushServicePubkey, 
-    myPriv, 
+    pushServicePubkey,
+    myPriv,
     JSON.stringify(tokenPayload)
   )
 };
 await relay.publish(await signEvent(event, myPriv));
 ```
 
-### Filter upsert
+### Update preferences
 
 ```javascript
-const filterPayload = {
-  filter: { kinds: [1, 9], "#p": [myPub] }
-};
+const prefsPayload = { kinds: [1, 7, 16] }; // only replies, likes, reposts
 
-const ev = {
-  kind: 3081,
-  pubkey: myPub,
-  created_at: Math.floor(Date.now() / 1000),
-  tags: [
-    ["p", pushServicePubkey],
-    ["app", "my-nostr-app"],
-    ["expiration", String(Math.floor(Date.now() / 1000) + 2592000)]
-  ],
-  content: await nip44.encrypt(
-    pushServicePubkey, 
-    myPriv, 
-    JSON.stringify(filterPayload)
-  )
-};
-```
-
-### Filter delete
-
-```javascript 
-const deletePayload = {
-  filter: { kinds: [1, 9], "#p": [myPub] }  // Same filter to remove
-};
-
-const ev = {
-  kind: 3082,
+const event = {
+  kind: 3083,
   pubkey: myPub,
   created_at: Math.floor(Date.now() / 1000),
   tags: [
@@ -228,11 +171,12 @@ const ev = {
     ["app", "my-nostr-app"]
   ],
   content: await nip44.encrypt(
-    pushServicePubkey, 
-    myPriv, 
-    JSON.stringify(deletePayload)
+    pushServicePubkey,
+    myPriv,
+    JSON.stringify(prefsPayload)
   )
 };
+await relay.publish(await signEvent(event, myPriv));
 ```
 
 ### Service Discovery
