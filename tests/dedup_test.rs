@@ -85,7 +85,6 @@ async fn test_dedup_concurrent_claims_only_one_wins() {
 
     let tasks = (0..task_count).map(|_| {
         let pool = pool.clone();
-        let event_id = event_id;
         tokio::spawn(async move { redis_store::try_claim_event(&pool, &event_id, 30).await })
     });
 
