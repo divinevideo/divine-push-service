@@ -1,7 +1,10 @@
 use crate::{error::Result, models::FcmPayload};
 use async_trait::async_trait;
 use firebase_messaging_rs::{
-    fcm::{FCMApi, FCMError as FirebaseFCMError, Message, Notification},
+    fcm::{
+        ios::{ApnsConfig, ApnsHeaders, ApnsPriority, ApnsPushType, Aps, ContentAvailable, MutableContent},
+        FCMApi, FCMError as FirebaseFCMError, Message, Notification,
+    },
     FCMClient as FirebaseClient,
 };
 // Removed unused imports
@@ -145,13 +148,30 @@ impl FcmSend for RealFcmClient {
             image: None,
         });
 
+        // APNS config ensures iOS delivers data-only messages even when the app is killed.
+        // content-available wakes the app; mutable-content lets the Notification Service Extension
+        // modify and display the notification.
+        let apns_config = ApnsConfig::new(
+            &Aps {
+                content_available: Some(ContentAvailable::On),
+                mutable_content: Some(MutableContent::On),
+                ..Default::default()
+            },
+            &std::collections::HashMap::new(),
+            Some(ApnsHeaders {
+                apns_push_type: Some(ApnsPushType::Alert),
+                apns_priority: Some(ApnsPriority::SendImmediately),
+                ..Default::default()
+            }),
+        );
+
         let message = Message::Token {
             token: token.to_string(),
             name: None,
             notification, // Can be None for data-only messages
             data: payload.data,
             android: None,
-            apns: None,
+            apns: Some(apns_config),
             webpush: None,
             fcm_options: None,
         };
@@ -424,5 +444,37 @@ mod tests {
         // Assert that no message was recorded for the error token (use original instance)
         let sent = mock_sender.get_sent_messages();
         assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn test_apns_config_serialization() {
+        let apns_config = ApnsConfig::new(
+            &Aps {
+                content_available: Some(ContentAvailable::On),
+                mutable_content: Some(MutableContent::On),
+                ..Default::default()
+            },
+            &std::collections::HashMap::new(),
+            Some(ApnsHeaders {
+                apns_push_type: Some(ApnsPushType::Alert),
+                apns_priority: Some(ApnsPriority::SendImmediately),
+                ..Default::default()
+            }),
+        );
+
+        let json = serde_json::to_value(&apns_config).expect("serialization should succeed");
+        let expected = serde_json::json!({
+            "payload": {
+                "aps": {
+                    "content-available": 1,
+                    "mutable-content": 1
+                }
+            },
+            "headers": {
+                "apns-push-type": "alert",
+                "apns-priority": "10"
+            }
+        });
+        assert_eq!(json, expected);
     }
 }
