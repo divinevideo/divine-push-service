@@ -2,7 +2,10 @@ use crate::{error::Result, models::FcmPayload};
 use async_trait::async_trait;
 use firebase_messaging_rs::{
     fcm::{
-        ios::{ApnsConfig, ApnsHeaders, ApnsPriority, ApnsPushType, Aps, ContentAvailable, MutableContent},
+        ios::{
+            ApnsConfig, ApnsHeaders, ApnsPriority, ApnsPushType, Aps, ContentAvailable,
+            MutableContent,
+        },
         FCMApi, FCMError as FirebaseFCMError, Message, Notification,
     },
     FCMClient as FirebaseClient,
