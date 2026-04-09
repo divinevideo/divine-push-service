@@ -10,9 +10,6 @@ use firebase_messaging_rs::{
     },
     FCMClient as FirebaseClient,
 };
-// Removed unused imports
-// use serde_json;
-// use base64;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
@@ -137,6 +134,12 @@ impl RealFcmClient {
 }
 
 fn build_apns_config(payload: &FcmPayload) -> Option<ApnsConfig> {
+    // APNS config is transport-owned — FcmPayload.apns should never be set.
+    debug_assert!(
+        payload.apns.is_none(),
+        "FcmPayload.apns must not be set; APNS config is built at transport level"
+    );
+
     let data = payload.data.clone().unwrap_or_default();
     let title = payload
         .notification
@@ -161,9 +164,15 @@ fn build_apns_config(payload: &FcmPayload) -> Option<ApnsConfig> {
             ..Default::default()
         };
 
+        // Filter title/body from custom data — they're already in aps.alert.
+        let custom_data: HashMap<String, String> = data
+            .into_iter()
+            .filter(|(k, _)| k != "title" && k != "body")
+            .collect();
+
         return Some(ApnsConfig::new(
             &aps,
-            &data,
+            &custom_data,
             Some(ApnsHeaders {
                 apns_push_type: Some(ApnsPushType::Alert),
                 apns_priority: Some(ApnsPriority::SendImmediately),
@@ -505,8 +514,6 @@ mod tests {
                     "content-available": 1,
                     "mutable-content": 1
                 },
-                "title": "New like",
-                "body": "Alice liked your post",
                 "eventId": "abc123"
             },
             "headers": {
