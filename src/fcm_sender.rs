@@ -1,12 +1,15 @@
 use crate::{error::Result, models::FcmPayload};
 use async_trait::async_trait;
 use firebase_messaging_rs::{
-    fcm::{FCMApi, FCMError as FirebaseFCMError, Message, Notification},
+    fcm::{
+        ios::{
+            Alert, ApnsConfig, ApnsHeaders, ApnsPriority, ApnsPushType, Aps, ContentAvailable,
+            MutableContent, RichAlert,
+        },
+        FCMApi, FCMError as FirebaseFCMError, Message, Notification,
+    },
     FCMClient as FirebaseClient,
 };
-// Removed unused imports
-// use serde_json;
-// use base64;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
@@ -130,6 +133,61 @@ impl RealFcmClient {
     }
 }
 
+fn build_apns_config(payload: &FcmPayload) -> Option<ApnsConfig> {
+    // APNS config is transport-owned — FcmPayload.apns should never be set.
+    debug_assert!(
+        payload.apns.is_none(),
+        "FcmPayload.apns must not be set; APNS config is built at transport level"
+    );
+
+    let data = payload.data.clone().unwrap_or_default();
+    let title = payload
+        .notification
+        .as_ref()
+        .and_then(|notification| notification.title.clone())
+        .or_else(|| data.get("title").cloned());
+    let body = payload
+        .notification
+        .as_ref()
+        .and_then(|notification| notification.body.clone())
+        .or_else(|| data.get("body").cloned());
+
+    if title.is_some() || body.is_some() {
+        let aps = Aps {
+            alert: Some(Alert::Structural(Box::new(RichAlert {
+                title,
+                body,
+                ..Default::default()
+            }))),
+            content_available: Some(ContentAvailable::On),
+            mutable_content: Some(MutableContent::On),
+            ..Default::default()
+        };
+
+        // Filter title/body from custom data — they're already in aps.alert.
+        let custom_data: HashMap<String, String> = data
+            .into_iter()
+            .filter(|(k, _)| k != "title" && k != "body")
+            .collect();
+
+        return Some(ApnsConfig::new(
+            &aps,
+            &custom_data,
+            Some(ApnsHeaders {
+                apns_push_type: Some(ApnsPushType::Alert),
+                apns_priority: Some(ApnsPriority::SendImmediately),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    if data.is_empty() {
+        None
+    } else {
+        Some(ApnsConfig::ios_background_notification(data))
+    }
+}
+
 #[async_trait]
 impl FcmSend for RealFcmClient {
     /// Sends a notification payload to a single FCM token using the real Firebase client.
@@ -138,6 +196,8 @@ impl FcmSend for RealFcmClient {
         token: &str,
         payload: FcmPayload,
     ) -> std::result::Result<(), FcmError> {
+        let apns = build_apns_config(&payload);
+
         // Support both notification+data and data-only messages
         let notification = payload.notification.map(|notif| Notification {
             title: notif.title,
@@ -151,7 +211,7 @@ impl FcmSend for RealFcmClient {
             notification, // Can be None for data-only messages
             data: payload.data,
             android: None,
-            apns: None,
+            apns,
             webpush: None,
             fcm_options: None,
         };
@@ -424,5 +484,74 @@ mod tests {
         // Assert that no message was recorded for the error token (use original instance)
         let sent = mock_sender.get_sent_messages();
         assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn test_build_apns_config_creates_alert_payload_from_data_only_message() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("title".to_string(), "New like".to_string());
+        data.insert("body".to_string(), "Alice liked your post".to_string());
+        data.insert("eventId".to_string(), "abc123".to_string());
+
+        let payload = FcmPayload {
+            notification: None,
+            data: Some(data),
+            android: None,
+            webpush: None,
+            apns: None,
+        };
+
+        let apns_config = build_apns_config(&payload).expect("apns config should exist");
+
+        let json = serde_json::to_value(&apns_config).expect("serialization should succeed");
+        let expected = serde_json::json!({
+            "payload": {
+                "aps": {
+                    "alert": {
+                        "title": "New like",
+                        "body": "Alice liked your post"
+                    },
+                    "content-available": 1,
+                    "mutable-content": 1
+                },
+                "eventId": "abc123"
+            },
+            "headers": {
+                "apns-push-type": "alert",
+                "apns-priority": "10"
+            }
+        });
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn test_build_apns_config_uses_background_transport_without_alert_fields() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("eventId".to_string(), "abc123".to_string());
+
+        let payload = FcmPayload {
+            notification: None,
+            data: Some(data),
+            android: None,
+            webpush: None,
+            apns: None,
+        };
+
+        let apns_config = build_apns_config(&payload).expect("apns config should exist");
+
+        let json = serde_json::to_value(&apns_config).expect("serialization should succeed");
+        let expected = serde_json::json!({
+            "payload": {
+                "aps": {
+                    "content-available": 1
+                },
+                "eventId": "abc123"
+            },
+            "headers": {
+                "apns-push-type": "background",
+                "apns-priority": "5"
+            }
+        });
+        assert_eq!(json, expected);
     }
 }
