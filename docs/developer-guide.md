@@ -52,9 +52,14 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Repost | 16 | Repost of user's note (p-tag) |
 
+> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, and reposts are the types actually delivered today.
+
 ## FCM Payload Format
 
-The service sends **data-only** FCM messages (no `notification` field). This gives the client full control over how notifications are displayed.
+The FCM message carries **no top-level `notification` field** — the `data` map below is always present and is identical in shape for every notification type (only the `title`/`body` strings differ). Per-platform delivery then diverges so that **one incoming push produces exactly one visible banner**:
+
+- **Android** — data-only (`notification` and `android` unset). Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields.
+- **iOS** — the service attaches an APNS override: `aps.alert` (title/body) + `mutable-content: 1`, push-type `alert`, priority 10. The OS presents the single banner; a Notification Service Extension (if shipped) uses `mutable-content` to *enrich* that same banner, never to create a second one. `content-available` is deliberately omitted — see [Avoiding duplicate banners](#avoiding-duplicate-banners).
 
 ```json
 {
@@ -90,13 +95,38 @@ The service sends **data-only** FCM messages (no `notification` field). This giv
 | `timestamp` | string | Unix timestamp of the event as string |
 | `referencedEventId` | hex | (optional) The event being reacted to or replied to |
 
+### iOS APNS shape
+
+For a like, the APNS override the service emits is:
+
+```json
+{
+  "aps": {
+    "alert": { "title": "New like", "body": "Alice liked your post" },
+    "mutable-content": 1
+  },
+  "type": "Like",
+  "eventId": "abc123...",
+  "...": "remaining data fields (title/body live in aps.alert, not duplicated here)"
+}
+```
+
+Headers: `apns-push-type: alert`, `apns-priority: 10`.
+
+A *silent/background* push — a data message with neither `title` nor `body` — instead uses `aps.content-available: 1`, push-type `background`, priority 5. The current notification types always carry `title`/`body`, so this background shape is not emitted today.
+
+### Avoiding duplicate banners
+
+`content-available: 1` is intentionally **absent** from alert pushes. It is iOS's background-update flag: it wakes the app's background isolate, which would build a **second, local** banner on top of the OS-presented `aps.alert` — the duplicate-banner bug ([divine-push-service#20](https://github.com/divinevideo/divine-push-service/issues/20)). An `aps.alert` push is delivered reliably to **terminated** iOS apps *without* `content-available` (that flag matters only for *silent* pushes, which iOS throttles when the app is terminated), so omitting it costs no delivery reliability.
+
+The contract is mirrored on the client ([divine-mobile#4760](https://github.com/divinevideo/divine-mobile/pull/4760)): the app renders a local banner **only** when the message has no OS-presented notification (`message.notification == null`, i.e. the Android data-only case). When iOS surfaces the `aps.alert` as `RemoteMessage.notification`, the client suppresses its local render. Result: **one push → one banner** across foreground, background, and terminated states.
+
 ### Client Handling
 
-Since these are data-only messages:
-- **Android**: The app must create and display the notification itself via `onMessageReceived`
-- **iOS**: The app must use a Notification Service Extension or handle via `application:didReceiveRemoteNotification:`
-- **Foreground**: The app receives the data and decides whether/how to show it
-- **Background**: A background handler must create a local notification from the data fields
+- **Android**: data-only — the app creates and displays the notification via `onMessageReceived` / background handler.
+- **iOS**: the OS presents the `aps.alert`; an optional Notification Service Extension enriches it via `mutable-content`. The app must **not** create a separate local notification for these.
+- **Foreground**: iOS does not OS-present in the foreground, so the app is the sole renderer; Android likewise renders once.
+- **Taps**: tapping the OS-presented banner routes via the platform notification-open callbacks (e.g. `onMessageOpenedApp` / `getInitialMessage`) using the `data` fields; routing does not depend on `content-available`.
 
 ## Service Discovery
 
