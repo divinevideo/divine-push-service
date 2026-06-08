@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use firebase_messaging_rs::{
     fcm::{
         ios::{
-            Alert, ApnsConfig, ApnsHeaders, ApnsPriority, ApnsPushType, Aps, ContentAvailable,
-            MutableContent, RichAlert,
+            Alert, ApnsConfig, ApnsHeaders, ApnsPriority, ApnsPushType, Aps, MutableContent,
+            RichAlert,
         },
         FCMApi, FCMError as FirebaseFCMError, Message, Notification,
     },
@@ -153,13 +153,16 @@ fn build_apns_config(payload: &FcmPayload) -> Option<ApnsConfig> {
         .or_else(|| data.get("body").cloned());
 
     if title.is_some() || body.is_some() {
+        // Alert push: the OS presents this single banner (NSE may enrich it via
+        // mutable-content). Deliberately NO content-available — that flag wakes the
+        // app's background isolate, which renders a *second*, duplicate banner. An
+        // alert push reaches terminated iOS apps without it. See divine-push-service#20.
         let aps = Aps {
             alert: Some(Alert::Structural(Box::new(RichAlert {
                 title,
                 body,
                 ..Default::default()
             }))),
-            content_available: Some(ContentAvailable::On),
             mutable_content: Some(MutableContent::On),
             ..Default::default()
         };
@@ -511,7 +514,6 @@ mod tests {
                         "title": "New like",
                         "body": "Alice liked your post"
                     },
-                    "content-available": 1,
                     "mutable-content": 1
                 },
                 "eventId": "abc123"
