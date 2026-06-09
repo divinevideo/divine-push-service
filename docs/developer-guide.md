@@ -48,15 +48,18 @@ The service watches for these event kinds and notifies the tagged recipient:
 |------|-----------|---------|
 | Like | 7 | Reaction to user's note (p-tag) |
 | Comment | 1 | Reply to user's note (p-tag, with e-tag reference) |
+| Comment | 1111 | NIP-22 comment on a user's video or article (notifies root author `P` and parent author `p`) |
 | Follow | 3 | New contact list including user (p-tag) |
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Repost | 16 | Repost of user's note (p-tag) |
 
 > **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, and reposts are the types actually delivered today.
 
+> **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
+
 ## FCM Payload Format
 
-The FCM message carries **no top-level `notification` field** — the `data` map below is always present and is identical in shape for every notification type (only the `title`/`body` strings differ). Per-platform delivery then diverges so that **one incoming push produces exactly one visible banner**:
+The FCM message carries **no top-level `notification` field** — the `data` map below is always present and is identical in shape for every notification type (only the `title`/`body` strings differ); every `data` value is a string. Per-platform delivery then diverges so that **one incoming push produces exactly one visible banner**:
 
 - **Android** — data-only (`notification` and `android` unset). Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields.
 - **iOS** — the service attaches an APNS override: `aps.alert` (title/body) + `mutable-content: 1`, push-type `alert`, priority 10. The OS presents the single banner; a Notification Service Extension (if shipped) uses `mutable-content` to *enrich* that same banner, never to create a second one. `content-available` is deliberately omitted — see [Avoiding duplicate banners](#avoiding-duplicate-banners).
@@ -64,7 +67,7 @@ The FCM message carries **no top-level `notification` field** — the `data` map
 ```json
 {
   "data": {
-    "type": "Like",
+    "type": "like",
     "eventId": "abc123...",
     "title": "New like",
     "body": "Alice liked your post",
@@ -74,26 +77,51 @@ The FCM message carries **no top-level `notification` field** — the `data` map
     "receiverNpub": "npub1...",
     "eventKind": "7",
     "timestamp": "1712345678",
-    "referencedEventId": "fedcba..."
+    "referencedEventId": "fedcba...",
+    "referencedAddress": "34236:9b2f...:my-vine-id",
+    "referencedKind": "34236",
+    "referencedAuthorPubkey": "9b2f...",
+    "referencedDTag": "my-vine-id"
   }
 }
 ```
 
-### Fields
+### Routing & attribution contract
+
+Each field is either **authoritative** — the client may route to and attribute the notification from it directly — or **presentation-only** — safe to display, but never used to decide *which* target to open.
+
+For a like, comment, or repost on a video the authoritative target is the addressable coordinate in `referencedAddress` (`kind:pubkey:d-tag`), taken verbatim from the triggering event's `a`/`A` tag. The owner pubkey is therefore the one the actor signed into the event, not the notification recipient.
+
+> **Clients MUST NOT** synthesize a video coordinate by pairing `referencedDTag` (or any d-tag) with the *recipient's* pubkey. The recipient is not necessarily the video owner — e.g. a reply to another user's comment, or a mention — and doing so attributes the notification to the wrong (or a nonexistent) video. Use `referencedAuthorPubkey` / `referencedAddress` for ownership; fall back to `referencedEventId` when no coordinate is present.
+
+When the triggering event carries no addressable reference (a follow, a mention in a plain note, or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
+
+#### Authoritative (routing / attribution)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `Like`, `Comment`, `Follow`, `Mention`, or `Repost` |
-| `eventId` | hex | The Nostr event that triggered the notification |
+| `type` | string | `like`, `comment`, `follow`, `mention`, or `repost` (lowercase) |
+| `eventId` | hex | The Nostr event that triggered the notification (the like/comment/repost/follow event itself); stable id for dedup and a routing fallback |
+| `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes follows and otherwise-unresolved taps |
+| `receiverPubkey` | hex | Pubkey of the notification recipient |
+| `referencedEventId` | hex | (optional) Target event. Root-aware: the NIP-22 uppercase `E` root scope when present, else the lowercase `e` tag — so comments anchor to the root video, not the parent comment |
+| `referencedAddress` | string | (optional) Authoritative addressable target coordinate `kind:pubkey:d-tag`, from the event's `A` (NIP-22 root) or `a` tag. Present when the target is an addressable event such as a kind 34236 video |
+| `referencedKind` | string | (optional) Kind component of `referencedAddress` (e.g. `34236`) |
+| `referencedAuthorPubkey` | hex | (optional) Owner-pubkey component of `referencedAddress` — the authoritative video owner |
+| `referencedDTag` | string | (optional) `d`-tag component of `referencedAddress`. Combine only with `referencedAuthorPubkey` (never the recipient) to rebuild the coordinate |
+
+#### Presentation-only (display)
+
+| Field | Type | Description |
+|-------|------|-------------|
 | `title` | string | Human-readable title (e.g. "New like") |
 | `body` | string | Human-readable body (e.g. "Alice liked your post") |
-| `senderPubkey` | hex | Pubkey of the user who triggered the event |
 | `senderName` | string | Display name or truncated npub of the sender |
-| `receiverPubkey` | hex | Pubkey of the notification recipient |
 | `receiverNpub` | bech32 | Bech32-encoded npub of the recipient |
-| `eventKind` | string | Nostr event kind as string (e.g. "7") |
-| `timestamp` | string | Unix timestamp of the event as string |
-| `referencedEventId` | hex | (optional) The event being reacted to or replied to |
+| `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
+| `timestamp` | string | Unix timestamp of the triggering event as a string |
+
+The `referenced*` coordinate fields are emitted only when the triggering event references an addressable event — currently kind 34236 videos via likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and follows/mentions omit them.
 
 ### iOS APNS shape
 
@@ -105,7 +133,7 @@ For a like, the APNS override the service emits is:
     "alert": { "title": "New like", "body": "Alice liked your post" },
     "mutable-content": 1
   },
-  "type": "Like",
+  "type": "like",
   "eventId": "abc123...",
   "...": "remaining data fields (title/body live in aps.alert, not duplicated here)"
 }

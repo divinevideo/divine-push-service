@@ -20,13 +20,6 @@ const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
 
-/// Content event kinds that trigger notifications
-const KIND_TEXT_NOTE: u16 = 1;
-const KIND_CONTACT_LIST: u16 = 3;
-const KIND_REACTION: u16 = 7;
-const KIND_REPOST: u16 = 16;
-const KIND_LONG_FORM: u16 = 30023;
-
 pub struct NostrListener {
     state: Arc<AppState>,
 }
@@ -168,19 +161,29 @@ impl NostrListener {
     }
 
     async fn subscribe_to_live_events(&self, token: &CancellationToken) -> Result<()> {
-        // Subscribe to all relevant kinds for diVine
-        let all_kinds = vec![
+        let mut all_kinds = vec![
             // Control kinds
             Kind::from(KIND_REGISTRATION),
             Kind::from(KIND_DEREGISTRATION),
             Kind::from(KIND_PREFERENCES_UPDATE),
-            // Notification trigger kinds
-            Kind::from(KIND_TEXT_NOTE),
-            Kind::from(KIND_CONTACT_LIST),
-            Kind::from(KIND_REACTION),
-            Kind::from(KIND_REPOST),
-            Kind::from(KIND_LONG_FORM),
         ];
+
+        for kind in &self.state.settings.notification.event_kinds {
+            match u16::try_from(*kind) {
+                Ok(kind) => {
+                    let kind = Kind::from(kind);
+                    if !all_kinds.contains(&kind) {
+                        all_kinds.push(kind);
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        kind,
+                        "Skipping notification event kind outside Nostr u16 range"
+                    );
+                }
+            }
+        }
 
         // Look back 1 hour to catch any recent events
         let since = Timestamp::now() - Duration::from_secs(60 * 60);

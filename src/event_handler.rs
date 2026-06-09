@@ -395,6 +395,13 @@ async fn handle_content_event(
             NotificationType::Mention
         };
         (notification_type, recipients)
+    } else if kind_num == 1111 {
+        // Kind 1111: NIP-22 comment (diVine publishes video comments here, not
+        // as kind 1). Notify the root author (uppercase `P`, the video owner)
+        // and the direct parent author (lowercase `p`). create_fcm_payload
+        // attaches the authoritative root-video target from the uppercase `A`.
+        let recipients = find_comment_recipients(event);
+        (NotificationType::Comment, recipients)
     } else if kind_num == 3 {
         // Kind 3: Contact list - notify newly followed users
         // Note: This would require tracking previous contact list state
@@ -507,6 +514,35 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
         .filter_map(|t| t.content())
         .filter_map(|content| PublicKey::from_str(content).ok())
         .collect()
+}
+
+/// Find recipients for a NIP-22 comment event (kind 1111).
+///
+/// Per NIP-22 the uppercase `P` tag is the root-scope author (for a video
+/// comment, the video owner) and the lowercase `p` tag is the parent-item
+/// author (for a reply, the parent comment's author — *not* the owner). Both
+/// are notified so the owner hears about comments on their video and the
+/// replied-to author hears about the reply; the two coincide for a top-level
+/// comment, so the result is deduplicated. The authoritative routing target
+/// (the root video) is attached separately by `create_fcm_payload` from the
+/// uppercase `A`/`E` root scope.
+fn find_comment_recipients(event: &Event) -> Vec<PublicKey> {
+    let root_author = TagKind::single_letter(Alphabet::P, true);
+    let parent_author = TagKind::p();
+
+    let mut recipients: Vec<PublicKey> = Vec::new();
+    for tag in event.tags.iter() {
+        let tag_kind = tag.kind();
+        if tag_kind != root_author && tag_kind != parent_author {
+            continue;
+        }
+        if let Some(pubkey) = tag.content().and_then(|c| PublicKey::from_str(c).ok()) {
+            if !recipients.contains(&pubkey) {
+                recipients.push(pubkey);
+            }
+        }
+    }
+    recipients
 }
 
 /// Send a notification to a specific user
@@ -766,15 +802,11 @@ async fn create_fcm_payload(
         event.created_at.as_secs().to_string(),
     );
 
-    // Add e-tag reference if present (for comments/reactions)
-    if let Some(e_tag) = event.tags.find(TagKind::e()) {
-        if let Some(referenced_event_id) = e_tag.content() {
-            data.insert(
-                "referencedEventId".to_string(),
-                referenced_event_id.to_string(),
-            );
-        }
-    }
+    // Add authoritative routing/attribution target fields: the referenced event
+    // id and, for addressable targets (e.g. kind 34236 videos), the signed
+    // coordinate (`referencedAddress` + components) so the client never has to
+    // guess the target's owner.
+    insert_reference_fields(&mut data, event);
 
     Ok(FcmPayload {
         notification: None, // Data-only message for better client control
@@ -782,6 +814,81 @@ async fn create_fcm_payload(
         android: None,
         webpush: None,
         apns: None,
+    })
+}
+
+/// Authoritative addressable target extracted from an event's `A`/`a` tag.
+///
+/// `address` is the full NIP-01 coordinate (`kind:pubkey:d-tag`); the remaining
+/// fields are its components. The owner pubkey comes from the coordinate signed
+/// into the actor's event, so consumers never have to infer ownership.
+struct ReferencedCoordinate {
+    address: String,
+    kind: String,
+    author_pubkey: String,
+    d_tag: String,
+}
+
+/// Insert routing/attribution target fields into the FCM data map.
+///
+/// Adds `referencedEventId` (root-aware: prefers the NIP-22 uppercase `E` root
+/// scope, else the lowercase `e` tag) and, when the event references an
+/// addressable event, the authoritative `referencedAddress` coordinate split
+/// into `referencedKind`, `referencedAuthorPubkey`, and `referencedDTag`.
+fn insert_reference_fields(data: &mut std::collections::HashMap<String, String>, event: &Event) {
+    if let Some(event_id) = referenced_event_id(event) {
+        data.insert("referencedEventId".to_string(), event_id);
+    }
+    if let Some(coord) = referenced_coordinate(event) {
+        data.insert("referencedAddress".to_string(), coord.address);
+        data.insert("referencedKind".to_string(), coord.kind);
+        data.insert("referencedAuthorPubkey".to_string(), coord.author_pubkey);
+        data.insert("referencedDTag".to_string(), coord.d_tag);
+    }
+}
+
+/// Root-aware referenced event id.
+///
+/// Prefers the NIP-22 uppercase `E` root scope when present (so a comment
+/// anchors to the root video, not the parent comment), otherwise the lowercase
+/// `e` tag used by reactions and reposts.
+fn referenced_event_id(event: &Event) -> Option<String> {
+    event
+        .tags
+        .find(TagKind::single_letter(Alphabet::E, true))
+        .or_else(|| event.tags.find(TagKind::e()))
+        .and_then(|tag| tag.content())
+        .map(str::to_string)
+}
+
+/// Authoritative addressable target from the event's `A` (NIP-22 root) tag,
+/// falling back to the lowercase `a` (parent) tag.
+///
+/// Returns `None` when there is no addressable reference, or when the
+/// coordinate is not a well-formed `kind:pubkey:d-tag` (numeric kind, non-empty
+/// pubkey and d-tag). A d-tag may itself contain `:`, so only the first two
+/// separators are split.
+fn referenced_coordinate(event: &Event) -> Option<ReferencedCoordinate> {
+    let address = event
+        .tags
+        .find(TagKind::single_letter(Alphabet::A, true))
+        .or_else(|| event.tags.find(TagKind::a()))
+        .and_then(|tag| tag.content())?;
+
+    let mut parts = address.splitn(3, ':');
+    let kind = parts.next()?;
+    let author_pubkey = parts.next()?;
+    let d_tag = parts.next()?;
+
+    if kind.parse::<u32>().is_err() || author_pubkey.is_empty() || d_tag.is_empty() {
+        return None;
+    }
+
+    Some(ReferencedCoordinate {
+        address: address.to_string(),
+        kind: kind.to_string(),
+        author_pubkey: author_pubkey.to_string(),
+        d_tag: d_tag.to_string(),
     })
 }
 
@@ -945,6 +1052,61 @@ mod tests {
         assert_eq!(pubkeys.len(), 3);
     }
 
+    #[test]
+    fn test_find_comment_recipients_reply_notifies_root_and_parent_authors() {
+        let actor = Keys::generate();
+        let video_owner = Keys::generate();
+        let parent_comment_author = Keys::generate();
+
+        // A NIP-22 reply to a comment on a video: the uppercase `P` is the root
+        // author (the video owner) and the lowercase `p` is the parent comment's
+        // author. Both must be notified, and they are distinct pubkeys here.
+        let event = EventBuilder::new(Kind::from(1111), "replying")
+            .tag(Tag::parse(["P", video_owner.public_key().to_hex().as_str()]).unwrap())
+            .tag(Tag::public_key(parent_comment_author.public_key()))
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let recipients = find_comment_recipients(&event);
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&video_owner.public_key()));
+        assert!(recipients.contains(&parent_comment_author.public_key()));
+    }
+
+    #[test]
+    fn test_find_comment_recipients_top_level_dedups_root_and_parent() {
+        let actor = Keys::generate();
+        let video_owner = Keys::generate();
+
+        // A top-level comment on a video: the parent scope equals the root scope,
+        // so uppercase `P` and lowercase `p` both point at the video owner. The
+        // owner must be notified exactly once.
+        let event = EventBuilder::new(Kind::from(1111), "nice video")
+            .tag(Tag::parse(["P", video_owner.public_key().to_hex().as_str()]).unwrap())
+            .tag(Tag::public_key(video_owner.public_key()))
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let recipients = find_comment_recipients(&event);
+        assert_eq!(recipients, vec![video_owner.public_key()]);
+    }
+
+    #[test]
+    fn test_find_comment_recipients_none_without_author_tags() {
+        let actor = Keys::generate();
+
+        // A NIP-22 comment scoped to an external identity (`I`/`i`, e.g. a URL)
+        // carries no `P`/`p` author tags, so there is nobody to notify.
+        let event = EventBuilder::new(Kind::from(1111), "nice article")
+            .tag(Tag::parse(["I", "https://example.com/article"]).unwrap())
+            .tag(Tag::parse(["K", "web"]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let recipients = find_comment_recipients(&event);
+        assert!(recipients.is_empty());
+    }
+
     // =========================================================================
     // Notification Type Detection Tests
     // =========================================================================
@@ -1039,5 +1201,130 @@ mod tests {
             .unwrap();
 
         assert!(is_event_for_service(&event, &service.public_key()));
+    }
+
+    // =========================================================================
+    // Authoritative Target Field Tests (referenced event id + addressable coord)
+    // =========================================================================
+
+    #[test]
+    fn test_insert_reference_fields_like_with_addressable_coordinate() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let video_event_id = "c".repeat(64);
+        let address = format!("34236:{}:my-vine-id", owner.public_key().to_hex());
+
+        // A like (kind 7) on a video carries a lowercase `a` coordinate plus the
+        // video event id in `e` and the owner in `p`.
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["e", video_event_id.as_str()]).unwrap())
+            .tag(Tag::parse(["a", address.as_str()]).unwrap())
+            .tag(Tag::public_key(owner.public_key()))
+            .tag(Tag::parse(["k", "34236"]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        insert_reference_fields(&mut data, &event);
+
+        assert_eq!(data.get("referencedEventId"), Some(&video_event_id));
+        assert_eq!(data.get("referencedAddress"), Some(&address));
+        assert_eq!(data.get("referencedKind"), Some(&"34236".to_string()));
+        assert_eq!(
+            data.get("referencedAuthorPubkey"),
+            Some(&owner.public_key().to_hex())
+        );
+        assert_eq!(data.get("referencedDTag"), Some(&"my-vine-id".to_string()));
+    }
+
+    #[test]
+    fn test_insert_reference_fields_prefers_nip22_root_scope() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let root_video_id = "a".repeat(64);
+        let parent_comment_id = "b".repeat(64);
+        let address = format!("34236:{}:root-vine", owner.public_key().to_hex());
+
+        // A NIP-22 comment (kind 1111): the uppercase root scope (`A`/`E`) is the
+        // video; the lowercase parent (`a`/`e`) is the comment being replied to.
+        // The authoritative target must be the root video, not the parent comment.
+        let event = EventBuilder::new(Kind::from(1111), "nice!")
+            .tag(Tag::parse(["E", root_video_id.as_str()]).unwrap())
+            .tag(Tag::parse(["A", address.as_str()]).unwrap())
+            .tag(Tag::parse(["K", "34236"]).unwrap())
+            .tag(Tag::parse(["e", parent_comment_id.as_str()]).unwrap())
+            .tag(Tag::parse(["k", "1111"]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        insert_reference_fields(&mut data, &event);
+
+        // Anchors to the root video, NOT the parent comment.
+        assert_eq!(data.get("referencedEventId"), Some(&root_video_id));
+        assert_eq!(data.get("referencedAddress"), Some(&address));
+        assert_eq!(
+            data.get("referencedAuthorPubkey"),
+            Some(&owner.public_key().to_hex())
+        );
+        assert_eq!(data.get("referencedDTag"), Some(&"root-vine".to_string()));
+    }
+
+    #[test]
+    fn test_insert_reference_fields_event_id_only_when_no_coordinate() {
+        let actor = Keys::generate();
+        let comment_id = "d".repeat(64);
+
+        // A like on a comment (kind 1111 target) has an `e` tag but no `a` tag.
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["e", comment_id.as_str()]).unwrap())
+            .tag(Tag::parse(["k", "1111"]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        insert_reference_fields(&mut data, &event);
+
+        assert_eq!(data.get("referencedEventId"), Some(&comment_id));
+        assert!(!data.contains_key("referencedAddress"));
+        assert!(!data.contains_key("referencedDTag"));
+        assert!(!data.contains_key("referencedAuthorPubkey"));
+        assert!(!data.contains_key("referencedKind"));
+    }
+
+    #[test]
+    fn test_insert_reference_fields_none_when_no_reference_tags() {
+        let actor = Keys::generate();
+        let target = Keys::generate();
+
+        // A mention carries only a `p` tag: no addressable target, no event ref.
+        let event = EventBuilder::text_note("hey @you")
+            .tag(Tag::public_key(target.public_key()))
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        insert_reference_fields(&mut data, &event);
+
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_insert_reference_fields_preserves_colons_in_dtag() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        // A d-tag may itself contain ':'; the split must keep it intact.
+        let address = format!("34236:{}:weird:d:tag", owner.public_key().to_hex());
+
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["a", address.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        insert_reference_fields(&mut data, &event);
+
+        assert_eq!(data.get("referencedAddress"), Some(&address));
+        assert_eq!(data.get("referencedDTag"), Some(&"weird:d:tag".to_string()));
     }
 }

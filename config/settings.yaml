@@ -38,6 +38,7 @@ notification:
     - 3      # Contact list (follows)
     - 7      # Reactions/likes (NIP-25)
     - 16     # Generic reposts (NIP-18)
+    - 1111   # NIP-22 comments
     - 30023  # Long-form content (mentions)
   # Default kinds users receive notifications for (can be customized via kind 3083)
   default_preferences:
