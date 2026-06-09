@@ -156,6 +156,7 @@ fn default_event_kinds() -> Vec<u64> {
         3,     // Contact list (follows)
         7,     // Reactions/likes (NIP-25)
         16,    // Generic reposts (NIP-18)
+        1111,  // NIP-22 comments
         30023, // Long-form content (mentions)
     ]
 }
@@ -247,6 +248,7 @@ mod tests {
         assert!(kinds.contains(&3)); // Contact list
         assert!(kinds.contains(&7)); // Reactions
         assert!(kinds.contains(&16)); // Reposts
+        assert!(kinds.contains(&1111)); // NIP-22 comments
         assert!(kinds.contains(&30023)); // Long-form
     }
 }
