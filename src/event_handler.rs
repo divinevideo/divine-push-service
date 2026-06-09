@@ -395,6 +395,13 @@ async fn handle_content_event(
             NotificationType::Mention
         };
         (notification_type, recipients)
+    } else if kind_num == 1111 {
+        // Kind 1111: NIP-22 comment (diVine publishes video comments here, not
+        // as kind 1). Notify the root author (uppercase `P`, the video owner)
+        // and the direct parent author (lowercase `p`). create_fcm_payload
+        // attaches the authoritative root-video target from the uppercase `A`.
+        let recipients = find_comment_recipients(event);
+        (NotificationType::Comment, recipients)
     } else if kind_num == 3 {
         // Kind 3: Contact list - notify newly followed users
         // Note: This would require tracking previous contact list state
@@ -507,6 +514,35 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
         .filter_map(|t| t.content())
         .filter_map(|content| PublicKey::from_str(content).ok())
         .collect()
+}
+
+/// Find recipients for a NIP-22 comment event (kind 1111).
+///
+/// Per NIP-22 the uppercase `P` tag is the root-scope author (for a video
+/// comment, the video owner) and the lowercase `p` tag is the parent-item
+/// author (for a reply, the parent comment's author — *not* the owner). Both
+/// are notified so the owner hears about comments on their video and the
+/// replied-to author hears about the reply; the two coincide for a top-level
+/// comment, so the result is deduplicated. The authoritative routing target
+/// (the root video) is attached separately by `create_fcm_payload` from the
+/// uppercase `A`/`E` root scope.
+fn find_comment_recipients(event: &Event) -> Vec<PublicKey> {
+    let root_author = TagKind::single_letter(Alphabet::P, true);
+    let parent_author = TagKind::p();
+
+    let mut recipients: Vec<PublicKey> = Vec::new();
+    for tag in event.tags.iter() {
+        let tag_kind = tag.kind();
+        if tag_kind != root_author && tag_kind != parent_author {
+            continue;
+        }
+        if let Some(pubkey) = tag.content().and_then(|c| PublicKey::from_str(c).ok()) {
+            if !recipients.contains(&pubkey) {
+                recipients.push(pubkey);
+            }
+        }
+    }
+    recipients
 }
 
 /// Send a notification to a specific user
@@ -1014,6 +1050,61 @@ mod tests {
 
         let pubkeys = find_mentioned_pubkeys(&event);
         assert_eq!(pubkeys.len(), 3);
+    }
+
+    #[test]
+    fn test_find_comment_recipients_reply_notifies_root_and_parent_authors() {
+        let actor = Keys::generate();
+        let video_owner = Keys::generate();
+        let parent_comment_author = Keys::generate();
+
+        // A NIP-22 reply to a comment on a video: the uppercase `P` is the root
+        // author (the video owner) and the lowercase `p` is the parent comment's
+        // author. Both must be notified, and they are distinct pubkeys here.
+        let event = EventBuilder::new(Kind::from(1111), "replying")
+            .tag(Tag::parse(["P", video_owner.public_key().to_hex().as_str()]).unwrap())
+            .tag(Tag::public_key(parent_comment_author.public_key()))
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let recipients = find_comment_recipients(&event);
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&video_owner.public_key()));
+        assert!(recipients.contains(&parent_comment_author.public_key()));
+    }
+
+    #[test]
+    fn test_find_comment_recipients_top_level_dedups_root_and_parent() {
+        let actor = Keys::generate();
+        let video_owner = Keys::generate();
+
+        // A top-level comment on a video: the parent scope equals the root scope,
+        // so uppercase `P` and lowercase `p` both point at the video owner. The
+        // owner must be notified exactly once.
+        let event = EventBuilder::new(Kind::from(1111), "nice video")
+            .tag(Tag::parse(["P", video_owner.public_key().to_hex().as_str()]).unwrap())
+            .tag(Tag::public_key(video_owner.public_key()))
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let recipients = find_comment_recipients(&event);
+        assert_eq!(recipients, vec![video_owner.public_key()]);
+    }
+
+    #[test]
+    fn test_find_comment_recipients_none_without_author_tags() {
+        let actor = Keys::generate();
+
+        // A NIP-22 comment scoped to an external identity (`I`/`i`, e.g. a URL)
+        // carries no `P`/`p` author tags, so there is nobody to notify.
+        let event = EventBuilder::new(Kind::from(1111), "nice article")
+            .tag(Tag::parse(["I", "https://example.com/article"]).unwrap())
+            .tag(Tag::parse(["K", "web"]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let recipients = find_comment_recipients(&event);
+        assert!(recipients.is_empty());
     }
 
     // =========================================================================

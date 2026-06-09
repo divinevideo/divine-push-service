@@ -48,11 +48,14 @@ The service watches for these event kinds and notifies the tagged recipient:
 |------|-----------|---------|
 | Like | 7 | Reaction to user's note (p-tag) |
 | Comment | 1 | Reply to user's note (p-tag, with e-tag reference) |
+| Comment | 1111 | NIP-22 comment on a user's video or article (notifies root author `P` and parent author `p`) |
 | Follow | 3 | New contact list including user (p-tag) |
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Repost | 16 | Repost of user's note (p-tag) |
 
 > **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, and reposts are the types actually delivered today.
+
+> **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
 
 ## FCM Payload Format
 
@@ -118,7 +121,7 @@ When the triggering event carries no addressable reference (a follow, a mention 
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
 | `timestamp` | string | Unix timestamp of the triggering event as a string |
 
-The `referenced*` coordinate fields are emitted only when the triggering event references an addressable event — currently kind 34236 videos via likes/reposts. Likes/reposts on non-video targets and follows/mentions omit them.
+The `referenced*` coordinate fields are emitted only when the triggering event references an addressable event — currently kind 34236 videos via likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and follows/mentions omit them.
 
 ### iOS APNS shape
 

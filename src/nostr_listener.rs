@@ -25,6 +25,7 @@ const KIND_TEXT_NOTE: u16 = 1;
 const KIND_CONTACT_LIST: u16 = 3;
 const KIND_REACTION: u16 = 7;
 const KIND_REPOST: u16 = 16;
+const KIND_COMMENT: u16 = 1111;
 const KIND_LONG_FORM: u16 = 30023;
 
 pub struct NostrListener {
@@ -179,6 +180,7 @@ impl NostrListener {
             Kind::from(KIND_CONTACT_LIST),
             Kind::from(KIND_REACTION),
             Kind::from(KIND_REPOST),
+            Kind::from(KIND_COMMENT),
             Kind::from(KIND_LONG_FORM),
         ];
 
