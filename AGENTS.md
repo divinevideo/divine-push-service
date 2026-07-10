@@ -4,6 +4,22 @@ This file is the canonical agent guide for this repo. It is tool-agnostic; Claud
 Code reads it via an `@AGENTS.md` import in `CLAUDE.md`. Keep Claude-only notes in
 `CLAUDE.md`; everything else belongs here.
 
+## Divine Context And Brain
+
+Before broad product, architecture, protocol, cross-repo, or service-boundary work, read the shared Divine context primer.
+
+Use `DIVINE_CONTEXT_ROOT` if set; otherwise look for `../divine-context`. If it is missing, try:
+
+`gh repo clone divinevideo/divine-context ../divine-context`
+
+The `divine-context` repo is private, so cloning requires GitHub access. If clone, network, or auth fails, continue from the local repo docs and avoid cross-repo assumptions.
+
+Before updating an existing context checkout, verify it is clean and on its default branch. If it is clean and on the default branch, update it with `git -C <context-dir> pull --ff-only`. If it is dirty, on another branch, cannot fast-forward, or network/auth fails, leave it untouched and say the context may be stale.
+
+Read `<context-dir>/AGENT_CONTEXT.md` and follow its instructions. If unavailable, continue from the local repo docs and avoid cross-repo assumptions.
+
+If a Divine Brain search or ask tool is available, you may use it for company memory. Treat it as optional and credentialed: tool names vary by client, and work must continue when Brain is unavailable. When Brain results influence work, cite the returned document ids. Never commit Brain credentials or expose Brain-derived sensitive content in public PRs, issues, branch names, commit messages, code comments, logs, screenshots, release notes, or externally shared agent transcripts.
+
 ## Project Structure & Module Organization
 - Service code lives in `src/`, with focused modules for relay listening, preferences, Redis storage, cleanup, and FCM delivery.
 - Integration and behavior tests live in `tests/`.
