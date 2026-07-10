@@ -1,6 +1,6 @@
-# diVine Push Service
+# Divine Push Service
 
-Push notification service for the [diVine](https://divine.video) mobile app.
+Push notification service for the [Divine](https://divine.video) mobile app.
 
 Implements [NIP-XX Push Notifications](docs/nip-xx-push-notifications.md) to deliver real-time Nostr event notifications via Firebase Cloud Messaging (FCM).
 
@@ -79,7 +79,7 @@ docker compose up -d
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  diVine App │────▶│ Nostr Relays│◀────│ Push Service│
+│  Divine App │────▶│ Nostr Relays│◀────│ Push Service│
 └─────────────┘     └─────────────┘     └──────┬──────┘
                                                │
                     ┌─────────────┐     ┌──────▼──────┐
@@ -93,7 +93,7 @@ docker compose up -d
                     └─────────────┘
 ```
 
-1. **diVine app** registers push token via NIP-44 encrypted event to relays
+1. **Divine app** registers push token via NIP-44 encrypted event to relays
 2. **Push service** monitors relays, decrypts registration, stores token in Redis
 3. **Push service** monitors relays for events matching user's subscriptions
 4. **Push service** sends notification to Firebase FCM
@@ -108,3 +108,7 @@ docker compose up -d
 ## License
 
 MIT
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
