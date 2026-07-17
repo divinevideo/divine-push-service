@@ -256,12 +256,25 @@ pub async fn try_claim_event(
     event_id: &EventId,
     ttl_seconds: u64,
 ) -> Result<bool> {
+    try_claim_dedup_key(pool, &event_id.to_hex(), ttl_seconds).await
+}
+
+/// Atomically claim an arbitrary deduplication key using `SET NX EX`.
+///
+/// # Errors
+///
+/// Returns an error when Redis cannot provide a connection or execute the claim.
+pub async fn try_claim_dedup_key(
+    pool: &RedisPool,
+    claim_key: &str,
+    ttl_seconds: u64,
+) -> Result<bool> {
     let mut conn = pool
         .get()
         .await
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
 
-    let key = format!("dedup:{}", event_id.to_hex());
+    let key = format!("dedup:{claim_key}");
 
     let result: Option<String> = redis::cmd("SET")
         .arg(&key)

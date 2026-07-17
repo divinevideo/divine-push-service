@@ -529,6 +529,17 @@ fn video_notification(event: &Event) -> (NotificationType, Vec<PublicKey>) {
     (NotificationType::Mention, recipients)
 }
 
+/// Build the coordinate-and-recipient key used to deduplicate video edits.
+fn video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<String> {
+    let d_tag = event.tags.identifier()?;
+    Some(format!(
+        "{}:{}:{d_tag}:{}",
+        event.kind.as_u16(),
+        event.pubkey.to_hex(),
+        recipient.to_hex()
+    ))
+}
+
 /// Find recipients for a NIP-22 comment event (kind 1111).
 ///
 /// Per NIP-22 the uppercase `P` tag is the root-scope author (for a video
@@ -618,6 +629,40 @@ async fn send_notification_to_user(
             "Notification type disabled by user preferences - skipping"
         );
         return Ok(());
+    }
+
+    if event.kind.as_u16() == KIND_VIDEO {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
+            warn!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Skipping video notification without an addressable d-tag"
+            );
+            return Ok(());
+        };
+        let claimed = tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while claiming video recipient.");
+                return Err(crate::error::ServiceError::Cancelled);
+            }
+            claim_result = redis_store::try_claim_dedup_key(
+                &state.redis_pool,
+                &claim_key,
+                state.settings.service.processed_event_ttl_secs,
+            ) => {
+                claim_result?
+            }
+        };
+
+        if !claimed {
+            trace!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Skipping video recipient already notified for this coordinate"
+            );
+            return Ok(());
+        }
     }
 
     info!(
@@ -1131,6 +1176,36 @@ mod tests {
         let (_, recipients) = video_notification(&event);
 
         assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn test_video_recipient_claim_key_is_stable_across_edits() {
+        let owner = Keys::generate();
+        let recipient = Keys::generate();
+        let first_event = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("video:d-tag"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let edited_event = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("video:d-tag"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+
+        assert_ne!(first_event.id, edited_event.id);
+        assert_eq!(
+            video_recipient_claim_key(&first_event, &recipient.public_key()),
+            video_recipient_claim_key(&edited_event, &recipient.public_key())
+        );
+        assert_eq!(
+            video_recipient_claim_key(&first_event, &recipient.public_key()),
+            Some(format!(
+                "34236:{}:video:d-tag:{}",
+                owner.public_key().to_hex(),
+                recipient.public_key().to_hex()
+            ))
+        );
     }
 
     #[test]
