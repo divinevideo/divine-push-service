@@ -51,6 +51,7 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Comment | 1111 | NIP-22 comment on a user's video or article (notifies root author `P` and parent author `p`) |
 | Follow | 3 | New contact list including user (p-tag) |
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
+| Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
 
 > **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, and reposts are the types actually delivered today.
@@ -92,9 +93,11 @@ Each field is either **authoritative** — the client may route to and attribute
 
 For a like, comment, or repost on a video the authoritative target is the addressable coordinate in `referencedAddress` (`kind:pubkey:d-tag`), taken verbatim from the triggering event's `a`/`A` tag. The owner pubkey is therefore the one the actor signed into the event, not the notification recipient.
 
+For a kind 34236 video mention, the triggering event is itself the addressable target. Its `referencedEventId` is the video's event id, while `referencedAddress` and its component fields come from the video's own kind, author pubkey, and `d` tag.
+
 > **Clients MUST NOT** synthesize a video coordinate by pairing `referencedDTag` (or any d-tag) with the *recipient's* pubkey. The recipient is not necessarily the video owner — e.g. a reply to another user's comment, or a mention — and doing so attributes the notification to the wrong (or a nonexistent) video. Use `referencedAuthorPubkey` / `referencedAddress` for ownership; fall back to `referencedEventId` when no coordinate is present.
 
-When the triggering event carries no addressable reference (a follow, a mention in a plain note, or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
+When the triggering event is not addressable and carries no addressable reference (a follow, a mention in a plain note, or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
 
 #### Authoritative (routing / attribution)
 
@@ -104,8 +107,8 @@ When the triggering event carries no addressable reference (a follow, a mention 
 | `eventId` | hex | The Nostr event that triggered the notification (the like/comment/repost/follow event itself); stable id for dedup and a routing fallback |
 | `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes follows and otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
-| `referencedEventId` | hex | (optional) Target event. Root-aware: the NIP-22 uppercase `E` root scope when present, else the lowercase `e` tag — so comments anchor to the root video, not the parent comment |
-| `referencedAddress` | string | (optional) Authoritative addressable target coordinate `kind:pubkey:d-tag`, from the event's `A` (NIP-22 root) or `a` tag. Present when the target is an addressable event such as a kind 34236 video |
+| `referencedEventId` | hex | (optional) Target event. For a direct kind 34236 trigger this is the video event's own id. Otherwise it is root-aware: the NIP-22 uppercase `E` root scope when present, else the lowercase `e` tag — so comments anchor to the root video, not the parent comment |
+| `referencedAddress` | string | (optional) Authoritative addressable target coordinate `kind:pubkey:d-tag`. Built from a direct kind 34236 trigger's own identity, or taken from the event's `A` (NIP-22 root) or `a` tag for an indirect reference |
 | `referencedKind` | string | (optional) Kind component of `referencedAddress` (e.g. `34236`) |
 | `referencedAuthorPubkey` | hex | (optional) Owner-pubkey component of `referencedAddress` — the authoritative video owner |
 | `referencedDTag` | string | (optional) `d`-tag component of `referencedAddress`. Combine only with `referencedAuthorPubkey` (never the recipient) to rebuild the coordinate |
@@ -121,7 +124,7 @@ When the triggering event carries no addressable reference (a follow, a mention 
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
 | `timestamp` | string | Unix timestamp of the triggering event as a string |
 
-The `referenced*` coordinate fields are emitted only when the triggering event references an addressable event — currently kind 34236 videos via likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and follows/mentions omit them.
+The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and follows/plain-note mentions omit them.
 
 ### iOS APNS shape
 
@@ -197,4 +200,5 @@ This is a list of event kinds the user wants notifications for. If no preference
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
 | `dedup:{event_id}` | String | Deduplication lock with TTL |
+| `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Per-recipient video-coordinate lock preventing repeat pushes after edits |
 | `divine:preferences:{pubkey}` | String | JSON notification preferences |
