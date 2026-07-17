@@ -158,6 +158,7 @@ fn default_event_kinds() -> Vec<u64> {
         16,    // Generic reposts (NIP-18)
         1111,  // NIP-22 comments
         30023, // Long-form content (mentions)
+        34236, // Video content (mentions)
     ]
 }
 
@@ -250,5 +251,6 @@ mod tests {
         assert!(kinds.contains(&16)); // Reposts
         assert!(kinds.contains(&1111)); // NIP-22 comments
         assert!(kinds.contains(&30023)); // Long-form
+        assert!(kinds.contains(&34236)); // Video mentions
     }
 }

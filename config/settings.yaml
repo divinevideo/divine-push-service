@@ -40,6 +40,7 @@ notification:
     - 16     # Generic reposts (NIP-18)
     - 1111   # NIP-22 comments
     - 30023  # Long-form content (mentions)
+    - 34236  # Video content (mentions)
   # Default kinds users receive notifications for (can be customized via kind 3083)
   default_preferences:
     kinds:
