@@ -34,6 +34,7 @@ pub enum EventContext {
 const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
+const KIND_VIDEO: u16 = 34236;
 
 // Replay horizon: ignore events older than this
 const REPLAY_HORIZON_DAYS: u64 = 7;
@@ -416,6 +417,8 @@ async fn handle_content_event(
         // Kind 30023: Long-form content - check for mentions
         let recipients = find_mentioned_pubkeys(event);
         (NotificationType::Mention, recipients)
+    } else if kind_num == KIND_VIDEO {
+        video_notification(event)
     } else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
@@ -514,6 +517,16 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
         .filter_map(|t| t.content())
         .filter_map(|content| PublicKey::from_str(content).ok())
         .collect()
+}
+
+/// Build a mention notification for a video event.
+fn video_notification(event: &Event) -> (NotificationType, Vec<PublicKey>) {
+    let recipients = find_mentioned_pubkeys(event)
+        .into_iter()
+        .filter(|recipient| *recipient != event.pubkey)
+        .collect();
+
+    (NotificationType::Mention, recipients)
 }
 
 /// Find recipients for a NIP-22 comment event (kind 1111).
@@ -806,7 +819,7 @@ async fn create_fcm_payload(
     // id and, for addressable targets (e.g. kind 34236 videos), the signed
     // coordinate (`referencedAddress` + components) so the client never has to
     // guess the target's owner.
-    insert_reference_fields(&mut data, event);
+    insert_trigger_reference_fields(&mut data, event);
 
     Ok(FcmPayload {
         notification: None, // Data-only message for better client control
@@ -845,6 +858,38 @@ fn insert_reference_fields(data: &mut std::collections::HashMap<String, String>,
         data.insert("referencedAuthorPubkey".to_string(), coord.author_pubkey);
         data.insert("referencedDTag".to_string(), coord.d_tag);
     }
+}
+
+/// Insert routing fields for either a direct video trigger or a reference.
+fn insert_trigger_reference_fields(
+    data: &mut std::collections::HashMap<String, String>,
+    event: &Event,
+) {
+    if event.kind.as_u16() == KIND_VIDEO {
+        insert_video_reference_fields(data, event);
+    } else {
+        insert_reference_fields(data, event);
+    }
+}
+
+/// Insert routing fields derived from a video trigger's own identity.
+fn insert_video_reference_fields(
+    data: &mut std::collections::HashMap<String, String>,
+    event: &Event,
+) {
+    data.insert("referencedEventId".to_string(), event.id.to_hex());
+
+    let Some(d_tag) = event.tags.identifier() else {
+        return;
+    };
+    let kind = event.kind.as_u16().to_string();
+    let author_pubkey = event.pubkey.to_hex();
+    let address = format!("{kind}:{author_pubkey}:{d_tag}");
+
+    data.insert("referencedAddress".to_string(), address);
+    data.insert("referencedKind".to_string(), kind);
+    data.insert("referencedAuthorPubkey".to_string(), author_pubkey);
+    data.insert("referencedDTag".to_string(), d_tag.to_string());
 }
 
 /// Root-aware referenced event id.
@@ -1053,6 +1098,42 @@ mod tests {
     }
 
     #[test]
+    fn test_video_notification_resolves_mentions_with_mention_type() {
+        let sender = Keys::generate();
+        let mentioned1 = Keys::generate();
+        let mentioned2 = Keys::generate();
+
+        let event = EventBuilder::new(Kind::from(34236), "inspired video")
+            .tag(Tag::identifier("video-id"))
+            .tag(Tag::public_key(mentioned1.public_key()))
+            .tag(Tag::public_key(mentioned2.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let (notification_type, recipients) = video_notification(&event);
+
+        assert_eq!(notification_type, NotificationType::Mention);
+        assert_eq!(notification_type.display_name(), "mention");
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&mentioned1.public_key()));
+        assert!(recipients.contains(&mentioned2.public_key()));
+    }
+
+    #[test]
+    fn test_video_notification_skips_self_reference() {
+        let sender = Keys::generate();
+        let event = EventBuilder::new(Kind::from(34236), "self-tagged video")
+            .tag(Tag::identifier("video-id"))
+            .tag(Tag::public_key(sender.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let (_, recipients) = video_notification(&event);
+
+        assert!(recipients.is_empty());
+    }
+
+    #[test]
     fn test_find_comment_recipients_reply_notifies_root_and_parent_authors() {
         let actor = Keys::generate();
         let video_owner = Keys::generate();
@@ -1235,6 +1316,28 @@ mod tests {
             Some(&owner.public_key().to_hex())
         );
         assert_eq!(data.get("referencedDTag"), Some(&"my-vine-id".to_string()));
+    }
+
+    #[test]
+    fn test_insert_video_reference_fields_uses_trigger_identity() {
+        let owner = Keys::generate();
+        let event = EventBuilder::new(Kind::from(34236), "inspired video")
+            .tag(Tag::identifier("video:d-tag"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let address = format!("34236:{}:video:d-tag", owner.public_key().to_hex());
+
+        let mut data = std::collections::HashMap::new();
+        insert_trigger_reference_fields(&mut data, &event);
+
+        assert_eq!(data.get("referencedEventId"), Some(&event.id.to_hex()));
+        assert_eq!(data.get("referencedAddress"), Some(&address));
+        assert_eq!(data.get("referencedKind"), Some(&"34236".to_string()));
+        assert_eq!(
+            data.get("referencedAuthorPubkey"),
+            Some(&owner.public_key().to_hex())
+        );
+        assert_eq!(data.get("referencedDTag"), Some(&"video:d-tag".to_string()));
     }
 
     #[test]
