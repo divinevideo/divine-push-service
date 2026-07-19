@@ -200,5 +200,5 @@ This is a list of event kinds the user wants notifications for. If no preference
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
 | `dedup:{event_id}` | String | Deduplication lock with TTL |
-| `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Per-recipient video-coordinate lock preventing repeat pushes after edits |
+| `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default) |
 | `divine:preferences:{pubkey}` | String | JSON notification preferences |

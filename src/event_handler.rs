@@ -640,22 +640,19 @@ async fn send_notification_to_user(
             );
             return Ok(());
         };
-        let claimed = tokio::select! {
+        let redis_key = format!("dedup:{claim_key}");
+        let already_notified = tokio::select! {
             biased;
             _ = token.cancelled() => {
-                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while claiming video recipient.");
+                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while checking video recipient delivery.");
                 return Err(crate::error::ServiceError::Cancelled);
             }
-            claim_result = redis_store::try_claim_dedup_key(
-                &state.redis_pool,
-                &claim_key,
-                state.settings.service.processed_event_ttl_secs,
-            ) => {
-                claim_result?
+            lookup_result = redis_store::get_cached_string(&state.redis_pool, &redis_key) => {
+                lookup_result?.is_some()
             }
         };
 
-        if !claimed {
+        if already_notified {
             trace!(
                 event_id = %event_id,
                 target_pubkey = %target_pubkey,
@@ -731,6 +728,25 @@ async fn send_notification_to_user(
         failed_count = tokens_to_remove.len(),
         "FCM notification send summary"
     );
+
+    if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
+            warn!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Successful video notification lacked an addressable d-tag"
+            );
+            return Ok(());
+        };
+        let redis_key = format!("dedup:{claim_key}");
+        redis_store::set_cached_string(
+            &state.redis_pool,
+            &redis_key,
+            "1",
+            state.settings.service.video_coordinate_dedup_ttl_secs,
+        )
+        .await?;
+    }
 
     // Remove invalid tokens
     if !tokens_to_remove.is_empty() {
@@ -1008,7 +1024,35 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
     use nostr_sdk::prelude::{Keys, SecretKey};
+
+    async fn test_redis_pool() -> Option<redis_store::RedisPool> {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let pool = redis_store::create_pool(&redis_url, 5).await.ok()?;
+        let mut conn = pool.get().await.ok()?;
+        let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+        drop(conn);
+        pong.ok().map(|_| pool)
+    }
+
+    fn test_app_state(
+        settings: crate::config::Settings,
+        redis_pool: redis_store::RedisPool,
+        fcm_client: FcmClient,
+    ) -> AppState {
+        AppState {
+            settings,
+            redis_pool,
+            fcm_client: Arc::new(fcm_client),
+            service_keys: None,
+            crypto_service: None,
+            nostr_client: Arc::new(Client::default()),
+            profile_client: Arc::new(Client::default()),
+            mention_parser_service: None,
+        }
+    }
 
     #[test]
     fn test_is_event_too_old() {
@@ -1182,6 +1226,7 @@ mod tests {
     fn test_video_recipient_claim_key_is_stable_across_edits() {
         let owner = Keys::generate();
         let recipient = Keys::generate();
+        let added_recipient = Keys::generate();
         let first_event = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
             .tag(Tag::identifier("video:d-tag"))
             .tag(Tag::public_key(recipient.public_key()))
@@ -1206,6 +1251,113 @@ mod tests {
                 recipient.public_key().to_hex()
             ))
         );
+        assert_ne!(
+            video_recipient_claim_key(&edited_event, &recipient.public_key()),
+            video_recipient_claim_key(&edited_event, &added_recipient.public_key()),
+            "a newly added recipient must have an independent delivery record"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_video_coordinate_is_recorded_only_after_successful_delivery() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let recipient = Keys::generate();
+        let fcm_token = format!("video-dedup-token-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(&fcm_token, FcmError::InternalError);
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let first_event = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("post-success-dedup"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let claim_key = video_recipient_claim_key(&first_event, &recipient.public_key()).unwrap();
+        let redis_key = format!("dedup:{claim_key}");
+
+        send_notification_to_user(
+            &state,
+            &first_event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            redis_store::get_cached_string(&pool, &redis_key)
+                .await
+                .unwrap(),
+            None,
+            "a failed FCM send must not mark the video recipient as notified"
+        );
+
+        mock_sender.clear();
+        let successful_edit = EventBuilder::new(Kind::from(KIND_VIDEO), "successful edit")
+            .tag(Tag::identifier("post-success-dedup"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &successful_edit,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+        assert_eq!(
+            redis_store::get_cached_string(&pool, &redis_key)
+                .await
+                .unwrap(),
+            Some("1".to_string()),
+            "a successful FCM send must mark the video recipient as notified"
+        );
+
+        let later_edit = EventBuilder::new(Kind::from(KIND_VIDEO), "later edit")
+            .tag(Tag::identifier("post-success-dedup"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &later_edit,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "a recorded coordinate must suppress later edits for the same recipient"
+        );
+
+        redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(redis_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
     }
 
     #[test]
