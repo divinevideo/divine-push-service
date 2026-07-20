@@ -13,6 +13,7 @@ service:
   # Load from env: NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX
   process_window_days: 7
   processed_event_ttl_secs: 604800  # 7 days
+  video_coordinate_dedup_ttl_secs: 31536000  # 1 year
 
 redis:
   url: "redis://127.0.0.1:6379"
@@ -39,6 +40,7 @@ notification:
     - 16     # Generic reposts (NIP-18)
     - 1111   # NIP-22 comments
     - 30023  # Long-form content (mentions)
+    - 34236  # Video content (mentions)
   # Default kinds users receive notifications for (can be customized via kind 3083)
   default_preferences:
     kinds:

@@ -34,6 +34,7 @@ pub enum EventContext {
 const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
+const KIND_VIDEO: u16 = 34236;
 
 // Replay horizon: ignore events older than this
 const REPLAY_HORIZON_DAYS: u64 = 7;
@@ -416,6 +417,8 @@ async fn handle_content_event(
         // Kind 30023: Long-form content - check for mentions
         let recipients = find_mentioned_pubkeys(event);
         (NotificationType::Mention, recipients)
+    } else if kind_num == KIND_VIDEO {
+        video_notification(event)
     } else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
@@ -516,6 +519,27 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
         .collect()
 }
 
+/// Build a mention notification for a video event.
+fn video_notification(event: &Event) -> (NotificationType, Vec<PublicKey>) {
+    let recipients = find_mentioned_pubkeys(event)
+        .into_iter()
+        .filter(|recipient| *recipient != event.pubkey)
+        .collect();
+
+    (NotificationType::Mention, recipients)
+}
+
+/// Build the coordinate-and-recipient key used to deduplicate video edits.
+fn video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<String> {
+    let d_tag = event.tags.identifier()?;
+    Some(format!(
+        "{}:{}:{d_tag}:{}",
+        event.kind.as_u16(),
+        event.pubkey.to_hex(),
+        recipient.to_hex()
+    ))
+}
+
 /// Find recipients for a NIP-22 comment event (kind 1111).
 ///
 /// Per NIP-22 the uppercase `P` tag is the root-scope author (for a video
@@ -607,6 +631,37 @@ async fn send_notification_to_user(
         return Ok(());
     }
 
+    if event.kind.as_u16() == KIND_VIDEO {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
+            warn!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Skipping video notification without an addressable d-tag"
+            );
+            return Ok(());
+        };
+        let redis_key = format!("dedup:{claim_key}");
+        let already_notified = tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while checking video recipient delivery.");
+                return Err(crate::error::ServiceError::Cancelled);
+            }
+            lookup_result = redis_store::get_cached_string(&state.redis_pool, &redis_key) => {
+                lookup_result?.is_some()
+            }
+        };
+
+        if already_notified {
+            trace!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Skipping video recipient already notified for this coordinate"
+            );
+            return Ok(());
+        }
+    }
+
     info!(
         event_id = %event_id,
         target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
@@ -673,6 +728,25 @@ async fn send_notification_to_user(
         failed_count = tokens_to_remove.len(),
         "FCM notification send summary"
     );
+
+    if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
+            warn!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Successful video notification lacked an addressable d-tag"
+            );
+            return Ok(());
+        };
+        let redis_key = format!("dedup:{claim_key}");
+        redis_store::set_cached_string(
+            &state.redis_pool,
+            &redis_key,
+            "1",
+            state.settings.service.video_coordinate_dedup_ttl_secs,
+        )
+        .await?;
+    }
 
     // Remove invalid tokens
     if !tokens_to_remove.is_empty() {
@@ -806,7 +880,7 @@ async fn create_fcm_payload(
     // id and, for addressable targets (e.g. kind 34236 videos), the signed
     // coordinate (`referencedAddress` + components) so the client never has to
     // guess the target's owner.
-    insert_reference_fields(&mut data, event);
+    insert_trigger_reference_fields(&mut data, event);
 
     Ok(FcmPayload {
         notification: None, // Data-only message for better client control
@@ -845,6 +919,38 @@ fn insert_reference_fields(data: &mut std::collections::HashMap<String, String>,
         data.insert("referencedAuthorPubkey".to_string(), coord.author_pubkey);
         data.insert("referencedDTag".to_string(), coord.d_tag);
     }
+}
+
+/// Insert routing fields for either a direct video trigger or a reference.
+fn insert_trigger_reference_fields(
+    data: &mut std::collections::HashMap<String, String>,
+    event: &Event,
+) {
+    if event.kind.as_u16() == KIND_VIDEO {
+        insert_video_reference_fields(data, event);
+    } else {
+        insert_reference_fields(data, event);
+    }
+}
+
+/// Insert routing fields derived from a video trigger's own identity.
+fn insert_video_reference_fields(
+    data: &mut std::collections::HashMap<String, String>,
+    event: &Event,
+) {
+    data.insert("referencedEventId".to_string(), event.id.to_hex());
+
+    let Some(d_tag) = event.tags.identifier() else {
+        return;
+    };
+    let kind = event.kind.as_u16().to_string();
+    let author_pubkey = event.pubkey.to_hex();
+    let address = format!("{kind}:{author_pubkey}:{d_tag}");
+
+    data.insert("referencedAddress".to_string(), address);
+    data.insert("referencedKind".to_string(), kind);
+    data.insert("referencedAuthorPubkey".to_string(), author_pubkey);
+    data.insert("referencedDTag".to_string(), d_tag.to_string());
 }
 
 /// Root-aware referenced event id.
@@ -918,7 +1024,35 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
     use nostr_sdk::prelude::{Keys, SecretKey};
+
+    async fn test_redis_pool() -> Option<redis_store::RedisPool> {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let pool = redis_store::create_pool(&redis_url, 5).await.ok()?;
+        let mut conn = pool.get().await.ok()?;
+        let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+        drop(conn);
+        pong.ok().map(|_| pool)
+    }
+
+    fn test_app_state(
+        settings: crate::config::Settings,
+        redis_pool: redis_store::RedisPool,
+        fcm_client: FcmClient,
+    ) -> AppState {
+        AppState {
+            settings,
+            redis_pool,
+            fcm_client: Arc::new(fcm_client),
+            service_keys: None,
+            crypto_service: None,
+            nostr_client: Arc::new(Client::default()),
+            profile_client: Arc::new(Client::default()),
+            mention_parser_service: None,
+        }
+    }
 
     #[test]
     fn test_is_event_too_old() {
@@ -1050,6 +1184,180 @@ mod tests {
 
         let pubkeys = find_mentioned_pubkeys(&event);
         assert_eq!(pubkeys.len(), 3);
+    }
+
+    #[test]
+    fn test_video_notification_resolves_mentions_with_mention_type() {
+        let sender = Keys::generate();
+        let mentioned1 = Keys::generate();
+        let mentioned2 = Keys::generate();
+
+        let event = EventBuilder::new(Kind::from(34236), "inspired video")
+            .tag(Tag::identifier("video-id"))
+            .tag(Tag::public_key(mentioned1.public_key()))
+            .tag(Tag::public_key(mentioned2.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let (notification_type, recipients) = video_notification(&event);
+
+        assert_eq!(notification_type, NotificationType::Mention);
+        assert_eq!(notification_type.display_name(), "mention");
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&mentioned1.public_key()));
+        assert!(recipients.contains(&mentioned2.public_key()));
+    }
+
+    #[test]
+    fn test_video_notification_skips_self_reference() {
+        let sender = Keys::generate();
+        let event = EventBuilder::new(Kind::from(34236), "self-tagged video")
+            .tag(Tag::identifier("video-id"))
+            .tag(Tag::public_key(sender.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+
+        let (_, recipients) = video_notification(&event);
+
+        assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn test_video_recipient_claim_key_is_stable_across_edits() {
+        let owner = Keys::generate();
+        let recipient = Keys::generate();
+        let added_recipient = Keys::generate();
+        let first_event = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("video:d-tag"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let edited_event = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("video:d-tag"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+
+        assert_ne!(first_event.id, edited_event.id);
+        assert_eq!(
+            video_recipient_claim_key(&first_event, &recipient.public_key()),
+            video_recipient_claim_key(&edited_event, &recipient.public_key())
+        );
+        assert_eq!(
+            video_recipient_claim_key(&first_event, &recipient.public_key()),
+            Some(format!(
+                "34236:{}:video:d-tag:{}",
+                owner.public_key().to_hex(),
+                recipient.public_key().to_hex()
+            ))
+        );
+        assert_ne!(
+            video_recipient_claim_key(&edited_event, &recipient.public_key()),
+            video_recipient_claim_key(&edited_event, &added_recipient.public_key()),
+            "a newly added recipient must have an independent delivery record"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_video_coordinate_is_recorded_only_after_successful_delivery() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let recipient = Keys::generate();
+        let fcm_token = format!("video-dedup-token-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(&fcm_token, FcmError::InternalError);
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let first_event = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("post-success-dedup"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let claim_key = video_recipient_claim_key(&first_event, &recipient.public_key()).unwrap();
+        let redis_key = format!("dedup:{claim_key}");
+
+        send_notification_to_user(
+            &state,
+            &first_event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            redis_store::get_cached_string(&pool, &redis_key)
+                .await
+                .unwrap(),
+            None,
+            "a failed FCM send must not mark the video recipient as notified"
+        );
+
+        mock_sender.clear();
+        let successful_edit = EventBuilder::new(Kind::from(KIND_VIDEO), "successful edit")
+            .tag(Tag::identifier("post-success-dedup"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &successful_edit,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+        assert_eq!(
+            redis_store::get_cached_string(&pool, &redis_key)
+                .await
+                .unwrap(),
+            Some("1".to_string()),
+            "a successful FCM send must mark the video recipient as notified"
+        );
+
+        let later_edit = EventBuilder::new(Kind::from(KIND_VIDEO), "later edit")
+            .tag(Tag::identifier("post-success-dedup"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &later_edit,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "a recorded coordinate must suppress later edits for the same recipient"
+        );
+
+        redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(redis_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1235,6 +1543,28 @@ mod tests {
             Some(&owner.public_key().to_hex())
         );
         assert_eq!(data.get("referencedDTag"), Some(&"my-vine-id".to_string()));
+    }
+
+    #[test]
+    fn test_insert_video_reference_fields_uses_trigger_identity() {
+        let owner = Keys::generate();
+        let event = EventBuilder::new(Kind::from(34236), "inspired video")
+            .tag(Tag::identifier("video:d-tag"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let address = format!("34236:{}:video:d-tag", owner.public_key().to_hex());
+
+        let mut data = std::collections::HashMap::new();
+        insert_trigger_reference_fields(&mut data, &event);
+
+        assert_eq!(data.get("referencedEventId"), Some(&event.id.to_hex()));
+        assert_eq!(data.get("referencedAddress"), Some(&address));
+        assert_eq!(data.get("referencedKind"), Some(&"34236".to_string()));
+        assert_eq!(
+            data.get("referencedAuthorPubkey"),
+            Some(&owner.public_key().to_hex())
+        );
+        assert_eq!(data.get("referencedDTag"), Some(&"video:d-tag".to_string()));
     }
 
     #[test]

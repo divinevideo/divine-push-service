@@ -60,6 +60,9 @@ pub struct ServiceSettings {
     pub process_window_days: i64,
     #[serde(default = "default_processed_event_ttl")]
     pub processed_event_ttl_secs: u64,
+    /// Retention for successful per-recipient video-coordinate deliveries.
+    #[serde(default = "default_video_coordinate_dedup_ttl")]
+    pub video_coordinate_dedup_ttl_secs: u64,
     /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
@@ -72,6 +75,12 @@ fn default_process_window_days() -> i64 {
 
 fn default_processed_event_ttl() -> u64 {
     604800 // 7 days
+}
+
+fn default_video_coordinate_dedup_ttl() -> u64 {
+    // Video coordinates remain stable across edits. One year prevents routine edits from
+    // re-notifying recipients while bounding Redis retention for inactive coordinates.
+    31_536_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -158,6 +167,7 @@ fn default_event_kinds() -> Vec<u64> {
         16,    // Generic reposts (NIP-18)
         1111,  // NIP-22 comments
         30023, // Long-form content (mentions)
+        34236, // Video content (mentions)
     ]
 }
 
@@ -231,6 +241,18 @@ impl Settings {
 mod tests {
     use super::*;
 
+    fn load_runtime_settings(filename: &str) -> Settings {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join(filename);
+        config::Config::builder()
+            .add_source(config::File::from(path).required(true))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
+    }
+
     #[test]
     fn test_default_preferences() {
         let prefs = DefaultPreferences::default();
@@ -250,5 +272,35 @@ mod tests {
         assert!(kinds.contains(&16)); // Reposts
         assert!(kinds.contains(&1111)); // NIP-22 comments
         assert!(kinds.contains(&30023)); // Long-form
+        assert!(kinds.contains(&34236)); // Video mentions
+    }
+
+    #[test]
+    fn test_runtime_config_event_kinds_match_defaults() {
+        let expected = default_event_kinds();
+
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            let settings = load_runtime_settings(filename);
+            assert_eq!(
+                settings.notification.event_kinds, expected,
+                "{filename} must stay in sync with default_event_kinds()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_coordinate_dedup_ttl_is_long_lived() {
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            let settings = load_runtime_settings(filename);
+            assert_eq!(
+                settings.service.video_coordinate_dedup_ttl_secs, 31_536_000,
+                "{filename} should retain successful video delivery records for one year"
+            );
+            assert!(
+                settings.service.video_coordinate_dedup_ttl_secs
+                    > settings.service.processed_event_ttl_secs,
+                "video-coordinate delivery records must outlive event-id claims"
+            );
+        }
     }
 }
