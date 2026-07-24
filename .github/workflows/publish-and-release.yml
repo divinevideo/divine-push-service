@@ -115,18 +115,6 @@ jobs:
           repository: containers-poc
           region: ${{ env.GCP_REGION }}
 
-      - name: Push to Test
-        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
-        with:
-          image-name: divine-push-service:local
-          registry-image: divine-push-service
-          tags: ${{ steps.tags.outputs.tags }}
-          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_TEST }}
-          service-account: ${{ vars.SERVICE_ACCOUNT_TEST }}
-          project-id: ${{ vars.GCP_PROJECT_ID_TEST }}
-          repository: containers-test
-          region: ${{ env.GCP_REGION }}
-
       - name: Push to Staging
         uses: divinevideo/divine-github-actions/docker-push-gcp@v1
         with:
@@ -161,7 +149,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Environments:**" >> $GITHUB_STEP_SUMMARY
           echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Test: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_TEST }}/containers-test/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
           echo "- Staging: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/containers-staging/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
             echo "- Production: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_PRODUCTION }}/containers-production/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
