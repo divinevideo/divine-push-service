@@ -114,10 +114,8 @@ events when `context == EventContext::Historical`
 (`event_handler.rs:192`), but notify lists must be rebuilt from history
 or the reverse index cannot be recovered after Redis data loss — every
 subscription stays dark until each user happens to republish. (A process
-restart on its own is fine: Redis is external, so the index survives
-it. Defending the requirement on its real grounds makes it harder to
-argue away later.) Treat them like control events: process in both
-paths.
+restart on its own is fine — Redis is external, so the index survives
+it.) Treat them like control events: process in both paths.
 
 Make the historical lookback for notify lists independent of
 `process_window_days` (7 days). A list published 3 months ago and never
