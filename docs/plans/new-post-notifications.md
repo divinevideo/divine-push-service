@@ -196,23 +196,19 @@ The script reads the old set, computes added/removed, `SREM`s the
 subscriber from `notify_watchers:{removed}`, `SADD`s to
 `notify_watchers:{added}`, replaces `notify_subs`, and sets
 `notify_subs_ts`. Writing to `notify_watchers:*` keys not declared in
-`KEYS` is not Redis-Cluster-safe. That is acceptable here, but for a
-production reason rather than the local `docker-compose.yml`: the
-deployment points at
-`redis://redis-replication-master.redis-clusters.svc.cluster.local:6379/2`
-(`divine-iac-coreconfig`,
-`k8s/applications/divine-push-service/base/deployment.yaml:44`), and
-`k8s/redis-clusters/base/cluster.yaml` declares a `RedisReplication`
-plus a `RedisSentinel` — master/replica with Sentinel failover, one
-keyspace, no sharding. Cross-key writes are fine. **Add a comment saying
-so**, and say it in those terms: the namespace is called
-`redis-clusters` but is not Redis Cluster, which is exactly the sort of
-thing a future reader gets wrong in the unsafe direction. Gate on it if
-the deployment ever moves to real Cluster mode.
+`KEYS` is not Redis-Cluster-safe. That is acceptable here, but justify it
+from the production deployment rather than the local
+`docker-compose.yml`: production Redis is a **master/replica deployment
+with Sentinel failover — a single keyspace, not a sharded Cluster** (see
+the platform IaC repo for the manifests). Cross-key writes are fine.
+**Add a comment saying so**, and word it so the distinction survives:
+the manifests live under a *cluster*-flavoured name while not being
+Redis Cluster, which is what a future reader gets wrong in the unsafe
+direction. Gate on it if the deployment ever moves to real Cluster mode.
 
-That Redis is also **shared** — this service uses db index 2 of an
-instance other services key off, and Sentinel is watching its liveness.
-Anything that blocks it blocks them.
+That Redis is also **shared with other services**, on a dedicated
+logical database rather than a dedicated instance, with Sentinel
+watching its liveness. Anything that blocks it blocks them.
 
 **Bound the creator list before it reaches Redis.** The script runs as
 one blocking unit and Redis is single-threaded, so a list with thousands
