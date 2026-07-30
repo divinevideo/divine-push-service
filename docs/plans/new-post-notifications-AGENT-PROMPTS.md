@@ -294,7 +294,7 @@ nothing; no watchers leaves existing mention-only behaviour byte-identical.
 ### Prompt 4 — preference gating
 
 ```
-Read AGENT-PROMPTS section 1 ("Corrected: the client-dependency in design task
+Read AGENT-PROMPTS section 1 ("Superseded: the client-dependency in design task
 4") and section 2.3. NOTE: the design doc's task 4 is stale on how the client
 publishes 34236 — AGENT-PROMPTS supersedes it.
 
