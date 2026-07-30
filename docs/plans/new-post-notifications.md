@@ -112,8 +112,12 @@ extra filter; `subscribe` accepts one filter per call, so issue a second
 **Historical processing is mandatory here.** `route_event` skips content
 events when `context == EventContext::Historical`
 (`event_handler.rs:192`), but notify lists must be rebuilt from history
-or a restart silently drops every subscription until each user happens
-to republish. Treat them like control events: process in both paths.
+or the reverse index cannot be recovered after Redis data loss — every
+subscription stays dark until each user happens to republish. (A process
+restart on its own is fine: Redis is external, so the index survives
+it. Defending the requirement on its real grounds makes it harder to
+argue away later.) Treat them like control events: process in both
+paths.
 
 Make the historical lookback for notify lists independent of
 `process_window_days` (7 days). A list published 3 months ago and never
@@ -121,6 +125,23 @@ touched since is still current — it is a replaceable event. Use no
 `since` bound at all for the historical notify-list query, and add
 config `notify_list_history_limit` (default `5000`) as a safety valve on
 result size.
+
+**Dropping `since` is not sufficient, and this is still unresolved.**
+`run()` calls `is_event_too_old(&event)` on *every* event before it
+reaches `route_event` (`event_handler.rs:93`), against a hard-coded
+`REPLAY_HORIZON_DAYS = 7` (`event_handler.rs:40`). A 90-day-old
+`d=notify` event is dropped in the handler loop whatever the filter says
+and whatever order `route_event` uses, so as written above the rebuild
+recovers nothing older than a week — exactly the case it exists to
+protect.
+
+The mechanism is the author's call: a kind-aware horizon, an explicit
+exemption for list events, or something else. Whichever way it goes,
+task 1 needs a boundary test either side of the horizon. Note also that
+`try_claim_event` (`event_handler.rs:105`) runs before `route_event` and
+writes `dedup:{event_id}` with a 7-day TTL, so replaying a list event
+that was already processed is dropped as a duplicate — the plan should
+say how the rebuild is meant to interact with that.
 
 ### 2. Ingest list events into the reverse index
 

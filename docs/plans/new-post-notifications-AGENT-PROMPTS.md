@@ -170,8 +170,20 @@ Requirements:
 - The historical notify-list query must use NO `since` bound. A replaceable
   list published three months ago and untouched since is still current;
   bounding it by `process_window_days` (7) would silently drop most
-  subscriptions on restart. Add config `notify_list_history_limit`
-  (default 5000) as a result-size safety valve instead.
+  subscriptions when the index has to be rebuilt. Add config
+  `notify_list_history_limit` (default 5000) as a result-size safety valve
+  instead.
+- STOP before assuming the previous bullet is enough — it is not, and the
+  gap is unresolved in the design. `run()` calls `is_event_too_old(&event)`
+  on every event before `route_event` ever sees it (event_handler.rs:93),
+  against a hard-coded `REPLAY_HORIZON_DAYS = 7` (event_handler.rs:40). A
+  90-day-old d=notify event is dropped there regardless of the filter, so
+  removing `since` alone recovers nothing older than a week. Do not invent
+  the fix: raise it with the PR author, then implement whatever is decided
+  and add a boundary test either side of the horizon. Related, same loop:
+  `try_claim_event` (event_handler.rs:105) writes `dedup:{event_id}` with a
+  7-day TTL before routing, so an already-processed list event is dropped as
+  a duplicate on replay.
 
 Verify: `cargo clippy --all-targets --all-features` and `cargo test` clean.
 Do not implement the handler yet — that is task 2. This task should compile
