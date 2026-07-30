@@ -153,7 +153,18 @@ if kind_num == KIND_NOTIFY_LIST {
 
 Add `redis_store::replace_notify_subscriptions(pool, subscriber, creators, created_at)`.
 The diff-and-apply must be atomic across replicas — do it in a **Lua
-script** keyed on the subscriber:
+script** keyed on the subscriber.
+
+Why atomic, concretely: production runs **2 replicas**
+(`divine-iac-coreconfig`, `k8s/applications/divine-push-service/overlays/production/kustomization.yaml`;
+staging and poc run 1, no HPA). `try_claim_event` only prevents two
+replicas handling the *same* event — two different list events from one
+subscriber can still land concurrently, and a read-then-write lets the
+older one win, resurrecting an unbell. `MULTI`/`EXEC` cannot express
+this: it queues blind writes, so the old set would have to be read
+outside the transaction. `WATCH` + retry would also work but is more
+code over pooled connections. A single-replica deployment needs none of
+this — the handler loop is sequential within a process.
 
 ```
 -- KEYS[1] = notify_subs:{sub}, KEYS[2] = notify_subs_ts:{sub}
@@ -170,13 +181,28 @@ subscriber from `notify_watchers:{removed}`, `SADD`s to
 (`docker-compose.yml`), so that is acceptable — **add a comment saying
 so** and gate on it if the deployment ever moves to Redis Cluster.
 
+**Bound the creator list before it reaches Redis.** The script runs as
+one blocking unit and Redis is single-threaded, so a list with thousands
+of `p` tags stalls the instance for every user. Add config
+`notify_list_max_creators` (default `1000`, well above any follow-gated
+bell list) and truncate with a warning rather than rejecting the list —
+the user keeps the bells that fit instead of losing all of them, and `p`
+tags are client-ordered so which survive is deterministic. This matters
+more than the cluster-safety note above: Cluster is hypothetical, an
+oversized list is something a user can do today.
+
 An empty `p` tag list is legitimate (user unbelled everyone) and must
 clear the forward set and remove them from every reverse index. Do not
 treat empty as "malformed, skip".
 
 **Tests:** `d`-tag rejection; self-reference dropped; add/remove diff
 produces the right reverse-index membership; an older `created_at` is
-ignored; empty list clears everything.
+ignored; empty list clears everything; the creator list truncates at the
+cap and duplicates do not consume cap budget.
+
+Keep the collection logic (dedup, self-filter, cap) in a **pure sync
+function** rather than inline in the async handler, or none of it is
+testable without a live Redis and an `AppState`.
 
 ### 3. Resolve new-post recipients
 
