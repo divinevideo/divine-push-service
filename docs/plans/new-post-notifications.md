@@ -185,9 +185,13 @@ ignored; empty list clears everything.
 Add `NotificationType::NewPost` to the enum (`preferences.rs:50`),
 with `display_name() == "newPost"` and `kind() == 34236`.
 
-The `display_name` string is a wire contract — `divine-mobile` matches
-on it in `parseFcmPayload` (`mobile/lib/services/notification_helpers.dart`).
-Do not change it casually.
+The `display_name` string is a wire contract — `divine-mobile` matches on
+it in `notificationKindFromPushType`
+(`mobile/lib/notifications/routing/notification_tap_target.dart`), which
+returns `null` for unrecognized values and degrades the tap target. It
+does not yet know `newPost`. `parseFcmPayload` is type-agnostic, so the
+push still displays; only the tap route is wrong. Do not change this
+string casually.
 
 **Structural change required.** `handle_content_event` currently
 computes a single `(NotificationType, Vec<PublicKey>)` tuple
@@ -239,14 +243,25 @@ Add `34236` to `UserPreferences::default()` and to
 **No server-side backfill is needed, and none should be written.**
 Users with a stale `user_preferences:*` entry lacking 34236 would be
 silently gated off — but reaching this code path at all requires having
-belled someone, which requires the new mobile build, which publishes
-kind 3083 including 34236 at the same moment it publishes the notify
-list. The client-side ordering makes the migration unnecessary.
+belled someone, which requires the new mobile build. Provided that build
+publishes kind 3083 including 34236 alongside the notify list, the
+client-side ordering makes a migration unnecessary.
 
-**This is a hard dependency on the mobile side.** Confirm the mobile PR
-publishes preferences alongside the first bell before shipping this
-service change, or new-post pushes will be gated off for every existing
-user and the bug will look like a service failure.
+**This is a hard dependency on mobile, and as of 2026-07-29 mobile
+cannot satisfy it.** `NotificationPreferences`
+(`mobile/lib/models/notification_preferences.dart`) is five fixed
+booleans, and `toKindsList()` can only emit a subset of `{1, 3, 7, 16}`.
+`push_notification_service.dart:254` publishes exactly that list, so
+**34236 is never published today** and this check gates every new-post
+push off.
+
+That is not a rollout-timing risk to be confirmed before shipping — it
+is the current state, and it fails silently. Mobile needs a sixth
+preference flag mapping to 34236 before any bell can produce a push.
+Tracked in the mobile design doc
+(`divine-mobile/docs/plans/2026-07-29-bell-notifications-design.md`,
+finding 2). Shipping this service change first is still safe: it finds
+no watchers and does nothing.
 
 **Tests:** `NewPost.kind() == 34236`; `NewPost.is_enabled()` false when
 prefs omit 34236; enabled under the shipped defaults.
@@ -373,7 +388,18 @@ the content field — that would make the list unreadable to this service
 and break the feature entirely.
 
 **Client dependency.** Task 4 is gated on the mobile client publishing
-34236 in its preferences. Ship order matters: service first is safe (it
-simply finds no watchers), client-first is safe (pushes start when the
-service deploys). Only a *partial* client rollout that publishes notify
-lists without updating preferences produces silent failure.
+34236 in its preferences, which it does not do today (see task 4). Ship
+order between the repos is still safe in both directions: service first
+finds no watchers and does nothing, client-first starts delivering when
+the service deploys. The unsafe case is a *partial* client rollout that
+publishes notify lists without the preference change — pushes are gated
+off silently and it looks like a service failure. That is the current
+mobile state, so the mobile release must carry both.
+
+**Reserved `d` tag collides with the mobile list UI.** `d=notify` decodes
+as an ordinary user-editable people list in `divine-mobile`
+(`Nip51PeopleListCodec` excludes only `d=block`), so before the mobile
+fix lands a user can rename or delete the list and silently wipe their
+own subscriptions. Nothing the service can defend against — it just sees
+a replacement list — but it is why the service must treat an empty `p`
+list as legitimate (task 2) rather than assuming malformed input.
