@@ -56,7 +56,8 @@ Do not write one.
   exact routing payload. Do not add new payload fields.
 - Design task 4's other correction still holds: the `display_name` string is
   matched in `notificationKindFromPushType`, not `parseFcmPayload`. Mobile now
-  knows `newPost`, so the tap route resolves — but only for that exact casing
+  knows `newPost`. The tap route resolves to the video even for a value mobile
+  does not recognize, so casing drives in-app row typing rather than routing
   (see [2.2](#22-fcm-payload-service-sends-client-reads)).
 - The `d=notify` / mobile list-UI collision the design flags as a risk is
   **fixed in mobile** (`Nip51PeopleListCodec.reservedDTags`). The reason it
@@ -117,10 +118,17 @@ is absent. A payload that is otherwise perfect but has no `body` produces
 easiest way to ship a silently broken feature.
 
 **Casing:** `notificationKindFromPushType('newpost')` and `'NewPost'` both
-return `null`. The push still displays (the parser is type-agnostic and
-`referencedAddress` is present), but the tap target degrades to a best-effort
-profile/inbox guess instead of opening the video. So a casing bug is
-*invisible in QA unless you tap the notification.*
+return `null`. That does **not** break the tap route.
+`resolveNotificationTapTarget` routes any non-`follow`, non-`system` kind
+with a video target to `OpenVideoTarget`, and `null` is neither
+(`notification_tap_target.dart:145-166`), so with `referencedAddress` present
+the notification still opens the video — `autoOpenComments` false, which is
+what a new post wants. Degrading to a profile/inbox guess happens only when
+there is *no* video target, which is not this payload.
+
+What a miscased value costs is the `NotificationKind` mobile maps for in-app
+row typing. Match the casing mobile actually ships, and do not rely on step 5
+of the end-to-end check to catch a mismatch — the tap succeeds either way.
 
 **Comments must not auto-open.** `notificationKindOpensComments` returns
 `false` for `newPost`, which is correct — a new video has no comment to open.
@@ -250,9 +258,10 @@ Read docs/plans/new-post-notifications.md (task 3) and AGENT-PROMPTS section
 
 Add `NotificationType::NewPost` in src/preferences.rs with:
 - `display_name()` returning exactly "newPost" (camelCase — this string is a
-  wire contract matched by the mobile client; "new_post" or "newpost" degrades
-  the tap target to a profile guess, which QA will not notice unless someone
-  taps the notification)
+  wire contract matched by the mobile client. It does not affect tap routing:
+  an unrecognized value still opens the video because `referencedAddress` is
+  present. It does decide the `NotificationKind` mobile uses for in-app row
+  typing, so it has to match what mobile ships.)
 - `kind()` returning 34236
 
 STRUCTURAL CHANGE, unavoidable: `handle_content_event` currently computes a
@@ -409,7 +418,8 @@ Cannot be done from this repo alone — needs the mobile branch on a device.
    it is a mobile bug.**
 4. Post a video as B. Confirm A receives a push titled "New vine".
 5. **Tap it.** Confirm it opens the video, not A's profile or the inbox. This
-   is the only step that catches a `type` casing mismatch.
+   will pass even if `type` is miscased, so it does not verify the casing —
+   check the in-app row renders as a new-post row for that.
 6. Post again within the hour. Confirm no second push and a rate-limit skip in
    the logs.
 7. Unbell B. Confirm the republished list drops B's `p` tag and pushes stop.

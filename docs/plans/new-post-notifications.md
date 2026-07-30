@@ -250,11 +250,25 @@ with `display_name() == "newPost"` and `kind() == 34236`.
 
 The `display_name` string is a wire contract — `divine-mobile` matches on
 it in `notificationKindFromPushType`
-(`mobile/lib/notifications/routing/notification_tap_target.dart`), which
-returns `null` for unrecognized values and degrades the tap target. It
-does not yet know `newPost`. `parseFcmPayload` is type-agnostic, so the
-push still displays; only the tap route is wrong. Do not change this
-string casually.
+(`mobile/lib/notifications/routing/notification_tap_target.dart:90`),
+which recognizes exactly five lowercase values
+(`like`/`comment`/`follow`/`mention`/`repost`) and returns `null` for
+anything else.
+
+An unrecognized value is **non-fatal, and the tap still routes
+correctly.** `resolveNotificationTapTarget` sends any non-`follow`,
+non-`system` kind with a video target to `OpenVideoTarget`, and `null` is
+neither (`notification_tap_target.dart:145-166`). Because this service
+always emits `referencedAddress` for a kind-34236 trigger,
+`hasVideoTarget` is true, so the notification opens the video with
+`autoOpenComments` false — correct for a new post. No client change is
+needed for routing to work.
+
+What the string does drive is the `NotificationKind` mobile uses for
+in-app row typing, so still do not change it casually. Note every value
+mobile recognizes today is lowercase, which argues for `newpost` over
+`newPost`; that is a cross-repo contract decision, not a detail to settle
+by whichever repo lands first.
 
 **Structural change required.** `handle_content_event` currently
 computes a single `(NotificationType, Vec<PublicKey>)` tuple
