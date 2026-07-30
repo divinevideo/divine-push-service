@@ -63,7 +63,7 @@ Out of scope here, listed so the contract is unambiguous:
 
 ## Redis schema
 
-Three new key families. All hex pubkeys, lowercase, full length — never
+Four new key families. All hex pubkeys, lowercase, full length — never
 truncate Nostr identifiers.
 
 | Key | Type | Purpose |
@@ -391,7 +391,14 @@ rather than treating the placeholder above as approved.
   index maintenance, and the rate-limit window.
 - `AGENTS.md`: add the new keys to the "Redis Keys" list and NewPost to
   the "Notification Types" table. Both are stale the moment task 2
-  lands.
+  lands. The existing "Redis Keys" entries are also **wrong today**:
+  they document `divine:token:{pubkey}`, `divine:preferences:{pubkey}`
+  and `divine:dedup:{pubkey}:{event_id}`, and no `divine:`-prefixed key
+  exists anywhere in `src/`. The real prefixes are `user_tokens:` and
+  `dedup:` (`redis_store.rs:21-27`), `user_preferences:`
+  (`preferences.rs:88`), plus the fixed `stale_tokens` and
+  `token_to_pubkey`. Correct them in the same pass instead of appending
+  four accurate rows to a list of three inaccurate ones.
 
 ---
 
