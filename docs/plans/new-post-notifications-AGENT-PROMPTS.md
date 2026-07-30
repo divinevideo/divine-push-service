@@ -210,7 +210,16 @@ the feature does nothing with no error anywhere.
 Handler requirements:
 1. Reject unless the `d` tag is exactly "notify" (defence in depth — the relay
    filter should guarantee it, but a buggy or hostile relay can send anything).
-2. Extract `p` values, parse as PublicKey, dedup, drop self-references.
+2. Extract `p` values, parse as PublicKey, dedup, drop self-references, then
+   truncate to config `notify_list_max_creators` (default 1000) with a warning
+   log. The Lua script below runs as one blocking unit and Redis is
+   single-threaded and shared with other services, so an unbounded list stalls
+   all of them. Truncate rather than reject — the user keeps the bells that fit
+   instead of losing every one, and `p` tags are client-ordered so which
+   survive is deterministic. Duplicates must not consume cap budget.
+   Keep this collection logic (dedup, self-filter, cap) in a PURE SYNC
+   function rather than inline in the async handler, or none of it is testable
+   without a live Redis and an AppState.
 3. Replaceable ordering guard: compare `event.created_at` against
    `notify_subs_ts:{author}`; drop and debug-log when stored >= incoming.
    Without this, a late-delivered older replacement resurrects an unbell.
@@ -226,8 +235,9 @@ declared in KEYS is not Redis-Cluster-safe; this deployment is single-instance
 
 Tests (all required): d-tag rejection; self-reference dropped; add/remove diff
 produces correct reverse-index membership; older created_at ignored; empty list
-clears everything. Follow tests/dedup_test.rs for the skip-cleanly-without-Redis
-convention.
+clears everything; the creator list truncates at the cap and duplicates do not
+consume cap budget. Follow tests/dedup_test.rs for the
+skip-cleanly-without-Redis convention.
 ```
 
 ---
