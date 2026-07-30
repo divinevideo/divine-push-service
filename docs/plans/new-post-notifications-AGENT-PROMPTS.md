@@ -244,8 +244,11 @@ declared in KEYS is not Redis-Cluster-safe; this deployment is single-instance
 Tests (all required): d-tag rejection; self-reference dropped; add/remove diff
 produces correct reverse-index membership; older created_at ignored; empty list
 clears everything; the creator list truncates at the cap and duplicates do not
-consume cap budget. Follow tests/dedup_test.rs for the
-skip-cleanly-without-Redis convention.
+consume cap budget. For the skip-cleanly-without-Redis convention copy
+`create_test_pool` from tests/dedup_test.rs, which PINGs before handing back
+the pool — NOT `get_test_pool` from tests/preferences_test.rs, which only
+checks that create_pool returned Ok and leaves the tests to panic on the bb8
+timeout when no server is listening.
 ```
 
 ---

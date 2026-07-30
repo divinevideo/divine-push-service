@@ -440,7 +440,12 @@ cargo test
 ```
 
 Redis-backed integration tests follow the existing `tests/dedup_test.rs`
-convention (skip cleanly when Redis is unavailable). Add
+convention (skip cleanly when Redis is unavailable). Copy **that**
+helper: `create_test_pool` (`tests/dedup_test.rs:6`) issues a `PING` and
+returns `None` when it fails. Do not copy `get_test_pool`
+(`tests/preferences_test.rs:10`), which only checks that `create_pool`
+returned `Ok` — it does with no server listening, and the tests then
+panic on the bb8 timeout instead of skipping. Add
 `tests/notify_subscriptions_test.rs` covering the index round-trip:
 publish list → assert reverse index → publish shrunken list → assert
 removal → assert the ordering guard rejects a replayed older event.
