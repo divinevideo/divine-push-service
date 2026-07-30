@@ -65,11 +65,19 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - **3079**: Register push token (encrypted)
 - **3080**: Deregister push token (encrypted)
 - **3083**: Update notification preferences
+- **30000**: NIP-51 people list; `d=notify` carries new-post ("bell") subscriptions (public, unencrypted)
 
 ### Redis Keys
-- `divine:token:{pubkey}` - User's FCM token
-- `divine:preferences:{pubkey}` - User's notification preferences (JSON)
-- `divine:dedup:{pubkey}:{event_id}` - Deduplication with TTL
+- `user_tokens:{pubkey}` - Set of FCM tokens registered for a pubkey
+- `token_to_pubkey` - Hash mapping a token back to its owner
+- `stale_tokens` - Sorted set of token timestamps, for cleanup
+- `user_preferences:{pubkey}` - User's notification preferences (JSON)
+- `dedup:{event_id}` - Per-event processing claim with TTL
+- `dedup:{kind}:{owner}:{d-tag}:{recipient}` - Per-recipient video delivery, so a NIP-33 edit does not re-notify
+- `notify_subs:{subscriber}` - Creators this user has belled
+- `notify_subs_ts:{subscriber}` - `created_at` of the last applied notify list (out-of-order guard)
+- `notify_watchers:{creator}` - Subscribers watching this creator (hot read path)
+- `notify_rate:{subscriber}:{creator}` - New-post rate-limit window marker
 
 ### Notification Types
 | Type | Kind | Description |
@@ -79,6 +87,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 | Follow | 3 | New followers |
 | Mention | 1 | Notes mentioning user |
 | Repost | 16 | Reposts of user's notes |
+| NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
 
 ## Unblocking Workflow
 

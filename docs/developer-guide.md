@@ -190,7 +190,85 @@ Users can optionally send a Kind 3083 event to control which notification types 
 { "kinds": [1, 3, 7, 16] }
 ```
 
-This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), follows (3), reactions (7), reposts (16), and long-form content (30023).
+This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), follows (3), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236).
+
+## New-post subscriptions ("bells")
+
+Every other notification type is triggered by someone acting on the recipient's
+content, so recipients are read off the trigger event's `p` tags. New-post
+notifications invert that: the recipient subscribed to a creator's output, and
+the trigger event says nothing about who wants it.
+
+### Source of truth
+
+The subscription list is a public NIP-51 people list published by the client,
+identified by a reserved `d` tag:
+
+```json
+{
+  "kind": 30000,
+  "tags": [
+    ["d", "notify"],
+    ["title", "Notify"],
+    ["p", "<creator-pubkey-hex>"]
+  ]
+}
+```
+
+It is replaceable and unencrypted — the service has to be able to read it, so
+there is no decryption step, unlike the kind 3079/3080/3083 control events. Any
+kind 30000 arriving without exactly `d=notify` is ignored.
+
+### Ingestion
+
+`handle_notify_list_update` is routed **before** the control-event block and
+deliberately outside its `p`-tag gate: these events are addressed to the world,
+not to this service.
+
+Two properties are load-bearing:
+
+- **Notify lists are exempt from the replay horizon.** A list published three
+  months ago and never touched since is still the user's current subscription
+  set, so `is_notify_list` carves it out of the `is_event_too_old` check. The
+  historical query is likewise unbounded in time, with
+  `notify_list_history_limit` as the size safety valve instead. Without
+  historical replay, a restart against a fresh Redis silently drops every bell
+  until each user republishes.
+- **An empty `p` list is legitimate**, not malformed. It means the user unbelled
+  everyone, and it must clear the forward set and remove them from every reverse
+  index.
+
+`replace_notify_subscriptions` applies the diff in a single Lua script keyed on
+the subscriber, because `notify_subs` and `notify_watchers` are two views of one
+relation and must move together. The script re-checks the stored `created_at`
+internally — a relay can deliver an older replacement after a newer one, and an
+advisory check in the caller would still race.
+
+The script writes `notify_watchers:*` keys that are not declared in `KEYS`, so it
+is **not Redis Cluster safe**. This deployment uses single-instance Redis; moving
+to Cluster requires resharding into one call per creator slot or a hash-tagged
+key layout.
+
+### Delivery
+
+On each incoming kind 34236, `video_notification_targets` unions the video's
+mention targets with `SMEMBERS notify_watchers:{author}`.
+
+**Mention wins on overlap.** A user who both watches the creator and is mentioned
+in the video gets one push, typed `mention`, because that is the more specific
+signal.
+
+Delivery is capped at one push per (subscriber, creator) per
+`new_post_rate_limit_secs`. The window is opened only on a *delivered* push
+(check-then-set-on-success, mirroring the video-coordinate dedup) so a failed FCM
+send does not burn the user's hour. The cost is that two replicas handling
+different videos from the same creator in the same instant can both pass the
+check and double-send — rare, bounded, and preferable to silently eating an hour
+of notifications on an FCM blip.
+
+The rate limit is push-only. The in-app feed shows every post from belled
+creators, so a user who receives one push for a six-post burst opens the app and
+sees all six. That is intended.
 
 ## Redis Keys
 
@@ -201,4 +279,8 @@ This is a list of event kinds the user wants notifications for. If no preference
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
 | `dedup:{event_id}` | String | Deduplication lock with TTL |
 | `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default) |
-| `divine:preferences:{pubkey}` | String | JSON notification preferences |
+| `user_preferences:{pubkey}` | String | JSON notification preferences |
+| `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
+| `notify_subs_ts:{subscriber}` | String | `created_at` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event. |
+| `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path — one `SMEMBERS` per incoming video. |
+| `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |

@@ -37,6 +37,9 @@ The service subscribes to trigger events on its relay and notifies the tagged re
 | Reply | 1 | Reply to a user's note |
 | Mention | 1 | Note mentioning a user |
 | Repost | 16 | Repost of a user's note (NIP-18) |
+| New post | 34236 | A creator the user subscribed to ("belled") published a video |
+
+New-post notifications are the one type not anchored to a `p` tag on the trigger event. Recipients come from the subscriber's own NIP-51 list (kind 30000, `d=notify`), so the service resolves them from a Redis reverse index rather than from the video. They are rate-limited to one push per (subscriber, creator) per hour; the in-app feed is not throttled. See [the protocol doc](docs/nip-xx-push-notifications.md) for the list shape.
 
 Divine video comments are NIP-22 `kind:1111` and notify both the root video author and the direct parent author (deduplicated when they coincide). Follows (kind 3) are defined in the protocol and subscribed to, but new-follow notifications are **not currently emitted** — that requires diffing contact-list state, which is not yet implemented.
 
