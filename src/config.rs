@@ -66,6 +66,13 @@ pub struct ServiceSettings {
     /// Minimum gap between new-post pushes for one (subscriber, creator) pair.
     #[serde(default = "default_new_post_rate_limit")]
     pub new_post_rate_limit_secs: u64,
+    /// Cap on creators honored from a single notify list.
+    ///
+    /// `replace_notify_subscriptions` applies the whole diff in one Lua script
+    /// and Redis is single-threaded, so an unbounded list would let one user
+    /// stall the instance for everyone.
+    #[serde(default = "default_notify_list_max_creators")]
+    pub notify_list_max_creators: usize,
     /// Cap on notify lists pulled during historical replay.
     ///
     /// The historical notify-list query is deliberately unbounded in time, so
@@ -84,6 +91,12 @@ fn default_process_window_days() -> i64 {
 
 fn default_processed_event_ttl() -> u64 {
     604800 // 7 days
+}
+
+fn default_notify_list_max_creators() -> usize {
+    // The bell is follow-gated on the client, so this is well above any
+    // legitimate list while still bounding the Lua script's work.
+    1000
 }
 
 fn default_notify_list_history_limit() -> usize {

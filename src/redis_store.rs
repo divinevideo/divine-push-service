@@ -316,6 +316,16 @@ pub fn build_notify_rate_key(subscriber: &PublicKey, creator: &PublicKey) -> Str
 /// would still race. Returns `false` when the incoming event was rejected as
 /// stale or duplicate, `true` when it was applied.
 ///
+/// The atomicity is load-bearing because production runs more than one replica.
+/// `try_claim_event` only prevents two replicas handling the *same* event; two
+/// different list events from one subscriber can still land concurrently, and a
+/// read-then-write would let the older one win. A single replica needs none of
+/// this — its handler loop is sequential.
+///
+/// `creators` must already be bounded by the caller
+/// (`notify_list_max_creators`): the script runs as one blocking unit and Redis
+/// is single-threaded, so an unbounded list stalls the instance for every user.
+///
 /// Not Redis Cluster safe: the script writes `notify_watchers:*` keys that are
 /// not declared in `KEYS`, because the set of creators is only known from the
 /// event body. This deployment uses single-instance Redis (see

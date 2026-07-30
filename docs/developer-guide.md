@@ -244,6 +244,19 @@ relation and must move together. The script re-checks the stored `created_at`
 internally — a relay can deliver an older replacement after a newer one, and an
 advisory check in the caller would still race.
 
+Because the script runs as one blocking unit and Redis is single-threaded, the
+creator list is bounded by `notify_list_max_creators` before it reaches Redis —
+otherwise one user with an absurd number of bells stalls the instance for
+everyone. Excess creators are dropped with a warning rather than the whole list
+being rejected, so the user keeps the bells that fit instead of losing all of
+them.
+
+Atomicity here is not theoretical: production runs more than one replica, and the
+event-level claim (`try_claim_event`) only stops two replicas processing *the same*
+event — it does nothing about two different list events from the same subscriber
+landing concurrently. Within a single replica the handler loop is sequential, so
+this is purely a cross-replica concern.
+
 The script writes `notify_watchers:*` keys that are not declared in `KEYS`, so it
 is **not Redis Cluster safe**. This deployment uses single-instance Redis; moving
 to Cluster requires resharding into one call per creator slot or a hash-tagged

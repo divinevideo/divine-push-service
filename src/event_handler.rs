@@ -396,6 +396,46 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
     Ok(())
 }
 
+/// Extract the subscribed creators from a notify list, deduplicated.
+///
+/// Drops self-references (belling yourself is meaningless) and unparseable `p`
+/// tags, preserving the client's tag order otherwise.
+///
+/// Bounded at `max_creators`. `replace_notify_subscriptions` applies the whole
+/// diff in a single Lua script and Redis is single-threaded, so an unbounded
+/// list would let one user with an absurd number of bells stall the instance for
+/// everyone. Truncating rather than rejecting degrades gracefully: the excess
+/// bells simply do not deliver, instead of the user losing all of them. `p` tags
+/// are ordered by the client, so which ones survive is deterministic and under
+/// the client's control.
+fn collect_notify_creators(event: &Event, max_creators: usize) -> Vec<PublicKey> {
+    let mut creators: Vec<PublicKey> = Vec::new();
+
+    for tag in event.tags.iter().filter(|t| t.kind() == TagKind::p()) {
+        let Some(pubkey) = tag.content().and_then(|c| PublicKey::from_str(c).ok()) else {
+            continue;
+        };
+        if pubkey == event.pubkey {
+            continue;
+        }
+        if creators.contains(&pubkey) {
+            continue;
+        }
+        if creators.len() == max_creators {
+            warn!(
+                event_id = %event.id,
+                pubkey = %event.pubkey,
+                max_creators,
+                "Notify list exceeds the creator cap; ignoring the remainder"
+            );
+            break;
+        }
+        creators.push(pubkey);
+    }
+
+    creators
+}
+
 /// Handle a notify-list update (kind 30000, `d=notify`).
 ///
 /// Rebuilds this subscriber's slice of the reverse index from the replacement
@@ -420,20 +460,7 @@ async fn handle_notify_list_update(state: &AppState, event: &Event) -> Result<()
         return Ok(());
     }
 
-    let mut creators: Vec<PublicKey> = Vec::new();
-    for tag in event.tags.iter().filter(|t| t.kind() == TagKind::p()) {
-        let Some(pubkey) = tag.content().and_then(|c| PublicKey::from_str(c).ok()) else {
-            continue;
-        };
-        // Belling yourself is meaningless, and the send loop would drop it
-        // anyway.
-        if pubkey == event.pubkey {
-            continue;
-        }
-        if !creators.contains(&pubkey) {
-            creators.push(pubkey);
-        }
-    }
+    let creators = collect_notify_creators(event, state.settings.service.notify_list_max_creators);
 
     // An empty list is legitimate: the user unbelled everyone. It must clear
     // the index rather than be treated as malformed and skipped.
@@ -1434,6 +1461,90 @@ mod tests {
             .unwrap();
 
         assert!(video_mention_targets(&event).is_empty());
+    }
+
+    /// Build a `d=notify` list event tagging `creators`.
+    fn notify_list_event(author: &Keys, creators: &[PublicKey]) -> Event {
+        let mut builder =
+            EventBuilder::new(Kind::from(30000), "").tag(Tag::identifier(NOTIFY_LIST_D_TAG));
+        for creator in creators {
+            builder = builder.tag(Tag::public_key(*creator));
+        }
+        builder.sign_with_keys(author).unwrap()
+    }
+
+    #[test]
+    fn test_collect_notify_creators_reads_p_tags_in_order() {
+        let author = Keys::generate();
+        let first = Keys::generate().public_key();
+        let second = Keys::generate().public_key();
+
+        let event = notify_list_event(&author, &[first, second]);
+
+        assert_eq!(collect_notify_creators(&event, 1000), vec![first, second]);
+    }
+
+    #[test]
+    fn test_collect_notify_creators_deduplicates() {
+        let author = Keys::generate();
+        let creator = Keys::generate().public_key();
+
+        let event = notify_list_event(&author, &[creator, creator, creator]);
+
+        assert_eq!(collect_notify_creators(&event, 1000), vec![creator]);
+    }
+
+    #[test]
+    fn test_collect_notify_creators_drops_self_reference() {
+        let author = Keys::generate();
+        let other = Keys::generate().public_key();
+
+        let event = notify_list_event(&author, &[author.public_key(), other]);
+
+        assert_eq!(
+            collect_notify_creators(&event, 1000),
+            vec![other],
+            "belling yourself is meaningless"
+        );
+    }
+
+    #[test]
+    fn test_collect_notify_creators_handles_empty_list() {
+        let author = Keys::generate();
+
+        let event = notify_list_event(&author, &[]);
+
+        assert!(
+            collect_notify_creators(&event, 1000).is_empty(),
+            "an empty list is legitimate, not malformed"
+        );
+    }
+
+    #[test]
+    fn test_collect_notify_creators_truncates_at_the_cap() {
+        let author = Keys::generate();
+        let creators: Vec<PublicKey> = (0..5).map(|_| Keys::generate().public_key()).collect();
+
+        let event = notify_list_event(&author, &creators);
+        let collected = collect_notify_creators(&event, 3);
+
+        // Redis is single-threaded and the diff runs in one Lua script, so an
+        // unbounded list would let one user stall the instance.
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected, creators[..3].to_vec(), "tag order is preserved");
+    }
+
+    #[test]
+    fn test_collect_notify_creators_counts_unique_against_the_cap() {
+        let author = Keys::generate();
+        let a = Keys::generate().public_key();
+        let b = Keys::generate().public_key();
+
+        // Duplicates must not consume cap budget, or a list padded with repeats
+        // would starve the real entries behind it.
+        let event = notify_list_event(&author, &[a, a, a, b]);
+
+        assert_eq!(collect_notify_creators(&event, 2), vec![a, b]);
     }
 
     #[test]
