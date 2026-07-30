@@ -198,13 +198,29 @@ The script reads the old set, computes added/removed, `SREM`s the
 subscriber from `notify_watchers:{removed}`, `SADD`s to
 `notify_watchers:{added}`, replaces `notify_subs`, and sets
 `notify_subs_ts`. Writing to `notify_watchers:*` keys not declared in
-`KEYS` is not cluster-safe; this deployment uses single-instance Redis
-(`docker-compose.yml`), so that is acceptable — **add a comment saying
-so** and gate on it if the deployment ever moves to Redis Cluster.
+`KEYS` is not Redis-Cluster-safe. That is acceptable here, but for a
+production reason rather than the local `docker-compose.yml`: the
+deployment points at
+`redis://redis-replication-master.redis-clusters.svc.cluster.local:6379/2`
+(`divine-iac-coreconfig`,
+`k8s/applications/divine-push-service/base/deployment.yaml:44`), and
+`k8s/redis-clusters/base/cluster.yaml` declares a `RedisReplication`
+plus a `RedisSentinel` — master/replica with Sentinel failover, one
+keyspace, no sharding. Cross-key writes are fine. **Add a comment saying
+so**, and say it in those terms: the namespace is called
+`redis-clusters` but is not Redis Cluster, which is exactly the sort of
+thing a future reader gets wrong in the unsafe direction. Gate on it if
+the deployment ever moves to real Cluster mode.
+
+That Redis is also **shared** — this service uses db index 2 of an
+instance other services key off, and Sentinel is watching its liveness.
+Anything that blocks it blocks them.
 
 **Bound the creator list before it reaches Redis.** The script runs as
 one blocking unit and Redis is single-threaded, so a list with thousands
-of `p` tags stalls the instance for every user. Add config
+of `p` tags stalls the instance — for every user of this service and,
+because the instance is shared, for every other service on it, with
+Sentinel watching. Add config
 `notify_list_max_creators` (default `1000`, well above any follow-gated
 bell list) and truncate with a warning rather than rejecting the list —
 the user keeps the bells that fit instead of losing all of them, and `p`
