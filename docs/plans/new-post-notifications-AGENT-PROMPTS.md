@@ -238,8 +238,13 @@ Handler requirements:
 Redis: diff-and-apply must be atomic across replicas — use a Lua script keyed
 on the subscriber, re-checking the timestamp inside the script (the read in
 step 3 is advisory and racy alone). Writing `notify_watchers:*` keys not
-declared in KEYS is not Redis-Cluster-safe; this deployment is single-instance
-(docker-compose.yml), so that is acceptable — add a comment saying so.
+declared in KEYS is not Redis-Cluster-safe. That is acceptable, but cite the
+production topology in the comment, not docker-compose.yml: the deployment
+points at redis-replication-master.redis-clusters.svc.cluster.local:6379/2 and
+divine-iac-coreconfig's k8s/redis-clusters/base/cluster.yaml declares
+RedisReplication plus RedisSentinel — master/replica, one keyspace, no
+sharding. The namespace is called redis-clusters and is not Redis Cluster; say
+so, because that is what a future reader gets wrong in the unsafe direction.
 
 Tests (all required): d-tag rejection; self-reference dropped; add/remove diff
 produces correct reverse-index membership; older created_at ignored; empty list

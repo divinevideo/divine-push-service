@@ -216,9 +216,8 @@ Anything that blocks it blocks them.
 
 **Bound the creator list before it reaches Redis.** The script runs as
 one blocking unit and Redis is single-threaded, so a list with thousands
-of `p` tags stalls the instance — for every user of this service and,
-because the instance is shared, for every other service on it, with
-Sentinel watching. Add config
+of `p` tags stalls the instance — and per the paragraph above, that is
+every other service on it too, not just this one's users. Add config
 `notify_list_max_creators` (default `1000`, well above any follow-gated
 bell list) and truncate with a warning rather than rejecting the list —
 the user keeps the bells that fit instead of losing all of them, and `p`
