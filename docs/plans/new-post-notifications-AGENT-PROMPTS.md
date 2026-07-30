@@ -13,24 +13,28 @@ Service status: **not started.**
 
 ## 1. Why this document exists
 
-The design doc was written *before* the mobile side was built, so several of
-its statements about the client were assumptions. They have now been
-implemented and verified. Three of the design's original assumptions were
-**wrong** and were corrected in mobile; one instruction in the design doc is
-now **stale** as a result.
+The design doc describes the service. This one carries the **client half of
+the contract**, verified against mobile code that now exists.
 
-**Read this section before task 4 in the design doc.** It contradicts it.
+**Read this section before task 4 in the design doc.** Task 4 currently says
+mobile *cannot* satisfy the preference dependency, and blocks on it. That is
+no longer true.
 
-### Corrected: the client-dependency in design task 4
+### Superseded: the client-dependency in design task 4
 
-The design said no server-side backfill is needed because "the client
-publishes kind 3083 including 34236 at the same moment it publishes the notify
-list," and asked the implementer to *confirm* that. At the time that work did
-not exist. `NotificationPreferences` was five fixed booleans and
-`toKindsList()` could only emit a subset of `{1,3,7,16}` — 34236 was
-structurally unpublishable.
+Design task 4 states, correctly as of 2026-07-29:
 
-It now works, but by a **different mechanism** than the design assumed:
+> **This is a hard dependency on mobile, and as of 2026-07-29 mobile cannot
+> satisfy it.** … `toKindsList()` can only emit a subset of `{1, 3, 7, 16}`,
+> so **34236 is never published today** and this check gates every new-post
+> push off.
+
+As of 2026-07-30 mobile **can** satisfy it. That paragraph is resolved — do not
+treat it as an open blocker.
+
+It works by a **different mechanism** than either version of the design
+assumed. The design expected the bell publish and the preference publish to
+happen together; they are in fact decoupled:
 
 - A sixth flag `newPostsEnabled` (default `true`) emits `34236`
   (`mobile/lib/models/notification_preferences.dart`).
@@ -50,6 +54,14 @@ Do not write one.
 - Kind 34236 is already subscribed (`config/settings.yaml:44`).
 - `insert_video_reference_fields` (`event_handler.rs:937`) already emits the
   exact routing payload. Do not add new payload fields.
+- Design task 4's other correction still holds: the `display_name` string is
+  matched in `notificationKindFromPushType`, not `parseFcmPayload`. Mobile now
+  knows `newPost`, so the tap route resolves — but only for that exact casing
+  (see [2.2](#22-fcm-payload-service-sends-client-reads)).
+- The `d=notify` / mobile list-UI collision the design flags as a risk is
+  **fixed in mobile** (`Nip51PeopleListCodec.reservedDTags`). The reason it
+  mattered to this service — treat an empty `p` list as legitimate, not
+  malformed — is unchanged and still required.
 
 ---
 
