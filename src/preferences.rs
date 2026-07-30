@@ -25,6 +25,7 @@ impl Default for UserPreferences {
                 7,     // Reactions/likes
                 16,    // Reposts
                 30023, // Long-form content
+                34236, // Videos from subscribed creators (new-post "bells")
             ],
         }
     }
@@ -53,6 +54,12 @@ pub enum NotificationType {
     Follow,
     Mention,
     Repost,
+    /// A creator the recipient subscribed to published a new video.
+    ///
+    /// Unlike every other variant this is not triggered by someone acting on the
+    /// recipient's content, so its recipients come from the notify-list reverse
+    /// index rather than the trigger event's `p` tags.
+    NewPost,
 }
 
 impl NotificationType {
@@ -64,6 +71,9 @@ impl NotificationType {
             NotificationType::Follow => 3,
             NotificationType::Mention => 1, // Same as Comment - both are kind 1
             NotificationType::Repost => 16,
+            // Distinct from Mention's kind 1 even though video mentions also
+            // arrive on kind 34236 events, so the two toggle independently.
+            NotificationType::NewPost => 34236,
         }
     }
 
@@ -80,6 +90,7 @@ impl NotificationType {
             NotificationType::Follow => "follow",
             NotificationType::Mention => "mention",
             NotificationType::Repost => "repost",
+            NotificationType::NewPost => "newPost",
         }
     }
 }
@@ -219,6 +230,44 @@ mod tests {
         let prefs_without_1 = UserPreferences { kinds: vec![7, 16] };
         assert!(!NotificationType::Comment.is_enabled(&prefs_without_1));
         assert!(!NotificationType::Mention.is_enabled(&prefs_without_1));
+    }
+
+    #[test]
+    fn test_new_post_kind_is_video_kind() {
+        assert_eq!(NotificationType::NewPost.kind(), 34236);
+    }
+
+    #[test]
+    fn test_new_post_display_name_is_wire_contract() {
+        // divine-mobile matches this exact string in notificationKindFromPushType.
+        assert_eq!(NotificationType::NewPost.display_name(), "newPost");
+    }
+
+    #[test]
+    fn test_new_post_disabled_when_prefs_omit_video_kind() {
+        let prefs = UserPreferences {
+            kinds: vec![1, 3, 7, 16, 30023],
+        };
+        assert!(!NotificationType::NewPost.is_enabled(&prefs));
+    }
+
+    #[test]
+    fn test_new_post_enabled_under_shipped_defaults() {
+        let prefs = UserPreferences::default();
+        assert!(NotificationType::NewPost.is_enabled(&prefs));
+    }
+
+    #[test]
+    fn test_new_post_and_mention_toggle_independently() {
+        // Mention is kind 1, NewPost is 34236, so a user can mute new-post
+        // pushes without muting video mentions.
+        let only_mentions = UserPreferences { kinds: vec![1] };
+        assert!(NotificationType::Mention.is_enabled(&only_mentions));
+        assert!(!NotificationType::NewPost.is_enabled(&only_mentions));
+
+        let only_new_posts = UserPreferences { kinds: vec![34236] };
+        assert!(!NotificationType::Mention.is_enabled(&only_new_posts));
+        assert!(NotificationType::NewPost.is_enabled(&only_new_posts));
     }
 
     #[test]

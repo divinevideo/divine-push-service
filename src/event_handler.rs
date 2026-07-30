@@ -36,8 +36,23 @@ const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
 const KIND_VIDEO: u16 = 34236;
 
+/// NIP-51 people list carrying new-post ("bell") subscriptions.
+const KIND_NOTIFY_LIST: u16 = 30000;
+
+/// Reserved `d` tag identifying a notify list among the user's kind 30000 lists.
+pub const NOTIFY_LIST_D_TAG: &str = "notify";
+
 // Replay horizon: ignore events older than this
 const REPLAY_HORIZON_DAYS: u64 = 7;
+
+/// Whether this event is a notify list, which is exempt from the replay horizon.
+///
+/// Notify lists are replaceable: a list published three months ago and never
+/// touched since is still the user's current subscription set. Aging one out
+/// would silently drop every bell on it until the user happened to republish.
+pub fn is_notify_list(event: &Event) -> bool {
+    event.kind.as_u16() == KIND_NOTIFY_LIST
+}
 
 /// Check if event is targeted to this service via p tag
 fn is_event_for_service(event: &Event, service_pubkey: &PublicKey) -> bool {
@@ -89,8 +104,11 @@ pub async fn run(
 
                 debug!(event_id = %event_id, kind = %event_kind, pubkey = %pubkey, context = ?context, "Event handler received event");
 
-                // Check replay horizon - ignore events that are too old
-                if is_event_too_old(&event) {
+                // Check replay horizon - ignore events that are too old.
+                // Notify lists are exempt: they are replaceable subscription
+                // state, not a timely trigger, so age says nothing about
+                // whether they are current.
+                if is_event_too_old(&event) && !is_notify_list(&event) {
                     debug!(event_id = %event_id, created_at = %event.created_at, "Ignoring old event beyond replay horizon");
                     continue;
                 }
@@ -156,6 +174,15 @@ async fn route_event(
     let event_kind = event.kind;
     let event_id = event.id;
     let kind_num = event_kind.as_u16();
+
+    // Notify lists are addressed to the world, not to this service, so they are
+    // routed before the control-event block and deliberately outside its p-tag
+    // gate. They are also processed in both the historical and live paths: the
+    // reverse index must be rebuilt from history or a restart drops every
+    // subscription until each user happens to republish.
+    if kind_num == KIND_NOTIFY_LIST {
+        return handle_notify_list_update(state, event).await;
+    }
 
     // Check for push notification management events (3079/3080/3083)
     let is_control_event = kind_num == KIND_REGISTRATION
@@ -369,6 +396,74 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
     Ok(())
 }
 
+/// Handle a notify-list update (kind 30000, `d=notify`).
+///
+/// Rebuilds this subscriber's slice of the reverse index from the replacement
+/// list. The list is public and unencrypted by design — the service has to be
+/// able to read it — so there is no decryption step here, unlike the control
+/// events above.
+async fn handle_notify_list_update(state: &AppState, event: &Event) -> Result<()> {
+    assert!(event.kind.as_u16() == KIND_NOTIFY_LIST);
+
+    // Defense in depth. The relay-side `#d` filter should already guarantee
+    // this, but a buggy or hostile relay can send any kind 30000 it likes, and
+    // applying someone's unrelated people list as their bell list would be
+    // both wrong and destructive.
+    let d_tag = event.tags.identifier();
+    if d_tag != Some(NOTIFY_LIST_D_TAG) {
+        debug!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            d_tag = ?d_tag,
+            "Ignoring kind 30000 list without the reserved notify d tag"
+        );
+        return Ok(());
+    }
+
+    let mut creators: Vec<PublicKey> = Vec::new();
+    for tag in event.tags.iter().filter(|t| t.kind() == TagKind::p()) {
+        let Some(pubkey) = tag.content().and_then(|c| PublicKey::from_str(c).ok()) else {
+            continue;
+        };
+        // Belling yourself is meaningless, and the send loop would drop it
+        // anyway.
+        if pubkey == event.pubkey {
+            continue;
+        }
+        if !creators.contains(&pubkey) {
+            creators.push(pubkey);
+        }
+    }
+
+    // An empty list is legitimate: the user unbelled everyone. It must clear
+    // the index rather than be treated as malformed and skipped.
+    let applied = redis_store::replace_notify_subscriptions(
+        &state.redis_pool,
+        &event.pubkey,
+        &creators,
+        event.created_at.as_secs(),
+    )
+    .await?;
+
+    if applied {
+        info!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            creator_count = creators.len(),
+            "Applied notify list update"
+        );
+    } else {
+        debug!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            created_at = %event.created_at,
+            "Ignoring notify list update older than the applied one"
+        );
+    }
+
+    Ok(())
+}
+
 /// Handle content events that may trigger notifications
 async fn handle_content_event(
     state: &AppState,
@@ -381,10 +476,9 @@ async fn handle_content_event(
     // Determine notification type and find recipients based on event kind
     let kind_num = event_kind.as_u16();
 
-    let (notification_type, recipients) = if kind_num == 7 {
+    let targets = if kind_num == 7 {
         // Kind 7: Reaction/Like - notify the author of the liked event
-        let recipients = find_reaction_recipients(event);
-        (NotificationType::Like, recipients)
+        targets_of(NotificationType::Like, find_reaction_recipients(event))
     } else if kind_num == 1 {
         // Kind 1: Text note - could be a comment or mention
         let recipients = find_text_note_recipients(event);
@@ -395,14 +489,13 @@ async fn handle_content_event(
         } else {
             NotificationType::Mention
         };
-        (notification_type, recipients)
+        targets_of(notification_type, recipients)
     } else if kind_num == 1111 {
         // Kind 1111: NIP-22 comment (diVine publishes video comments here, not
         // as kind 1). Notify the root author (uppercase `P`, the video owner)
         // and the direct parent author (lowercase `p`). create_fcm_payload
         // attaches the authoritative root-video target from the uppercase `A`.
-        let recipients = find_comment_recipients(event);
-        (NotificationType::Comment, recipients)
+        targets_of(NotificationType::Comment, find_comment_recipients(event))
     } else if kind_num == 3 {
         // Kind 3: Contact list - notify newly followed users
         // Note: This would require tracking previous contact list state
@@ -411,20 +504,18 @@ async fn handle_content_event(
         return Ok(());
     } else if kind_num == 16 {
         // Kind 16: Repost - notify the author of the reposted event
-        let recipients = find_repost_recipients(event);
-        (NotificationType::Repost, recipients)
+        targets_of(NotificationType::Repost, find_repost_recipients(event))
     } else if kind_num == 30023 {
         // Kind 30023: Long-form content - check for mentions
-        let recipients = find_mentioned_pubkeys(event);
-        (NotificationType::Mention, recipients)
+        targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
     } else if kind_num == KIND_VIDEO {
-        video_notification(event)
+        video_notification_targets(state, event).await?
     } else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
     };
 
-    if recipients.is_empty() {
+    if targets.is_empty() {
         debug!(event_id = %event_id, kind = %event_kind, "No recipients found for event");
         return Ok(());
     }
@@ -432,17 +523,18 @@ async fn handle_content_event(
     info!(
         event_id = %event_id,
         kind = %event_kind,
-        notification_type = ?notification_type,
-        recipient_count = recipients.len(),
+        recipient_count = targets.len(),
         "Processing notification event"
     );
 
-    // Send notifications to each recipient
-    for recipient_pubkey in recipients {
+    // Send notifications to each target
+    for target in targets {
         if token.is_cancelled() {
             info!(event_id = %event_id, "Notification sending cancelled");
             return Err(crate::error::ServiceError::Cancelled);
         }
+
+        let recipient_pubkey = target.recipient;
 
         // Skip if recipient is the sender
         if recipient_pubkey == event.pubkey {
@@ -454,7 +546,7 @@ async fn handle_content_event(
             state,
             event,
             &recipient_pubkey,
-            notification_type,
+            target.notification_type,
             token.clone(),
         )
         .await
@@ -519,14 +611,84 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
         .collect()
 }
 
-/// Build a mention notification for a video event.
-fn video_notification(event: &Event) -> (NotificationType, Vec<PublicKey>) {
-    let recipients = find_mentioned_pubkeys(event)
+/// One notification to deliver: who gets it, and what kind it is.
+///
+/// A single event can now yield more than one notification *type* — a video both
+/// mentions someone and reaches the author's bell subscribers — so recipients
+/// carry their own type rather than sharing one for the whole event.
+#[derive(Debug, Clone, Copy)]
+struct NotificationTarget {
+    recipient: PublicKey,
+    notification_type: NotificationType,
+}
+
+/// Give every recipient the same notification type.
+fn targets_of(
+    notification_type: NotificationType,
+    recipients: Vec<PublicKey>,
+) -> Vec<NotificationTarget> {
+    recipients
+        .into_iter()
+        .map(|recipient| NotificationTarget {
+            recipient,
+            notification_type,
+        })
+        .collect()
+}
+
+/// Mention targets for a video event: p-tagged users other than the author.
+fn video_mention_targets(event: &Event) -> Vec<NotificationTarget> {
+    find_mentioned_pubkeys(event)
         .into_iter()
         .filter(|recipient| *recipient != event.pubkey)
-        .collect();
+        .map(|recipient| NotificationTarget {
+            recipient,
+            notification_type: NotificationType::Mention,
+        })
+        .collect()
+}
 
-    (NotificationType::Mention, recipients)
+/// Merge bell watchers into a video's mention targets.
+///
+/// Mention wins on overlap: someone who both watches `author` and is mentioned
+/// in the video gets exactly one push, typed `Mention`, because that is the more
+/// specific signal. Watchers already present as mention targets are therefore
+/// skipped rather than added.
+///
+/// Kept separate from the Redis read so the dedup rule is testable on its own.
+fn merge_watcher_targets(
+    mut targets: Vec<NotificationTarget>,
+    author: &PublicKey,
+    watchers: Vec<PublicKey>,
+) -> Vec<NotificationTarget> {
+    for watcher in watchers {
+        // The send loop skips self-notifications too, but filtering here avoids
+        // a pointless token lookup and preferences read per video.
+        if watcher == *author {
+            continue;
+        }
+        if targets.iter().any(|t| t.recipient == watcher) {
+            continue;
+        }
+        targets.push(NotificationTarget {
+            recipient: watcher,
+            notification_type: NotificationType::NewPost,
+        });
+    }
+    targets
+}
+
+/// Build the notification targets for a video event: mentions plus bells.
+async fn video_notification_targets(
+    state: &AppState,
+    event: &Event,
+) -> Result<Vec<NotificationTarget>> {
+    let watchers = redis_store::get_notify_watchers(&state.redis_pool, &event.pubkey).await?;
+    Ok(merge_watcher_targets(
+        video_mention_targets(event),
+        &event.pubkey,
+        watchers,
+    ))
 }
 
 /// Build the coordinate-and-recipient key used to deduplicate video edits.
@@ -662,6 +824,30 @@ async fn send_notification_to_user(
         }
     }
 
+    if notification_type == NotificationType::NewPost {
+        let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
+        let within_window = tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while checking the new-post rate limit.");
+                return Err(crate::error::ServiceError::Cancelled);
+            }
+            lookup_result = redis_store::get_cached_string(&state.redis_pool, &rate_key) => {
+                lookup_result?.is_some()
+            }
+        };
+
+        if within_window {
+            info!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                creator = %event.pubkey,
+                "Skipping new-post notification inside the per-creator rate-limit window"
+            );
+            return Ok(());
+        }
+    }
+
     info!(
         event_id = %event_id,
         target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
@@ -728,6 +914,26 @@ async fn send_notification_to_user(
         failed_count = tokens_to_remove.len(),
         "FCM notification send summary"
     );
+
+    // Open the rate-limit window only on a delivered push.
+    //
+    // This is check-then-set-on-success rather than an atomic `SET NX EX`, both
+    // to mirror the video-coordinate dedup above and — more importantly — so a
+    // failed FCM send does not burn the user's hour-long window. The tradeoff is
+    // that two replicas handling different videos from the same creator in the
+    // same instant can both pass the check and double-send. That race is rare,
+    // bounded, and low-harm; silently eating an hour of notifications on an FCM
+    // blip is worse. Do not "fix" this into `SET NX EX`.
+    if notification_type == NotificationType::NewPost && success_count > 0 {
+        let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
+        redis_store::set_cached_string(
+            &state.redis_pool,
+            &rate_key,
+            "1",
+            state.settings.service.new_post_rate_limit_secs,
+        )
+        .await?;
+    }
 
     if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
         let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
@@ -851,6 +1057,13 @@ async fn create_fcm_payload(
         NotificationType::Repost => {
             let title = "New repost".to_string();
             let body = format!("{} reposted your post", sender_name);
+            (title, body)
+        }
+        NotificationType::NewPost => {
+            // Provisional copy. divine-mobile/brand-guidelines/TONE_OF_VOICE.md
+            // governs user-facing strings; confirm before release.
+            let title = "New vine".to_string();
+            let body = format!("{} posted a new vine", sender_name);
             (title, body)
         }
     };
@@ -1199,11 +1412,14 @@ mod tests {
             .sign_with_keys(&sender)
             .unwrap();
 
-        let (notification_type, recipients) = video_notification(&event);
+        let targets = video_mention_targets(&event);
 
-        assert_eq!(notification_type, NotificationType::Mention);
-        assert_eq!(notification_type.display_name(), "mention");
-        assert_eq!(recipients.len(), 2);
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .all(|t| t.notification_type == NotificationType::Mention));
+        assert_eq!(NotificationType::Mention.display_name(), "mention");
+        let recipients: Vec<PublicKey> = targets.iter().map(|t| t.recipient).collect();
         assert!(recipients.contains(&mentioned1.public_key()));
         assert!(recipients.contains(&mentioned2.public_key()));
     }
@@ -1217,9 +1433,78 @@ mod tests {
             .sign_with_keys(&sender)
             .unwrap();
 
-        let (_, recipients) = video_notification(&event);
+        assert!(video_mention_targets(&event).is_empty());
+    }
 
-        assert!(recipients.is_empty());
+    #[test]
+    fn test_watcher_yields_a_new_post_target() {
+        let author = Keys::generate().public_key();
+        let watcher = Keys::generate().public_key();
+
+        let targets = merge_watcher_targets(Vec::new(), &author, vec![watcher]);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, watcher);
+        assert_eq!(targets[0].notification_type, NotificationType::NewPost);
+    }
+
+    #[test]
+    fn test_mentioned_watcher_yields_exactly_one_mention_target() {
+        let author = Keys::generate().public_key();
+        let both = Keys::generate().public_key();
+
+        let mentions = vec![NotificationTarget {
+            recipient: both,
+            notification_type: NotificationType::Mention,
+        }];
+        let targets = merge_watcher_targets(mentions, &author, vec![both]);
+
+        assert_eq!(targets.len(), 1, "mention wins, so no second push");
+        assert_eq!(targets[0].notification_type, NotificationType::Mention);
+    }
+
+    #[test]
+    fn test_author_watching_themselves_yields_nothing() {
+        let author = Keys::generate().public_key();
+
+        let targets = merge_watcher_targets(Vec::new(), &author, vec![author]);
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_no_watchers_leaves_mention_targets_unchanged() {
+        let author = Keys::generate().public_key();
+        let mentioned = Keys::generate().public_key();
+
+        let mentions = vec![NotificationTarget {
+            recipient: mentioned,
+            notification_type: NotificationType::Mention,
+        }];
+        let targets = merge_watcher_targets(mentions, &author, Vec::new());
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, mentioned);
+        assert_eq!(targets[0].notification_type, NotificationType::Mention);
+    }
+
+    #[test]
+    fn test_watcher_and_separate_mention_both_get_their_own_type() {
+        let author = Keys::generate().public_key();
+        let mentioned = Keys::generate().public_key();
+        let watcher = Keys::generate().public_key();
+
+        let mentions = vec![NotificationTarget {
+            recipient: mentioned,
+            notification_type: NotificationType::Mention,
+        }];
+        let targets = merge_watcher_targets(mentions, &author, vec![watcher]);
+
+        assert_eq!(targets.len(), 2);
+        let mention = targets.iter().find(|t| t.recipient == mentioned).unwrap();
+        let bell = targets.iter().find(|t| t.recipient == watcher).unwrap();
+        assert_eq!(mention.notification_type, NotificationType::Mention);
+        assert_eq!(bell.notification_type, NotificationType::NewPost);
     }
 
     #[test]

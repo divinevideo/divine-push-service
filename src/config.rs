@@ -63,6 +63,15 @@ pub struct ServiceSettings {
     /// Retention for successful per-recipient video-coordinate deliveries.
     #[serde(default = "default_video_coordinate_dedup_ttl")]
     pub video_coordinate_dedup_ttl_secs: u64,
+    /// Minimum gap between new-post pushes for one (subscriber, creator) pair.
+    #[serde(default = "default_new_post_rate_limit")]
+    pub new_post_rate_limit_secs: u64,
+    /// Cap on notify lists pulled during historical replay.
+    ///
+    /// The historical notify-list query is deliberately unbounded in time, so
+    /// this is the safety valve on result size instead.
+    #[serde(default = "default_notify_list_history_limit")]
+    pub notify_list_history_limit: usize,
     /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
@@ -75,6 +84,17 @@ fn default_process_window_days() -> i64 {
 
 fn default_processed_event_ttl() -> u64 {
     604800 // 7 days
+}
+
+fn default_notify_list_history_limit() -> usize {
+    5000
+}
+
+fn default_new_post_rate_limit() -> u64 {
+    // Vines are cheap to make. An unthrottled prolific creator trains users to
+    // disable notifications entirely, so cap new-post pushes at one per hour
+    // per creator. The in-app feed is deliberately not throttled.
+    3600
 }
 
 fn default_video_coordinate_dedup_ttl() -> u64 {
@@ -186,6 +206,7 @@ fn default_preference_kinds() -> Vec<u16> {
         7,     // Reactions/likes
         16,    // Reposts
         30023, // Long-form content
+        34236, // Videos from subscribed creators (new-post "bells")
     ]
 }
 

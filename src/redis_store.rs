@@ -278,6 +278,147 @@ pub async fn try_claim_event(
 }
 
 // =============================================================================
+// Notify Subscriptions ("bells")
+// =============================================================================
+
+/// Forward index: creators this subscriber has belled.
+fn build_notify_subs_key(subscriber: &PublicKey) -> String {
+    format!("notify_subs:{}", subscriber.to_hex())
+}
+
+/// `created_at` of the last applied notify-list event for this subscriber.
+fn build_notify_subs_ts_key(subscriber: &PublicKey) -> String {
+    format!("notify_subs_ts:{}", subscriber.to_hex())
+}
+
+/// Prefix of the reverse index. Kept as a prefix (not a built key) because the
+/// Lua script below composes watcher keys from it.
+const NOTIFY_WATCHERS_PREFIX: &str = "notify_watchers:";
+
+/// Reverse index: subscribers watching this creator. The hot read path.
+fn build_notify_watchers_key(creator: &PublicKey) -> String {
+    format!("{}{}", NOTIFY_WATCHERS_PREFIX, creator.to_hex())
+}
+
+/// Rate-limit window marker for one (subscriber, creator) pair.
+pub fn build_notify_rate_key(subscriber: &PublicKey, creator: &PublicKey) -> String {
+    format!("notify_rate:{}:{}", subscriber.to_hex(), creator.to_hex())
+}
+
+/// Diff-and-apply a replacement notify list atomically.
+///
+/// `notify_subs` and `notify_watchers` are two views of the same relation and
+/// must move together, so the whole diff runs in one Lua script rather than a
+/// read-then-write from the caller.
+///
+/// The script re-checks the stored `created_at` internally: a relay can deliver
+/// an older replacement after a newer one, and an advisory check in the caller
+/// would still race. Returns `false` when the incoming event was rejected as
+/// stale or duplicate, `true` when it was applied.
+///
+/// Not Redis Cluster safe: the script writes `notify_watchers:*` keys that are
+/// not declared in `KEYS`, because the set of creators is only known from the
+/// event body. This deployment uses single-instance Redis (see
+/// `docker-compose.yml`); moving to Cluster requires resharding this into one
+/// call per creator slot or a hash-tagged key layout.
+pub async fn replace_notify_subscriptions(
+    pool: &RedisPool,
+    subscriber: &PublicKey,
+    creators: &[PublicKey],
+    created_at: u64,
+) -> Result<bool> {
+    const REPLACE_SCRIPT: &str = r#"
+        local stored = redis.call('GET', KEYS[2])
+        if stored and tonumber(stored) >= tonumber(ARGV[1]) then
+          return 0
+        end
+
+        local prefix = ARGV[2]
+        local subscriber = ARGV[3]
+
+        local incoming = {}
+        for i = 4, #ARGV do
+          incoming[ARGV[i]] = true
+        end
+
+        -- Drop the subscriber from creators no longer on the list.
+        local previous = redis.call('SMEMBERS', KEYS[1])
+        for _, creator in ipairs(previous) do
+          if not incoming[creator] then
+            redis.call('SREM', prefix .. creator, subscriber)
+          end
+        end
+
+        -- Replace the forward set wholesale. An empty incoming list is
+        -- legitimate (the user unbelled everyone) and clears the key.
+        redis.call('DEL', KEYS[1])
+        for i = 4, #ARGV do
+          redis.call('SADD', KEYS[1], ARGV[i])
+          redis.call('SADD', prefix .. ARGV[i], subscriber)
+        end
+
+        redis.call('SET', KEYS[2], ARGV[1])
+        return 1
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let script = redis::Script::new(REPLACE_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(build_notify_subs_key(subscriber))
+        .key(build_notify_subs_ts_key(subscriber))
+        .arg(created_at)
+        .arg(NOTIFY_WATCHERS_PREFIX)
+        .arg(subscriber.to_hex());
+    for creator in creators {
+        invocation.arg(creator.to_hex());
+    }
+
+    let applied: i64 = invocation
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(applied == 1)
+}
+
+/// Read the subscribers watching `creator`.
+///
+/// Unparseable members are skipped with a warning rather than failing the whole
+/// lookup, so one corrupt entry cannot block delivery to everyone else.
+pub async fn get_notify_watchers(pool: &RedisPool, creator: &PublicKey) -> Result<Vec<PublicKey>> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let members: Vec<String> = redis::cmd("SMEMBERS")
+        .arg(build_notify_watchers_key(creator))
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    let mut watchers = Vec::with_capacity(members.len());
+    for member in members {
+        match PublicKey::from_hex(&member) {
+            Ok(pubkey) => watchers.push(pubkey),
+            Err(e) => tracing::warn!(
+                creator = %creator.to_hex(),
+                member = %member,
+                error = %e,
+                "Skipping unparseable notify watcher"
+            ),
+        }
+    }
+
+    Ok(watchers)
+}
+
+// =============================================================================
 // Caching
 // =============================================================================
 
