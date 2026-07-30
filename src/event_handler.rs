@@ -663,6 +663,17 @@ fn targets_of(
         .collect()
 }
 
+/// User-visible copy for a new-post push.
+///
+/// The body is required by the mobile client: an empty value makes foreground
+/// handling return early without displaying a notification.
+fn new_post_copy(sender_name: &str) -> (String, String) {
+    (
+        "New vine".to_string(),
+        format!("{} posted a new vine", sender_name),
+    )
+}
+
 /// Mention targets for a video event: p-tagged users other than the author.
 fn video_mention_targets(event: &Event) -> Vec<NotificationTarget> {
     find_mentioned_pubkeys(event)
@@ -1089,9 +1100,7 @@ async fn create_fcm_payload(
         NotificationType::NewPost => {
             // Provisional copy. divine-mobile/brand-guidelines/TONE_OF_VOICE.md
             // governs user-facing strings; confirm before release.
-            let title = "New vine".to_string();
-            let body = format!("{} posted a new vine", sender_name);
-            (title, body)
+            new_post_copy(&sender_name)
         }
     };
 
@@ -1557,6 +1566,18 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].recipient, watcher);
         assert_eq!(targets[0].notification_type, NotificationType::NewPost);
+    }
+
+    #[test]
+    fn test_new_post_copy_has_required_non_empty_body() {
+        let (title, body) = new_post_copy("Alice");
+
+        assert_eq!(title, "New vine");
+        assert_eq!(body, "Alice posted a new vine");
+        assert!(
+            !body.trim().is_empty(),
+            "mobile silently drops foreground pushes without a body"
+        );
     }
 
     #[test]
