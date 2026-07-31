@@ -561,10 +561,24 @@ async fn handle_content_event(
         return Ok(());
     }
 
+    // A single event can now yield more than one notification type, so the log
+    // carries the per-type breakdown rather than one type for the whole event.
+    // A bare count would leave the type most likely to need operational
+    // attention -- NewPost, with its fan-out and rate limiting -- invisible.
+    let mut type_counts: Vec<(&str, usize)> = Vec::new();
+    for target in &targets {
+        let name = target.notification_type.display_name();
+        match type_counts.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => type_counts.push((name, 1)),
+        }
+    }
+
     info!(
         event_id = %event_id,
         kind = %event_kind,
         recipient_count = targets.len(),
+        notification_types = ?type_counts,
         "Processing notification event"
     );
 
