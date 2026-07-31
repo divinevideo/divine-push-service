@@ -50,8 +50,13 @@ const REPLAY_HORIZON_DAYS: u64 = 7;
 /// Notify lists are replaceable: a list published three months ago and never
 /// touched since is still the user's current subscription set. Aging one out
 /// would silently drop every bell on it until the user happened to republish.
+///
+/// Checks the `d` tag as well as the kind, for the same reason
+/// `handle_notify_list_update` does: the relay-side `#d` filter should already
+/// guarantee it, but a buggy or hostile relay can send any kind 30000 it likes,
+/// and the exemption should cover exactly the events it exists for.
 pub fn is_notify_list(event: &Event) -> bool {
-    event.kind.as_u16() == KIND_NOTIFY_LIST
+    event.kind.as_u16() == KIND_NOTIFY_LIST && event.tags.identifier() == Some(NOTIFY_LIST_D_TAG)
 }
 
 /// Whether the handler loop should drop this event as beyond the replay horizon.

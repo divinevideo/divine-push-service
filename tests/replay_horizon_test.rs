@@ -104,3 +104,13 @@ fn test_old_content_events_are_still_dropped() {
 
     assert!(event_handler::is_beyond_replay_horizon(&old_video));
 }
+
+#[test]
+fn test_exemption_does_not_cover_other_kind_30000_lists() {
+    // The relay filter narrows to `#d=notify`, but a buggy or hostile relay can
+    // send any kind 30000. An unrelated people list is not subscription state
+    // this service owns, so it gets no exemption from the horizon.
+    let other = aged_list_event("mute", Duration::from_secs(90 * 24 * 60 * 60));
+
+    assert!(event_handler::is_beyond_replay_horizon(&other));
+}
