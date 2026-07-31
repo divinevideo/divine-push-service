@@ -54,6 +54,15 @@ pub fn is_notify_list(event: &Event) -> bool {
     event.kind.as_u16() == KIND_NOTIFY_LIST
 }
 
+/// Whether the handler loop should drop this event as beyond the replay horizon.
+///
+/// Extracted from `run()` so the exemption is covered by a test. Getting this
+/// composition wrong is silent: bells set more than `REPLAY_HORIZON_DAYS` ago
+/// simply never rebuild, and nothing logs an error.
+pub fn is_beyond_replay_horizon(event: &Event) -> bool {
+    is_event_too_old(event) && !is_notify_list(event)
+}
+
 /// Check if event is targeted to this service via p tag
 fn is_event_for_service(event: &Event, service_pubkey: &PublicKey) -> bool {
     event
@@ -108,7 +117,7 @@ pub async fn run(
                 // Notify lists are exempt: they are replaceable subscription
                 // state, not a timely trigger, so age says nothing about
                 // whether they are current.
-                if is_event_too_old(&event) && !is_notify_list(&event) {
+                if is_beyond_replay_horizon(&event) {
                     debug!(event_id = %event_id, created_at = %event.created_at, "Ignoring old event beyond replay horizon");
                     continue;
                 }

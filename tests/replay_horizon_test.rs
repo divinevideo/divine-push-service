@@ -57,3 +57,50 @@ fn test_replay_horizon_future_events() {
     // Future events should be accepted (they're not old)
     assert!(!event_handler::is_event_too_old(&event));
 }
+
+/// Build a kind-30000 list event with the given `d` tag, aged by `age`.
+fn aged_list_event(d_tag: &str, age: Duration) -> Event {
+    EventBuilder::new(Kind::from(30000u16), "")
+        .tag(Tag::identifier(d_tag))
+        .tag(Tag::public_key(Keys::generate().public_key()))
+        .custom_created_at(Timestamp::now() - age)
+        .sign_with_keys(&Keys::generate())
+        .unwrap()
+}
+
+#[test]
+fn test_notify_list_survives_the_replay_horizon() {
+    // The whole feature rests on this. A bell list is replaceable state, not a
+    // timely trigger: one published 90 days ago and never touched since is
+    // still the user's current subscription set. If the horizon aged it out,
+    // every user who set their bells more than a week ago would silently get
+    // nothing, with no error anywhere.
+    let list = aged_list_event("notify", Duration::from_secs(90 * 24 * 60 * 60));
+
+    assert!(
+        event_handler::is_event_too_old(&list),
+        "the event really is beyond the horizon"
+    );
+    assert!(
+        !event_handler::is_beyond_replay_horizon(&list),
+        "but the handler loop must not drop it"
+    );
+}
+
+#[test]
+fn test_recent_notify_list_is_kept() {
+    let list = aged_list_event("notify", Duration::from_secs(60 * 60));
+
+    assert!(!event_handler::is_beyond_replay_horizon(&list));
+}
+
+#[test]
+fn test_old_content_events_are_still_dropped() {
+    let old_video = EventBuilder::new(Kind::from(34236u16), "video")
+        .tag(Tag::identifier("vid-1"))
+        .custom_created_at(Timestamp::now() - Duration::from_secs(8 * 24 * 60 * 60))
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+
+    assert!(event_handler::is_beyond_replay_horizon(&old_video));
+}
