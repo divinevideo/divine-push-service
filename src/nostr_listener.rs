@@ -23,7 +23,7 @@ const KIND_PREFERENCES_UPDATE: u16 = 3083;
 /// NIP-51 people list carrying new-post ("bell") subscriptions.
 const KIND_NOTIFY_LIST: u16 = 30000;
 
-/// Build the notify-list filter.
+/// Build the notify-list filter for the historical rebuild.
 ///
 /// This must be a *separate* filter from the main kinds filter: an identifier
 /// constraint there would wrongly apply to every kind in the list. Subscribing
@@ -32,12 +32,29 @@ const KIND_NOTIFY_LIST: u16 = 30000;
 ///
 /// Deliberately unbounded in time. A notify list is replaceable, so one
 /// published months ago and never touched since is still current; a `since`
-/// bound would silently drop those subscriptions.
-fn notify_list_filter(limit: usize) -> Filter {
+/// bound would silently drop those subscriptions. `limit` is the safety valve
+/// on result size instead.
+fn notify_list_history_filter(limit: usize) -> Filter {
     Filter::new()
         .kind(Kind::from(KIND_NOTIFY_LIST))
         .identifier(crate::event_handler::NOTIFY_LIST_D_TAG)
         .limit(limit)
+}
+
+/// Build the notify-list filter for the live subscription.
+///
+/// Unlike the historical query this is bounded in time and carries no `limit`.
+/// Per NIP-01 a filter's `limit` applies to the initial stored-event query, so
+/// reusing the history filter here makes every subscribe — including the
+/// automatic resubscribe after a relay reconnect — replay up to `limit` stored
+/// lists that the historical pass already applied. The `since` window mirrors
+/// the main live filter and covers the gap between the historical fetch and the
+/// subscription taking effect.
+fn notify_list_live_filter(since: Timestamp) -> Filter {
+    Filter::new()
+        .kind(Kind::from(KIND_NOTIFY_LIST))
+        .identifier(crate::event_handler::NOTIFY_LIST_D_TAG)
+        .since(since)
 }
 
 pub struct NostrListener {
@@ -193,7 +210,7 @@ impl NostrListener {
         token: &CancellationToken,
     ) -> Result<()> {
         let limit = self.state.settings.service.notify_list_history_limit;
-        let filter = notify_list_filter(limit);
+        let filter = notify_list_history_filter(limit);
 
         info!(limit, "Querying historical notify lists...");
 
@@ -308,8 +325,7 @@ impl NostrListener {
         // Notify lists need their own subscription: `subscribe` takes one filter
         // per call, and the `#d` narrowing cannot be merged into the kinds
         // filter above without wrongly constraining every other kind.
-        let notify_filter =
-            notify_list_filter(self.state.settings.service.notify_list_history_limit);
+        let notify_filter = notify_list_live_filter(since);
 
         info!(
             "Subscribing to notify lists (kind {KIND_NOTIFY_LIST}, d={})",
