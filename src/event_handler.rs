@@ -536,7 +536,7 @@ async fn handle_content_event(
         // Kind 30023: Long-form content - check for mentions
         targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
     } else if kind_num == KIND_VIDEO {
-        video_notification_targets(state, event).await?
+        video_notification_targets(state, event).await
     } else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
@@ -716,17 +716,39 @@ fn merge_watcher_targets(
     targets
 }
 
+/// Resolve a watcher lookup into the watchers to notify, degrading to none.
+///
+/// Bells are enrichment layered on top of mentions, and they are the only part
+/// of a video's targets that needs Redis. A failed lookup must therefore cost
+/// the bells and nothing else. Propagating it would discard the mention
+/// notifications the same event produced before this feature existed, from
+/// tags that were already in hand.
+///
+/// Kept separate from the read so the degradation is testable without an
+/// `AppState`.
+fn watchers_or_degrade(event: &Event, lookup: Result<Vec<PublicKey>>) -> Vec<PublicKey> {
+    match lookup {
+        Ok(watchers) => watchers,
+        Err(e) => {
+            error!(
+                event_id = %event.id,
+                creator = %event.pubkey,
+                error = %e,
+                "Failed to read notify watchers - delivering mentions without bells"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Build the notification targets for a video event: mentions plus bells.
-async fn video_notification_targets(
-    state: &AppState,
-    event: &Event,
-) -> Result<Vec<NotificationTarget>> {
-    let watchers = redis_store::get_notify_watchers(&state.redis_pool, &event.pubkey).await?;
-    Ok(merge_watcher_targets(
+async fn video_notification_targets(state: &AppState, event: &Event) -> Vec<NotificationTarget> {
+    let lookup = redis_store::get_notify_watchers(&state.redis_pool, &event.pubkey).await;
+    merge_watcher_targets(
         video_mention_targets(event),
         &event.pubkey,
-        watchers,
-    ))
+        watchers_or_degrade(event, lookup),
+    )
 }
 
 /// Build the coordinate-and-recipient key used to deduplicate video edits.
@@ -1614,6 +1636,35 @@ mod tests {
             notification_type: NotificationType::Mention,
         }];
         let targets = merge_watcher_targets(mentions, &author, Vec::new());
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, mentioned);
+        assert_eq!(targets[0].notification_type, NotificationType::Mention);
+    }
+
+    #[test]
+    fn test_failed_watcher_lookup_still_delivers_mentions() {
+        let author = Keys::generate();
+        let mentioned = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("vid-1"))
+            .tag(Tag::public_key(mentioned))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        // Redis is down. The bells are lost; the mentions must not be, because
+        // they came from the event's own tags and needed no lookup at all.
+        let lookup = Err(crate::error::ServiceError::Internal(
+            "redis down".to_string(),
+        ));
+        let watchers = watchers_or_degrade(&event, lookup);
+        assert!(watchers.is_empty());
+
+        let targets = merge_watcher_targets(
+            video_mention_targets(&event),
+            &author.public_key(),
+            watchers,
+        );
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].recipient, mentioned);
