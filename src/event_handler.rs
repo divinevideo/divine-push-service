@@ -14,7 +14,9 @@ use crate::{
     redis_store,
     state::AppState,
 };
+use futures_util::{stream, StreamExt};
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -580,7 +582,7 @@ async fn handle_content_event(
         // Kind 30023: Long-form content - check for mentions
         targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
     } else if kind_num == KIND_VIDEO {
-        video_notification_targets(state, event).await
+        return handle_video_content_event(state, event, token).await;
     } else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
@@ -625,10 +627,19 @@ async fn handle_content_event(
     // only if some recipient survives the gates in `send_notification_to_user`.
     let copy = LazyEventCopy::for_targets(&targets);
 
-    // Send notifications to each target
+    send_notifications_sequential(state, event, targets, &copy, token).await
+}
+
+async fn send_notifications_sequential(
+    state: &AppState,
+    event: &Event,
+    targets: Vec<NotificationTarget>,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+) -> Result<()> {
     for target in targets {
         if token.is_cancelled() {
-            info!(event_id = %event_id, "Notification sending cancelled");
+            info!(event_id = %event.id, "Notification sending cancelled");
             return Err(crate::error::ServiceError::Cancelled);
         }
 
@@ -639,7 +650,7 @@ async fn handle_content_event(
             event,
             &recipient_pubkey,
             target.notification_type,
-            &copy,
+            copy,
             token.clone(),
         )
         .await
@@ -648,7 +659,7 @@ async fn handle_content_event(
                 return Err(e);
             }
             error!(
-                event_id = %event_id,
+                event_id = %event.id,
                 recipient = %recipient_pubkey,
                 error = %e,
                 "Failed to send notification"
@@ -657,6 +668,173 @@ async fn handle_content_event(
     }
 
     Ok(())
+}
+
+async fn send_notifications_bounded(
+    state: &AppState,
+    event: &Event,
+    targets: Vec<NotificationTarget>,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+    concurrency: usize,
+) -> Result<()> {
+    let mut deliveries = stream::iter(targets)
+        .map(|target| {
+            let token = token.clone();
+            async move {
+                let recipient = target.recipient;
+                (
+                    recipient,
+                    deliver_notification_target(state, event, target, copy, token).await,
+                )
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some((recipient, result)) = deliveries.next().await {
+        if let Err(e) = result {
+            if matches!(e, crate::error::ServiceError::Cancelled) {
+                return Err(e);
+            }
+            error!(
+                event_id = %event.id,
+                recipient = %recipient,
+                error = %e,
+                "Failed to send notification"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn deliver_notification_target(
+    state: &AppState,
+    event: &Event,
+    target: NotificationTarget,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+) -> Result<()> {
+    let recipient_pubkey = target.recipient;
+
+    // Skip if recipient is the sender
+    if recipient_pubkey == event.pubkey {
+        trace!(event_id = %event.id, "Skipping notification to sender");
+        return Ok(());
+    }
+
+    send_notification_to_user(
+        state,
+        event,
+        &recipient_pubkey,
+        target.notification_type,
+        copy,
+        token,
+    )
+    .await
+}
+
+async fn handle_video_content_event(
+    state: &AppState,
+    event: &Event,
+    token: CancellationToken,
+) -> Result<()> {
+    let mention_targets = deliverable_targets(video_mention_targets(event), &event.pubkey);
+    let mentioned: HashSet<PublicKey> = mention_targets
+        .iter()
+        .map(|target| target.recipient)
+        .collect();
+
+    let mut target_count = 0usize;
+    if !mention_targets.is_empty() {
+        info!(
+            event_id = %event.id,
+            kind = %event.kind,
+            recipient_count = mention_targets.len(),
+            notification_types = ?vec![(NotificationType::Mention.display_name(), mention_targets.len())],
+            "Processing notification event"
+        );
+        let copy = LazyEventCopy::for_targets(&mention_targets);
+        send_notifications_sequential(state, event, mention_targets, &copy, token.clone()).await?;
+        target_count += mentioned.len();
+    }
+
+    let page_size = state.settings.service.new_post_fanout_page_size;
+    let concurrency = state.settings.service.new_post_delivery_concurrency;
+    let mut cursor = 0;
+    loop {
+        if token.is_cancelled() {
+            info!(event_id = %event.id, "Notification sending cancelled");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+
+        let page = match redis_store::get_notify_watchers_page(
+            &state.redis_pool,
+            &event.pubkey,
+            cursor,
+            page_size,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(e) => {
+                error!(
+                    event_id = %event.id,
+                    creator = %event.pubkey,
+                    cursor,
+                    error = %e,
+                    "Failed to read notify watcher page - delivering mentions without remaining bells"
+                );
+                break;
+            }
+        };
+
+        let next_cursor = page.next_cursor;
+        let new_post_targets = watcher_page_targets(page.watchers, &event.pubkey, &mentioned);
+        if !new_post_targets.is_empty() {
+            let page_target_count = new_post_targets.len();
+            info!(
+                event_id = %event.id,
+                kind = %event.kind,
+                recipient_count = page_target_count,
+                notification_types = ?vec![(NotificationType::NewPost.display_name(), page_target_count)],
+                cursor,
+                next_cursor,
+                "Processing new-post notification page"
+            );
+            let copy = LazyEventCopy::for_targets(&new_post_targets);
+            send_notifications_bounded(
+                state,
+                event,
+                new_post_targets,
+                &copy,
+                token.clone(),
+                concurrency,
+            )
+            .await?;
+            target_count += page_target_count;
+        }
+
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    if target_count == 0 {
+        debug!(event_id = %event.id, kind = %event.kind, "No recipients found for event");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+fn split_delivery_targets(
+    targets: Vec<NotificationTarget>,
+) -> (Vec<NotificationTarget>, Vec<NotificationTarget>) {
+    targets
+        .into_iter()
+        .partition(|target| target.notification_type != NotificationType::NewPost)
 }
 
 /// Find recipients for a reaction event (kind 7)
@@ -929,6 +1107,7 @@ fn video_mention_targets(event: &Event) -> Vec<NotificationTarget> {
 /// skipped rather than added.
 ///
 /// Kept separate from the Redis read so the dedup rule is testable on its own.
+#[cfg(test)]
 fn merge_watcher_targets(
     mut targets: Vec<NotificationTarget>,
     author: &PublicKey,
@@ -951,6 +1130,22 @@ fn merge_watcher_targets(
     targets
 }
 
+fn watcher_page_targets(
+    watchers: Vec<PublicKey>,
+    author: &PublicKey,
+    mentioned: &HashSet<PublicKey>,
+) -> Vec<NotificationTarget> {
+    watchers
+        .into_iter()
+        .filter(|watcher| watcher != author)
+        .filter(|watcher| !mentioned.contains(watcher))
+        .map(|recipient| NotificationTarget {
+            recipient,
+            notification_type: NotificationType::NewPost,
+        })
+        .collect()
+}
+
 /// Resolve a watcher lookup into the watchers to notify, degrading to none.
 ///
 /// Bells are enrichment layered on top of mentions, and they are the only part
@@ -961,6 +1156,7 @@ fn merge_watcher_targets(
 ///
 /// Kept separate from the read so the degradation is testable without an
 /// `AppState`.
+#[cfg(test)]
 fn watchers_or_degrade(event: &Event, lookup: Result<Vec<PublicKey>>) -> Vec<PublicKey> {
     match lookup {
         Ok(watchers) => watchers,
@@ -974,16 +1170,6 @@ fn watchers_or_degrade(event: &Event, lookup: Result<Vec<PublicKey>>) -> Vec<Pub
             Vec::new()
         }
     }
-}
-
-/// Build the notification targets for a video event: mentions plus bells.
-async fn video_notification_targets(state: &AppState, event: &Event) -> Vec<NotificationTarget> {
-    let lookup = redis_store::get_notify_watchers(&state.redis_pool, &event.pubkey).await;
-    merge_watcher_targets(
-        video_mention_targets(event),
-        &event.pubkey,
-        watchers_or_degrade(event, lookup),
-    )
 }
 
 /// Build the coordinate-and-recipient key used to deduplicate video edits.
@@ -2351,19 +2537,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_real_watcher_lookup_failure_still_delivers_mentions() {
-        // The test above proves `watchers_or_degrade` degrades. It does not
-        // prove anything calls it: it never reaches `video_notification_targets`,
-        // where the degradation is actually wired in, so replacing that call
-        // with `lookup.expect(...)` leaves the whole suite green. This drives a
-        // genuine `get_notify_watchers` failure through the real function, by
-        // leaving a string where the watcher set belongs so `SMEMBERS` fails
-        // with WRONGTYPE.
+    async fn test_a_real_watcher_page_failure_still_delivers_mentions() {
+        // This drives a genuine watcher-page failure through the real video
+        // delivery path by leaving a string where the watcher set belongs, so
+        // SSCAN fails with WRONGTYPE. Mentions came from the event's own tags
+        // and must still be delivered.
         let Some(pool) = test_redis_pool().await else {
             return;
         };
         let author = Keys::generate();
         let mentioned = Keys::generate().public_key();
+        let fcm_token = format!("mention_token_{}", EventId::all_zeros().to_hex());
+        redis_store::add_or_update_token(&pool, &mentioned, &fcm_token)
+            .await
+            .expect("register token");
         let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
             .tag(Tag::identifier("wrongtype-vid"))
             .tag(Tag::public_key(mentioned))
@@ -2381,27 +2568,36 @@ mod tests {
 
         // Without this the test could pass vacuously, by the lookup succeeding
         // and simply finding no watchers.
-        let lookup_failed = redis_store::get_notify_watchers(&pool, &author.public_key())
-            .await
-            .is_err();
+        let lookup_failed =
+            redis_store::get_notify_watchers_page(&pool, &author.public_key(), 0, 1000)
+                .await
+                .is_err();
 
+        let mock_sender = MockFcmSender::new();
         let state = test_app_state(
             crate::config::Settings::new().unwrap(),
             pool.clone(),
-            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
         );
-        let targets = video_notification_targets(&state, &event).await;
+        handle_video_content_event(&state, &event, CancellationToken::new())
+            .await
+            .expect("video handling degrades to mentions");
 
         let _: () = redis::cmd("DEL")
             .arg(&watchers_key)
             .query_async(&mut *conn)
             .await
             .unwrap();
+        redis_store::remove_token(&pool, &mentioned, &fcm_token)
+            .await
+            .expect("cleanup token");
 
         assert!(lookup_failed, "the seeded key must make the lookup fail");
-        assert_eq!(targets.len(), 1, "the mention survives the failed lookup");
-        assert_eq!(targets[0].recipient, mentioned);
-        assert_eq!(targets[0].notification_type, NotificationType::Mention);
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the mention survives the failed watcher page lookup"
+        );
     }
 
     #[test]
@@ -2421,6 +2617,29 @@ mod tests {
         let bell = targets.iter().find(|t| t.recipient == watcher).unwrap();
         assert_eq!(mention.notification_type, NotificationType::Mention);
         assert_eq!(bell.notification_type, NotificationType::NewPost);
+    }
+
+    #[test]
+    fn test_delivery_targets_split_new_post_from_regular_notifications() {
+        let mention_recipient = Keys::generate().public_key();
+        let watcher = Keys::generate().public_key();
+        let targets = vec![
+            NotificationTarget {
+                recipient: mention_recipient,
+                notification_type: NotificationType::Mention,
+            },
+            NotificationTarget {
+                recipient: watcher,
+                notification_type: NotificationType::NewPost,
+            },
+        ];
+
+        let (regular, new_posts) = split_delivery_targets(targets);
+
+        assert_eq!(regular.len(), 1);
+        assert_eq!(regular[0].notification_type, NotificationType::Mention);
+        assert_eq!(new_posts.len(), 1);
+        assert_eq!(new_posts[0].notification_type, NotificationType::NewPost);
     }
 
     #[test]

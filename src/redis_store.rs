@@ -12,6 +12,7 @@ use bb8_redis::bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use nostr_sdk::{EventId, PublicKey, Timestamp};
 use redis::{RedisResult, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 
 // Type alias for the connection pool
@@ -505,14 +506,69 @@ pub async fn get_notify_watchers(pool: &RedisPool, creator: &PublicKey) -> Resul
     Ok(watchers)
 }
 
+/// One page of subscribers watching a creator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyWatcherPage {
+    pub watchers: Vec<PublicKey>,
+    pub next_cursor: u64,
+}
+
+/// Read one SSCAN page of subscribers watching `creator`.
+///
+/// The video fan-out path loops over pages so each Redis read and delivery
+/// batch stays bounded without dropping subscribers beyond a permanent cap.
+/// Unparseable members are skipped with a warning rather than failing the page.
+pub async fn get_notify_watchers_page(
+    pool: &RedisPool,
+    creator: &PublicKey,
+    cursor: u64,
+    count: usize,
+) -> Result<NotifyWatcherPage> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let (next_cursor, members): (u64, Vec<String>) = redis::cmd("SSCAN")
+        .arg(build_notify_watchers_key(creator))
+        .arg(cursor)
+        .arg("COUNT")
+        .arg(count)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    let mut seen = HashSet::with_capacity(members.len());
+    let mut watchers = Vec::with_capacity(members.len());
+    for member in members {
+        match PublicKey::from_hex(&member) {
+            Ok(pubkey) => {
+                if seen.insert(pubkey) {
+                    watchers.push(pubkey);
+                }
+            }
+            Err(e) => tracing::warn!(
+                creator = %creator.to_hex(),
+                member = %member,
+                error = %e,
+                "Skipping unparseable notify watcher"
+            ),
+        }
+    }
+
+    Ok(NotifyWatcherPage {
+        watchers,
+        next_cursor,
+    })
+}
+
 /// Test whether `subscriber` watches `creator`.
 ///
 /// The membership question on its own. The bell fallback in
 /// `send_notification_to_user` asks it per muted-mention recipient, and it is
 /// the whole answer it needs, so it must not pay `get_notify_watchers`'s
-/// transfer-and-parse of a creator's entire watcher set. `SISMEMBER` answers in
-/// the server. `get_notify_watchers` stays the read for the fan-out, which does
-/// need every member.
+/// transfer-and-parse of a creator's entire watcher set. `SISMEMBER` answers
+/// in the server. Fan-out reads use `get_notify_watchers_page`.
 pub async fn is_notify_watcher(
     pool: &RedisPool,
     creator: &PublicKey,

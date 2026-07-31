@@ -3,6 +3,7 @@
 
 use divine_push_service::redis_store;
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 
 async fn create_test_pool() -> Option<redis_store::RedisPool> {
     let redis_url =
@@ -719,4 +720,49 @@ async fn test_a_half_applied_list_still_converges_on_the_next_one() {
     );
 
     cleanup(&pool, &keys_for(&subscriber, &all)).await;
+}
+
+#[tokio::test]
+async fn test_watcher_pages_walk_to_full_coverage() {
+    let Some(pool) = create_test_pool().await else {
+        return;
+    };
+
+    let subscribers: Vec<PublicKey> = (0..3).map(|_| Keys::generate().public_key()).collect();
+    let creator = Keys::generate().public_key();
+    for subscriber in &subscribers {
+        cleanup(&pool, &keys_for(subscriber, &[creator])).await;
+    }
+
+    for (idx, subscriber) in subscribers.iter().enumerate() {
+        redis_store::replace_notify_subscriptions(
+            &pool,
+            subscriber,
+            &[creator],
+            1000 + idx as u64,
+            &test_event_id(1000 + idx as u64),
+        )
+        .await
+        .expect("replace");
+    }
+
+    let mut cursor = 0;
+    let mut watchers = HashSet::new();
+    loop {
+        let page = redis_store::get_notify_watchers_page(&pool, &creator, cursor, 2)
+            .await
+            .expect("watcher page lookup");
+        watchers.extend(page.watchers);
+        if page.next_cursor == 0 {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+
+    let expected: HashSet<PublicKey> = subscribers.iter().copied().collect();
+    assert_eq!(watchers, expected);
+
+    for subscriber in &subscribers {
+        cleanup(&pool, &keys_for(subscriber, &[creator])).await;
+    }
 }

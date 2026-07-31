@@ -15,8 +15,10 @@ service:
   processed_event_ttl_secs: 604800  # 7 days
   video_coordinate_dedup_ttl_secs: 31536000  # 1 year
   new_post_rate_limit_secs: 3600  # One new-post push per (subscriber, creator) per hour
-  notify_list_max_creators: 1000  # Bounds the Lua diff so one huge list can't stall Redis
+  notify_list_max_creators: 1000  # Bounds the Lua diff so one huge list cannot stall Redis
   notify_list_history_limit: 5000  # Page size for historical notify-list replay
+  new_post_fanout_page_size: 1000  # Watcher SSCAN page size for one video
+  new_post_delivery_concurrency: 50  # Concurrent NewPost deliveries per page
   # allowed_pubkeys: [] — empty means no restriction (production default)
 
 redis:
