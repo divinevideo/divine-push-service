@@ -582,6 +582,9 @@ async fn handle_content_event(
         "Processing notification event"
     );
 
+    // Resolve the recipient-independent copy once, before the fan-out loop.
+    let copy = resolve_event_scoped_copy(state, event, &targets).await;
+
     // Send notifications to each target
     for target in targets {
         if token.is_cancelled() {
@@ -602,6 +605,7 @@ async fn handle_content_event(
             event,
             &recipient_pubkey,
             target.notification_type,
+            &copy,
             token.clone(),
         )
         .await
@@ -689,6 +693,94 @@ fn targets_of(
             notification_type,
         })
         .collect()
+}
+
+/// The parts of a push payload that depend on the event rather than the recipient.
+///
+/// Resolved once per event and shared across the fan-out. Both fields used to be
+/// computed inside `create_fcm_payload`, which runs per recipient, so both cost
+/// scaled with the recipient count while their inputs did not.
+///
+/// That was affordable when an event reached one to three `p`-tagged recipients.
+/// A bell reaches every watcher of the creator, and `get_display_name` is not a
+/// cheap repeat: on a profile-cache miss it does a relay `fetch_events` with a
+/// five-second timeout, and misses are never cached — only profiles that were
+/// found are written back. So a creator with no kind-0 metadata paid one relay
+/// round-trip per watcher, serially, on the single event-handler loop, delaying
+/// every other user's notifications behind it.
+struct EventScopedCopy {
+    /// Display name of the event author, or a short npub when unresolvable.
+    sender_name: String,
+    /// Event content with mentions resolved, when any target renders it.
+    ///
+    /// `None` means "not resolved" — either no target needed it or the parse
+    /// failed — and callers fall back to the raw content, as they did before.
+    formatted_content: Option<String>,
+}
+
+/// Whether this notification type renders the event's content in its body.
+///
+/// Exhaustive rather than a `matches!` so a new notification type has to state
+/// its answer here instead of silently defaulting to "no" and reaching
+/// `create_fcm_payload` without the content it needs.
+fn renders_event_content(notification_type: NotificationType) -> bool {
+    match notification_type {
+        NotificationType::Comment | NotificationType::Mention => true,
+        NotificationType::Like
+        | NotificationType::Follow
+        | NotificationType::Repost
+        | NotificationType::NewPost => false,
+    }
+}
+
+/// Resolve the recipient-independent copy for an event, once.
+///
+/// The content parse is skipped entirely unless some target actually renders the
+/// body, so a pure bell fan-out does not pay for mention parsing it never uses.
+async fn resolve_event_scoped_copy(
+    state: &AppState,
+    event: &Event,
+    targets: &[NotificationTarget],
+) -> EventScopedCopy {
+    let Some(mention_parser) = state.mention_parser_service.as_ref() else {
+        return EventScopedCopy {
+            sender_name: format_short_npub(&event.pubkey),
+            formatted_content: None,
+        };
+    };
+
+    let sender_name = match mention_parser
+        .get_display_name(&event.pubkey.to_hex())
+        .await
+    {
+        Ok(Some(name)) => name,
+        Ok(None) => format_short_npub(&event.pubkey),
+        Err(e) => {
+            warn!(error = %e, "Failed to get sender display name");
+            format_short_npub(&event.pubkey)
+        }
+    };
+
+    let needs_content = targets
+        .iter()
+        .any(|target| renders_event_content(target.notification_type));
+
+    let formatted_content = if needs_content {
+        match mention_parser.format_content_for_push(&event.content).await {
+            Ok(formatted) => Some(formatted),
+            Err(e) => {
+                warn!(event_id = %event.id, error = %e, "Failed to format content for push");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    EventScopedCopy {
+        sender_name,
+        formatted_content,
+    }
 }
 
 /// User-visible copy for a new-post push.
@@ -826,6 +918,7 @@ async fn send_notification_to_user(
     event: &Event,
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
+    copy: &EventScopedCopy,
     token: CancellationToken,
 ) -> Result<()> {
     let event_id = event.id;
@@ -944,7 +1037,7 @@ async fn send_notification_to_user(
     );
 
     // Create FCM payload
-    let payload = create_fcm_payload(event, target_pubkey, notification_type, state).await?;
+    let payload = create_fcm_payload(event, target_pubkey, notification_type, copy);
 
     // Send to all tokens
     info!(
@@ -1069,29 +1162,27 @@ async fn send_notification_to_user(
 }
 
 /// Create FCM payload for a notification
-async fn create_fcm_payload(
+///
+/// Takes the event-scoped copy rather than resolving it, so the relay and Redis
+/// work behind `sender_name` and `formatted_content` happens once per event
+/// instead of once per recipient. That leaves this function free of I/O, which
+/// is also what makes it directly testable.
+fn create_fcm_payload(
     event: &Event,
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
-    state: &AppState,
-) -> Result<FcmPayload> {
+    copy: &EventScopedCopy,
+) -> FcmPayload {
     let mut data = std::collections::HashMap::new();
 
-    // Get sender name using mention parser service
-    let sender_name = if let Some(ref mention_parser) = state.mention_parser_service {
-        match mention_parser
-            .get_display_name(&event.pubkey.to_hex())
-            .await
-        {
-            Ok(Some(name)) => name,
-            Ok(None) => format_short_npub(&event.pubkey),
-            Err(e) => {
-                warn!(error = %e, "Failed to get sender display name");
-                format_short_npub(&event.pubkey)
-            }
-        }
-    } else {
-        format_short_npub(&event.pubkey)
+    let sender_name = copy.sender_name.clone();
+
+    // Falls back to the raw content when the parse was skipped or failed, which
+    // is what the per-recipient parse did on error.
+    let formatted_content = || {
+        copy.formatted_content
+            .clone()
+            .unwrap_or_else(|| event.content.clone())
     };
 
     // Generate title and body based on notification type
@@ -1103,19 +1194,10 @@ async fn create_fcm_payload(
         }
         NotificationType::Comment => {
             let title = "New comment".to_string();
-            // Format content with mention parser if available
-            let formatted_content = if let Some(ref mention_parser) = state.mention_parser_service {
-                match mention_parser.format_content_for_push(&event.content).await {
-                    Ok(formatted) => formatted,
-                    Err(_) => event.content.clone(),
-                }
-            } else {
-                event.content.clone()
-            };
             let body = format!(
                 "{}: {}",
                 sender_name,
-                truncate_string(&formatted_content, 150)
+                truncate_string(&formatted_content(), 150)
             );
             (title, body)
         }
@@ -1126,19 +1208,10 @@ async fn create_fcm_payload(
         }
         NotificationType::Mention => {
             let title = "You were mentioned".to_string();
-            // Format content with mention parser if available
-            let formatted_content = if let Some(ref mention_parser) = state.mention_parser_service {
-                match mention_parser.format_content_for_push(&event.content).await {
-                    Ok(formatted) => formatted,
-                    Err(_) => event.content.clone(),
-                }
-            } else {
-                event.content.clone()
-            };
             let body = format!(
                 "{}: {}",
                 sender_name,
-                truncate_string(&formatted_content, 150)
+                truncate_string(&formatted_content(), 150)
             );
             (title, body)
         }
@@ -1181,13 +1254,13 @@ async fn create_fcm_payload(
     // guess the target's owner.
     insert_trigger_reference_fields(&mut data, event);
 
-    Ok(FcmPayload {
+    FcmPayload {
         notification: None, // Data-only message for better client control
         data: Some(data),
         android: None,
         webpush: None,
         apns: None,
-    })
+    }
 }
 
 /// Authoritative addressable target extracted from an event's `A`/`a` tag.
@@ -1350,6 +1423,14 @@ mod tests {
             nostr_client: Arc::new(Client::default()),
             profile_client: Arc::new(Client::default()),
             mention_parser_service: None,
+        }
+    }
+
+    /// Event-scoped copy for tests that exercise delivery rather than copy.
+    fn test_copy() -> EventScopedCopy {
+        EventScopedCopy {
+            sender_name: "tester".to_string(),
+            formatted_content: None,
         }
     }
 
@@ -1631,6 +1712,88 @@ mod tests {
     }
 
     #[test]
+    fn test_only_body_rendering_types_need_the_event_content() {
+        // The content parse is skipped when no target renders the body, so this
+        // has to stay in step with the arms of `create_fcm_payload` that call
+        // `formatted_content()`. A type added to one and not the other silently
+        // downgrades that push to raw, unparsed content.
+        assert!(renders_event_content(NotificationType::Comment));
+        assert!(renders_event_content(NotificationType::Mention));
+
+        assert!(!renders_event_content(NotificationType::Like));
+        assert!(!renders_event_content(NotificationType::Follow));
+        assert!(!renders_event_content(NotificationType::Repost));
+        assert!(!renders_event_content(NotificationType::NewPost));
+    }
+
+    #[test]
+    fn test_payload_uses_the_event_scoped_sender_name() {
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("hoisted-sender"))
+            .sign_with_keys(&author)
+            .unwrap();
+        let copy = EventScopedCopy {
+            sender_name: "Alice".to_string(),
+            formatted_content: None,
+        };
+
+        let payload = create_fcm_payload(&event, &recipient, NotificationType::NewPost, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        // The name resolved once for the event reaches the per-recipient push.
+        assert_eq!(data.get("senderName"), Some(&"Alice".to_string()));
+        assert_eq!(data.get("title"), Some(&"New vine".to_string()));
+        assert_eq!(
+            data.get("body"),
+            Some(&"Alice posted a new vine".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mention_body_prefers_the_resolved_content() {
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::text_note("hey nostr:npub1raw")
+            .sign_with_keys(&author)
+            .unwrap();
+        let copy = EventScopedCopy {
+            sender_name: "Alice".to_string(),
+            formatted_content: Some("hey @bob".to_string()),
+        };
+
+        let payload = create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(data.get("body"), Some(&"Alice: hey @bob".to_string()));
+    }
+
+    #[test]
+    fn test_mention_body_falls_back_to_raw_content() {
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::text_note("hey nostr:npub1raw")
+            .sign_with_keys(&author)
+            .unwrap();
+        // `None` is what a skipped or failed parse leaves behind. Before the
+        // hoist the per-recipient parse fell back to the raw content on error;
+        // that behaviour has to survive the move.
+        let copy = EventScopedCopy {
+            sender_name: "Alice".to_string(),
+            formatted_content: None,
+        };
+
+        let payload = create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(
+            data.get("body"),
+            Some(&"Alice: hey nostr:npub1raw".to_string())
+        );
+    }
+
+    #[test]
     fn test_mentioned_watcher_yields_exactly_one_mention_target() {
         let author = Keys::generate().public_key();
         let both = Keys::generate().public_key();
@@ -1786,6 +1949,7 @@ mod tests {
             &first_event,
             &recipient.public_key(),
             NotificationType::Mention,
+            &test_copy(),
             CancellationToken::new(),
         )
         .await
@@ -1810,6 +1974,7 @@ mod tests {
             &successful_edit,
             &recipient.public_key(),
             NotificationType::Mention,
+            &test_copy(),
             CancellationToken::new(),
         )
         .await
@@ -1834,6 +1999,7 @@ mod tests {
             &later_edit,
             &recipient.public_key(),
             NotificationType::Mention,
+            &test_copy(),
             CancellationToken::new(),
         )
         .await
