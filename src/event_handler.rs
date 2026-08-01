@@ -68,6 +68,30 @@ pub fn is_beyond_replay_horizon(event: &Event) -> bool {
     is_event_too_old(event) && !is_notify_list(event)
 }
 
+/// Whether the handler loop should claim this event before routing it.
+///
+/// The claim exists to stop two replicas sending the same push twice, and for
+/// every handler that sends a push it is the only thing standing between a
+/// duplicate and the user. Notify lists send nothing. They build persistent
+/// state through `replace_notify_subscriptions`, a single atomic Lua script that
+/// already rejects any list not strictly newer than the stored one, so
+/// concurrent replicas applying the same list are a no-op with or without the
+/// claim.
+///
+/// Meanwhile the claim is taken *before* routing and never released, so a
+/// transient Redis error inside the handler leaves it standing: the historical
+/// replay on the next restart skips the event as already-claimed, and that
+/// subscriber's bells stay dark until `processed_event_ttl_secs` expires, seven
+/// days by default. So the claim trades an outage of a user's subscriptions for
+/// deduplication the Lua script performs anyway.
+///
+/// Scoped by `is_notify_list` rather than kind alone, symmetric with
+/// `is_beyond_replay_horizon`: the idempotency argument rests on the Lua script,
+/// which only runs for `d=notify`.
+pub fn requires_event_claim(event: &Event) -> bool {
+    !is_notify_list(event)
+}
+
 /// Check if event is targeted to this service via p tag
 fn is_event_for_service(event: &Event, service_pubkey: &PublicKey) -> bool {
     event
@@ -127,31 +151,36 @@ pub async fn run(
                     continue;
                 }
 
-                // Atomically claim the event to prevent duplicate processing across replicas
-                let claimed = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => {
-                        info!("Event handler cancelled while claiming event {}.", event_id);
-                        break;
-                    }
-                    claim_result = redis_store::try_claim_event(
-                        &state.redis_pool,
-                        &event_id,
-                        state.settings.service.processed_event_ttl_secs,
-                    ) => {
-                        match claim_result {
-                            Ok(claimed) => claimed,
-                            Err(e) => {
-                                error!(event_id = %event_id, error = %e, "Failed to claim event");
-                                continue;
+                // Atomically claim the event to prevent duplicate processing across
+                // replicas. Notify lists are exempt: the claim prevents nothing for
+                // them and turns a transient Redis error into days of lost
+                // subscriptions. See `requires_event_claim`.
+                if requires_event_claim(&event) {
+                    let claimed = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            info!("Event handler cancelled while claiming event {}.", event_id);
+                            break;
+                        }
+                        claim_result = redis_store::try_claim_event(
+                            &state.redis_pool,
+                            &event_id,
+                            state.settings.service.processed_event_ttl_secs,
+                        ) => {
+                            match claim_result {
+                                Ok(claimed) => claimed,
+                                Err(e) => {
+                                    error!(event_id = %event_id, error = %e, "Failed to claim event");
+                                    continue;
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
-                if !claimed {
-                    trace!(event_id = %event_id, "Skipping already claimed event");
-                    continue;
+                    if !claimed {
+                        trace!(event_id = %event_id, "Skipping already claimed event");
+                        continue;
+                    }
                 }
 
                 // Route the event based on its type

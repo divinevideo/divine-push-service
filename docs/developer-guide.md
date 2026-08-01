@@ -234,6 +234,16 @@ Two properties are load-bearing:
   `notify_list_history_limit` as the size safety valve instead. Without
   historical replay, a restart against a fresh Redis silently drops every bell
   until each user republishes.
+- **Notify lists are exempt from the event claim.** `run()` claims every other
+  event before routing it, so two replicas cannot send the same push twice.
+  Notify lists send nothing, and `replace_notify_subscriptions` already rejects
+  any list not strictly newer than the stored one, so the claim prevents nothing
+  here. It does cost something: the claim is taken before routing and never
+  released, so a transient Redis error inside the handler leaves it standing and
+  the replay on the next restart skips the event as already-claimed. That
+  subscriber's bells stay dark for the full `processed_event_ttl_secs`.
+  `requires_event_claim` scopes the exemption with `is_notify_list`, the same
+  kind-plus-`d`-tag check the horizon exemption uses.
 - **An empty `p` list is legitimate**, not malformed. It means the user unbelled
   everyone, and it must clear the forward set and remove them from every reverse
   index.
@@ -290,7 +300,7 @@ sees all six. That is intended.
 | `user_tokens:{pubkey}` | Set | FCM tokens registered for a pubkey |
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
-| `dedup:{event_id}` | String | Deduplication lock with TTL |
+| `dedup:{event_id}` | String | Per-event processing claim with TTL. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
 | `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
