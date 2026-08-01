@@ -556,6 +556,15 @@ async fn handle_content_event(
         return Ok(());
     };
 
+    // Drop self-targets before anything downstream reads the list. Several of
+    // the `find_*` helpers return the author when an event `p`-tags its own
+    // sender, and the send loop used to skip those one at a time — which was
+    // free while the payload was built per recipient, but now sits after the
+    // event-scoped copy has been resolved. Filtering here keeps a self-only
+    // event from paying for a profile lookup it can never use, and makes the
+    // count and per-type breakdown logged below describe real deliveries.
+    let targets = deliverable_targets(targets, &event.pubkey);
+
     if targets.is_empty() {
         debug!(event_id = %event_id, kind = %event_kind, "No recipients found for event");
         return Ok(());
@@ -593,12 +602,6 @@ async fn handle_content_event(
         }
 
         let recipient_pubkey = target.recipient;
-
-        // Skip if recipient is the sender
-        if recipient_pubkey == event.pubkey {
-            trace!(event_id = %event_id, "Skipping notification to sender");
-            continue;
-        }
 
         if let Err(e) = send_notification_to_user(
             state,
@@ -679,6 +682,22 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
 struct NotificationTarget {
     recipient: PublicKey,
     notification_type: NotificationType,
+}
+
+/// Drop targets that are the event's own author.
+///
+/// An event that `p`-tags its own sender — a self-reaction, a self-repost —
+/// resolves to the author as a recipient, and nobody should be notified about
+/// their own activity. Kept as a pure function, like `merge_watcher_targets`,
+/// so the rule is testable without an `AppState`.
+fn deliverable_targets(
+    targets: Vec<NotificationTarget>,
+    author: &PublicKey,
+) -> Vec<NotificationTarget> {
+    targets
+        .into_iter()
+        .filter(|target| target.recipient != *author)
+        .collect()
 }
 
 /// Give every recipient the same notification type.
@@ -820,8 +839,8 @@ fn merge_watcher_targets(
     watchers: Vec<PublicKey>,
 ) -> Vec<NotificationTarget> {
     for watcher in watchers {
-        // The send loop skips self-notifications too, but filtering here avoids
-        // a pointless token lookup and preferences read per video.
+        // `deliverable_targets` drops self-targets for every event kind, but
+        // filtering here keeps the merge rule complete on its own terms.
         if watcher == *author {
             continue;
         }
@@ -1728,6 +1747,50 @@ mod tests {
         assert!(
             !body.trim().is_empty(),
             "mobile silently drops foreground pushes without a body"
+        );
+    }
+
+    #[test]
+    fn test_deliverable_targets_drops_the_author() {
+        let author = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+
+        // A self-reaction p-tags its own sender, so the author arrives as a
+        // recipient. Dropping them here rather than mid-loop keeps a self-only
+        // event from resolving an event-scoped copy it cannot use.
+        let targets = deliverable_targets(
+            vec![
+                NotificationTarget {
+                    recipient: author,
+                    notification_type: NotificationType::Like,
+                },
+                NotificationTarget {
+                    recipient: other,
+                    notification_type: NotificationType::Like,
+                },
+            ],
+            &author,
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, other);
+    }
+
+    #[test]
+    fn test_deliverable_targets_empties_a_self_only_event() {
+        let author = Keys::generate().public_key();
+
+        let targets = deliverable_targets(
+            vec![NotificationTarget {
+                recipient: author,
+                notification_type: NotificationType::Repost,
+            }],
+            &author,
+        );
+
+        assert!(
+            targets.is_empty(),
+            "a self-only event must resolve to nothing deliverable"
         );
     }
 
