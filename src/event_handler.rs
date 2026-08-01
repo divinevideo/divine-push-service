@@ -872,11 +872,29 @@ async fn video_notification_targets(state: &AppState, event: &Event) -> Vec<Noti
 }
 
 /// Build the coordinate-and-recipient key used to deduplicate video edits.
-fn video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<String> {
+///
+/// Scoped by notification type as well as coordinate, because the two are
+/// orthogonal: an edit does not change which *kind* of notification a recipient
+/// is owed, so keying on type keeps the stable-across-edits property while
+/// stopping one type from consuming another's record.
+///
+/// Without the type, a watcher who got a NewPost push for a video and was then
+/// `p`-tagged in an edit of that same video had the mention suppressed for
+/// `video_coordinate_dedup_ttl_secs` — a year by default. Belling a creator
+/// quietly cost you mention notifications from them. `merge_watcher_targets`
+/// already makes mention win over bell within a single event; this extends the
+/// same rule across edits, where the two pushes carry genuinely different
+/// information ("X posted a vine" versus "X mentioned you").
+fn video_recipient_claim_key(
+    event: &Event,
+    recipient: &PublicKey,
+    notification_type: NotificationType,
+) -> Option<String> {
     let d_tag = event.tags.identifier()?;
     Some(format!(
-        "{}:{}:{d_tag}:{}",
+        "{}:{}:{}:{d_tag}:{}",
         event.kind.as_u16(),
+        notification_type.display_name(),
         event.pubkey.to_hex(),
         recipient.to_hex()
     ))
@@ -975,7 +993,8 @@ async fn send_notification_to_user(
     }
 
     if event.kind.as_u16() == KIND_VIDEO {
-        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, notification_type)
+        else {
             warn!(
                 event_id = %event_id,
                 target_pubkey = %target_pubkey,
@@ -1117,7 +1136,8 @@ async fn send_notification_to_user(
     }
 
     if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
-        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, notification_type)
+        else {
             warn!(
                 event_id = %event_id,
                 target_pubkey = %target_pubkey,
@@ -1899,21 +1919,61 @@ mod tests {
 
         assert_ne!(first_event.id, edited_event.id);
         assert_eq!(
-            video_recipient_claim_key(&first_event, &recipient.public_key()),
-            video_recipient_claim_key(&edited_event, &recipient.public_key())
+            video_recipient_claim_key(
+                &first_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            ),
+            video_recipient_claim_key(
+                &edited_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            )
         );
         assert_eq!(
-            video_recipient_claim_key(&first_event, &recipient.public_key()),
+            video_recipient_claim_key(
+                &first_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            ),
             Some(format!(
-                "34236:{}:video:d-tag:{}",
+                "34236:mention:{}:video:d-tag:{}",
                 owner.public_key().to_hex(),
                 recipient.public_key().to_hex()
             ))
         );
         assert_ne!(
-            video_recipient_claim_key(&edited_event, &recipient.public_key()),
-            video_recipient_claim_key(&edited_event, &added_recipient.public_key()),
+            video_recipient_claim_key(
+                &edited_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            ),
+            video_recipient_claim_key(
+                &edited_event,
+                &added_recipient.public_key(),
+                NotificationType::Mention
+            ),
             "a newly added recipient must have an independent delivery record"
+        );
+    }
+
+    #[test]
+    fn test_video_recipient_claim_key_separates_notification_types() {
+        let owner = Keys::generate();
+        let recipient = Keys::generate();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("video:d-tag"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+
+        // A bell and a mention for the same coordinate are different pushes
+        // carrying different information, so one must not consume the other's
+        // record for the coordinate TTL — a year by default.
+        assert_ne!(
+            video_recipient_claim_key(&event, &recipient.public_key(), NotificationType::NewPost),
+            video_recipient_claim_key(&event, &recipient.public_key(), NotificationType::Mention),
+            "a bell must not suppress a later mention on the same video"
         );
     }
 
@@ -1941,7 +2001,12 @@ mod tests {
             .tag(Tag::public_key(recipient.public_key()))
             .sign_with_keys(&owner)
             .unwrap();
-        let claim_key = video_recipient_claim_key(&first_event, &recipient.public_key()).unwrap();
+        let claim_key = video_recipient_claim_key(
+            &first_event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+        )
+        .unwrap();
         let redis_key = format!("dedup:{claim_key}");
 
         send_notification_to_user(
@@ -2017,6 +2082,115 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         redis::cmd("DEL")
             .arg(redis_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_bell_does_not_suppress_a_later_mention_on_the_same_video() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("bell-then-mention-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        // The bell fires first: the watcher is not `p`-tagged on the original.
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("bell-then-mention"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the bell delivers"
+        );
+
+        // The creator then edits the video and `p`-tags the watcher. That is a
+        // different notification carrying different information, so it must not
+        // be eaten by the bell's record for the same coordinate.
+        let edit_adding_mention = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("bell-then-mention"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &edit_adding_mention,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            2,
+            "a delivered bell must not suppress a later mention on the same video"
+        );
+
+        // The per-type record still works within its own type: a second edit
+        // does not re-notify the mention.
+        let further_edit = EventBuilder::new(Kind::from(KIND_VIDEO), "second edit")
+            .tag(Tag::identifier("bell-then-mention"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &further_edit,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            2,
+            "the mention's own record still suppresses a repeat edit"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let bell_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let mention_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{bell_key}"))
+            .arg(format!("dedup:{mention_key}"))
+            .arg(redis_store::build_notify_rate_key(
+                &watcher.public_key(),
+                &owner.public_key(),
+            ))
             .query_async::<()>(&mut *conn)
             .await
             .unwrap();

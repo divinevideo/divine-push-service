@@ -291,7 +291,7 @@ sees all six. That is intended.
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
 | `dedup:{event_id}` | String | Deduplication lock with TTL |
-| `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default) |
+| `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
 | `notify_subs_ts:{subscriber}` | String | `created_at` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event. |
