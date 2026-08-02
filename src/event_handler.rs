@@ -805,6 +805,20 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
 /// construction keeps the once-per-event property and restores the property the
 /// per-recipient version had for free: an event nobody can be pushed for costs
 /// no profile work at all.
+///
+/// What it gives up: the cell caches whatever `resolve_event_scoped_copy`
+/// returns, and that includes the short-npub fallback it returns when the
+/// profile lookup fails. On `main` the lookup sat inside `create_fcm_payload`,
+/// so one recipient's timeout did not spoil the next one's — each retried.
+/// Here the first recipient to resolve fixes the sender name for the whole
+/// fan-out, so a single timed-out lookup shows every remaining watcher a short
+/// npub instead of the creator's name.
+///
+/// That is the trade rather than an oversight. Retrying per recipient is what
+/// made one unreachable profile relay cost five seconds *per recipient*, and a
+/// bell fan-out is precisely where that multiplies. A degraded name on one
+/// event is cheaper than stalling the handler for every other user's
+/// notifications.
 struct LazyEventCopy {
     cell: tokio::sync::OnceCell<EventScopedCopy>,
     /// Whether any target renders the event body, decided over the whole target
@@ -1014,6 +1028,16 @@ fn video_recipient_claim_key(
 /// across edits. Without it, a watcher who was `p`-tagged in the original and
 /// dropped from an edit resolves to a bare `NewPost` target on the edit and is
 /// told "posted a new vine" about a video they were already pushed about.
+///
+/// The guarantee is per-replica, not global. An event and its edit carry
+/// different ids, so `try_claim_event` does not serialise them, and production
+/// runs two replicas: two handlers reaching the coordinate check in the same
+/// moment both read it absent and both send. What makes it hold on one replica
+/// is that `run` awaits `route_event` inline, so the original's record is
+/// written before the edit is read. Closing the cross-replica case means
+/// `SET NX EX` on the claim, which costs the same thing the rate-limit comment
+/// in `send_notification_to_user` declines to pay: a failed send would burn the
+/// record and that recipient would never get the push at all.
 ///
 /// Pure, so the rule is testable without Redis.
 fn satisfied_video_claims(notification_type: NotificationType) -> Vec<NotificationType> {
