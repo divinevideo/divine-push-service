@@ -338,6 +338,25 @@ pub fn build_notify_rate_key(subscriber: &PublicKey, creator: &PublicKey) -> Str
 /// read-then-write would let the older one win. A single replica needs none of
 /// this — its handler loop is sequential.
 ///
+/// Atomic is not transactional, though: Redis runs the script without
+/// interleaving anything else, but a script that dies partway through keeps the
+/// writes it already made. So the write order holds one invariant at every
+/// intermediate step — every `notify_watchers:{creator}` naming this subscriber
+/// has `creator` in `notify_subs:{subscriber}`. Removals clear the reverse
+/// index before the forward one and additions write the forward index first,
+/// which leaves a half-applied script with `notify_subs` a *superset* of the
+/// true relation. The next list reconciles that, because removals are computed
+/// from it.
+///
+/// The opposite skew does not recover, which is why the forward set is diffed
+/// rather than `DEL`d and rebuilt. `notify_subs` is the only record of which
+/// `notify_watchers:*` keys hold this subscriber, so once it is short, the
+/// missing creators are unreachable: `previous` comes back without them, their
+/// `SREM` is never issued, and the subscriber keeps getting pushes for a
+/// creator they unbelled. Republishing the list they actually hold does not
+/// help — only re-belling that exact creator and unbelling again would, which
+/// is not something a user would think to do.
+///
 /// `creators` must already be bounded by the caller
 /// (`notify_list_max_creators`): the script runs as one blocking unit and Redis
 /// is single-threaded, so an unbounded list stalls the instance for every user.
@@ -394,17 +413,21 @@ pub async fn replace_notify_subscriptions(
           incoming[ARGV[i]] = true
         end
 
-        -- Drop the subscriber from creators no longer on the list.
+        -- Drop the subscriber from creators no longer on the list, reverse
+        -- index first. Applying the difference rather than replacing the
+        -- forward set wholesale is what keeps a half-applied script
+        -- recoverable; see the ordering note in the function doc. An empty
+        -- incoming list is legitimate (the user unbelled everyone) and Redis
+        -- drops the key once its last member is removed.
         local previous = redis.call('SMEMBERS', KEYS[1])
         for _, creator in ipairs(previous) do
           if not incoming[creator] then
             redis.call('SREM', prefix .. creator, subscriber)
+            redis.call('SREM', KEYS[1], creator)
           end
         end
 
-        -- Replace the forward set wholesale. An empty incoming list is
-        -- legitimate (the user unbelled everyone) and clears the key.
-        redis.call('DEL', KEYS[1])
+        -- Add the new ones, forward index first, for the same reason.
         for i = 5, #ARGV do
           redis.call('SADD', KEYS[1], ARGV[i])
           redis.call('SADD', prefix .. ARGV[i], subscriber)

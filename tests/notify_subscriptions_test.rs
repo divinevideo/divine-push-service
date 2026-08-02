@@ -551,3 +551,97 @@ async fn test_two_subscribers_watching_one_creator() {
     cleanup(&pool, &keys_for(&subscriber_a, &[creator])).await;
     cleanup(&pool, &keys_for(&subscriber_b, &[creator])).await;
 }
+
+/// A Lua script is atomic but not transactional: Redis will not interleave
+/// anything else, but a script that dies partway keeps the writes it already
+/// made. A write rejected under `maxmemory` is the reachable way in; here the
+/// abort is injected by parking a string on one `notify_watchers:*` key, so
+/// `SADD` raises `WRONGTYPE` at a chosen point in the add loop.
+///
+/// What has to survive it is the forward index. It is the only record of which
+/// watcher sets name this subscriber, so if it comes back *short*, the creators
+/// it lost can never be unbelled: `previous` omits them, their `SREM` is never
+/// issued, and the pushes continue. A superset is recoverable; a subset is not.
+#[tokio::test]
+async fn test_a_half_applied_list_still_converges_on_the_next_one() {
+    let Some(pool) = create_test_pool().await else {
+        return;
+    };
+
+    let subscriber = Keys::generate().public_key();
+    let kept = Keys::generate().public_key();
+    let dropped = Keys::generate().public_key();
+    let poisoned = Keys::generate().public_key();
+    let all = [kept, dropped, poisoned];
+    cleanup(&pool, &keys_for(&subscriber, &all)).await;
+
+    redis_store::replace_notify_subscriptions(
+        &pool,
+        &subscriber,
+        &[kept, dropped],
+        1000,
+        &test_event_id(1000),
+    )
+    .await
+    .expect("initial list");
+
+    // Park a string where a watcher set belongs.
+    let poisoned_key = format!("notify_watchers:{}", poisoned.to_hex());
+    {
+        let mut conn = pool.get().await.expect("redis connection");
+        let _: () = redis::cmd("SET")
+            .arg(&poisoned_key)
+            .arg("not a set")
+            .query_async(&mut *conn)
+            .await
+            .expect("poison the watcher key");
+    }
+
+    // `poisoned` is listed first, so the script dies before it re-adds `kept`.
+    let interrupted = redis_store::replace_notify_subscriptions(
+        &pool,
+        &subscriber,
+        &[poisoned, kept],
+        2000,
+        &test_event_id(2000),
+    )
+    .await;
+    assert!(
+        interrupted.is_err(),
+        "the injection must actually abort the script, or this test proves nothing"
+    );
+
+    // The invariant, stated where it is broken: the forward index still names
+    // every creator whose watcher set names this subscriber.
+    let forward: Vec<String> = {
+        let mut conn = pool.get().await.expect("redis connection");
+        redis::cmd("SMEMBERS")
+            .arg(format!("notify_subs:{}", subscriber.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .expect("read the forward index")
+    };
+    assert!(
+        forward.contains(&kept.to_hex()),
+        "a half-applied list must leave the forward index a superset, not a subset"
+    );
+
+    // Clear the injection so the next list runs to completion.
+    cleanup(&pool, &[poisoned_key]).await;
+
+    // The subscriber unbells everyone. Republishing is the only corrective
+    // action a user has, so it has to be enough.
+    redis_store::replace_notify_subscriptions(&pool, &subscriber, &[], 3000, &test_event_id(3000))
+        .await
+        .expect("unbell everyone");
+
+    assert!(
+        redis_store::get_notify_watchers(&pool, &kept)
+            .await
+            .expect("watchers lookup")
+            .is_empty(),
+        "a creator stranded by the interrupted list must still be removable"
+    );
+
+    cleanup(&pool, &keys_for(&subscriber, &all)).await;
+}
