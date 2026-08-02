@@ -32,16 +32,29 @@ fn test_replay_horizon_accepts_recent_events() {
 
 #[test]
 fn test_replay_horizon_edge_case() {
-    // Create an event that's exactly 7 days old (at the horizon boundary)
-    let boundary_timestamp = Timestamp::now() - Duration::from_secs(7 * 24 * 60 * 60);
+    // Straddle the boundary rather than sitting on it. This test and
+    // `is_event_too_old` each call `Timestamp::now()`, and the horizon only
+    // moves forward between the two, so an event built at *exactly* 7 days
+    // flips to "too old" whenever a second ticks over in between. A minute of
+    // slack on each side pins the same cutoff without the coin flip.
+    const HORIZON_SECS: u64 = 7 * 24 * 60 * 60;
+    const SLACK_SECS: u64 = 60;
 
-    let event = EventBuilder::new(Kind::TextNote, "Boundary message")
-        .custom_created_at(boundary_timestamp)
-        .sign_with_keys(&Keys::generate())
-        .unwrap();
+    let build = |age_secs: u64| {
+        EventBuilder::new(Kind::TextNote, "Boundary message")
+            .custom_created_at(Timestamp::now() - Duration::from_secs(age_secs))
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    };
 
-    // The event should still be accepted (7 days is the cutoff, not 6)
-    assert!(!event_handler::is_event_too_old(&event));
+    // 7 days is the cutoff, not 6.
+    assert!(!event_handler::is_event_too_old(&build(
+        HORIZON_SECS - SLACK_SECS
+    )));
+    // And it is a cutoff, not a floor.
+    assert!(event_handler::is_event_too_old(&build(
+        HORIZON_SECS + SLACK_SECS
+    )));
 }
 
 #[test]
