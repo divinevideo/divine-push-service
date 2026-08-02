@@ -421,28 +421,24 @@ pub async fn replace_notify_subscriptions(
         -- recoverable; see the ordering note in the function doc. An empty
         -- incoming list is legitimate (the user unbelled everyone) and Redis
         -- drops the key once its last member is removed.
-        local had_previous = {}
         local previous = redis.call('SMEMBERS', KEYS[1])
         for _, creator in ipairs(previous) do
-          had_previous[creator] = true
           if not incoming[creator] then
             redis.call('SREM', prefix .. creator, subscriber)
             redis.call('SREM', KEYS[1], creator)
           end
         end
 
-        -- Add the new ones, forward index first, for the same reason.
+        -- Add the new ones, forward index first, for the same reason. Both
+        -- writes are unconditional, and the second one is why: re-asserting the
+        -- reverse entry for a creator already on the forward set is exactly
+        -- what lets an exact replay repair a `notify_watchers:*` that Redis
+        -- lost while `notify_subs:*` survived. Skipping either write when the
+        -- creator "is already applied" would take that repair away, and the
+        -- forward `SADD` it would save is a no-op on a member anyway.
         for i = 5, #ARGV do
-          local creator = ARGV[i]
-          if not had_previous[creator] then
-            redis.call('SADD', KEYS[1], creator)
-            redis.call('SADD', prefix .. creator, subscriber)
-          else
-            -- Exact replays are allowed as repair. Re-assert the reverse entry
-            -- in case Redis lost `notify_watchers:*` while `notify_subs:*`
-            -- survived.
-            redis.call('SADD', prefix .. creator, subscriber)
-          end
+          redis.call('SADD', KEYS[1], ARGV[i])
+          redis.call('SADD', prefix .. ARGV[i], subscriber)
         end
 
         -- ARGV[1] verbatim rather than `incoming_at`, so the stored timestamp
