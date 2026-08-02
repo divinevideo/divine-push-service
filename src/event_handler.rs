@@ -2178,6 +2178,60 @@ mod tests {
         assert_eq!(targets[0].notification_type, NotificationType::Mention);
     }
 
+    #[tokio::test]
+    async fn test_a_real_watcher_lookup_failure_still_delivers_mentions() {
+        // The test above proves `watchers_or_degrade` degrades. It does not
+        // prove anything calls it: it never reaches `video_notification_targets`,
+        // where the degradation is actually wired in, so replacing that call
+        // with `lookup.expect(...)` leaves the whole suite green. This drives a
+        // genuine `get_notify_watchers` failure through the real function, by
+        // leaving a string where the watcher set belongs so `SMEMBERS` fails
+        // with WRONGTYPE.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let mentioned = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("wrongtype-vid"))
+            .tag(Tag::public_key(mentioned))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let watchers_key = format!("notify_watchers:{}", author.public_key().to_hex());
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&watchers_key)
+            .arg("not-a-set")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        // Without this the test could pass vacuously, by the lookup succeeding
+        // and simply finding no watchers.
+        let lookup_failed = redis_store::get_notify_watchers(&pool, &author.public_key())
+            .await
+            .is_err();
+
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        let targets = video_notification_targets(&state, &event).await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&watchers_key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        assert!(lookup_failed, "the seeded key must make the lookup fail");
+        assert_eq!(targets.len(), 1, "the mention survives the failed lookup");
+        assert_eq!(targets[0].recipient, mentioned);
+        assert_eq!(targets[0].notification_type, NotificationType::Mention);
+    }
+
     #[test]
     fn test_watcher_and_separate_mention_both_get_their_own_type() {
         let author = Keys::generate().public_key();
