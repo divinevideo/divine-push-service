@@ -265,7 +265,68 @@ impl Settings {
             )
             .build()?;
 
-        s.try_deserialize()
+        let settings: Settings = s.try_deserialize()?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// Reject values that deserialize cleanly but cannot work at runtime.
+    ///
+    /// Every field here is a bound the service writes to Redis or counts
+    /// against, and every one of them fails *quietly* at zero. Redis rejects an
+    /// expiry of 0, but nothing downstream treats that rejection as fatal, so
+    /// the throttle simply never engages, the cache never caches, the claim
+    /// never lands. The two caps are worse still: they are read as "nothing
+    /// allowed" and take a subscriber's bells with them. A startup error is the
+    /// only place an operator would find out.
+    ///
+    /// This is reachable without editing `settings.yaml`. The config crate
+    /// layers `NOSTR_PUSH__*` over the file, and production already sets
+    /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
+    /// reaches every field below.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let must_be_positive: [(&str, u64, &str); 6] = [
+            (
+                "nostr.profile_cache_ttl_secs",
+                self.nostr.profile_cache_ttl_secs,
+                "cache writes fail silently, so every event refetches profiles from the relays",
+            ),
+            (
+                "service.processed_event_ttl_secs",
+                self.service.processed_event_ttl_secs,
+                "the event claim errors, so no claimed event is ever processed",
+            ),
+            (
+                "service.video_coordinate_dedup_ttl_secs",
+                self.service.video_coordinate_dedup_ttl_secs,
+                "no delivery is recorded, so every video edit re-notifies",
+            ),
+            (
+                "service.new_post_rate_limit_secs",
+                self.service.new_post_rate_limit_secs,
+                "the window never opens, so new-post pushes are never throttled",
+            ),
+            (
+                "service.notify_list_max_creators",
+                self.service.notify_list_max_creators as u64,
+                "every notify list reads as empty, clearing that subscriber's bells",
+            ),
+            (
+                "service.notify_list_history_limit",
+                self.service.notify_list_history_limit as u64,
+                "the startup replay fetches nothing",
+            ),
+        ];
+
+        for (name, value, consequence) in must_be_positive {
+            if value == 0 {
+                return Err(ConfigError::Message(format!(
+                    "{name} must be greater than zero: at 0, {consequence}"
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Get service keys for relay auth and NIP-44 encryption
@@ -323,6 +384,59 @@ mod tests {
             assert_eq!(
                 settings.notification.event_kinds, expected,
                 "{filename} must stay in sync with default_event_kinds()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shipped_config_passes_validation() {
+        // `load_runtime_settings` deserializes without validating, so this is
+        // the only thing asserting the files we actually ship would boot.
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            assert!(
+                load_runtime_settings(filename).validate().is_ok(),
+                "{filename} must load"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_degenerate_zero_is_rejected_at_load() {
+        /// A field name and the setter that zeroes it.
+        type ZeroCase = (&'static str, fn(&mut Settings));
+
+        // One case per field, because a loop over the same setter would pass
+        // just as well against a `validate` that only checks the first.
+        let cases: [ZeroCase; 6] = [
+            ("nostr.profile_cache_ttl_secs", |s| {
+                s.nostr.profile_cache_ttl_secs = 0
+            }),
+            ("service.processed_event_ttl_secs", |s| {
+                s.service.processed_event_ttl_secs = 0
+            }),
+            ("service.video_coordinate_dedup_ttl_secs", |s| {
+                s.service.video_coordinate_dedup_ttl_secs = 0
+            }),
+            ("service.new_post_rate_limit_secs", |s| {
+                s.service.new_post_rate_limit_secs = 0
+            }),
+            ("service.notify_list_max_creators", |s| {
+                s.service.notify_list_max_creators = 0
+            }),
+            ("service.notify_list_history_limit", |s| {
+                s.service.notify_list_history_limit = 0
+            }),
+        ];
+
+        for (field, zero_it) in cases {
+            let mut settings = load_runtime_settings("settings.yaml");
+            zero_it(&mut settings);
+            let error = settings
+                .validate()
+                .expect_err(&format!("{field} at zero must be rejected"));
+            assert!(
+                error.to_string().contains(field),
+                "the error must name the field an operator has to fix, got: {error}"
             );
         }
     }
