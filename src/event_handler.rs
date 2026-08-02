@@ -620,8 +620,9 @@ async fn handle_content_event(
         "Processing notification event"
     );
 
-    // Resolve the recipient-independent copy once, before the fan-out loop.
-    let copy = resolve_event_scoped_copy(state, event, &targets).await;
+    // The recipient-independent copy resolves at most once for the event, and
+    // only if some recipient survives the gates in `send_notification_to_user`.
+    let copy = LazyEventCopy::for_targets(&targets);
 
     // Send notifications to each target
     for target in targets {
@@ -781,6 +782,58 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
     }
 }
 
+/// The event-scoped copy, resolved at most once and only if it is needed.
+///
+/// Resolving once per event rather than once per recipient is the point of the
+/// `EventScopedCopy` split. Resolving it *eagerly* is not: every gate in
+/// `send_notification_to_user` — allowlist, registered tokens, preferences,
+/// coordinate record, rate limit — can drop a recipient, and on a public relay
+/// the token gate alone drops nearly all of them, because the subscription has
+/// no `#p` narrowing and most tagged users have never registered for push.
+///
+/// An eager resolve therefore pays `get_display_name` for events that deliver
+/// nothing. That is a Redis GET plus, on a cache miss, a relay `fetch_events`
+/// bounded by `query_timeout_secs` — and misses are never written back, so an
+/// author with no kind-0 pays it on every event forever. All of it on the single
+/// sequential handler task, ahead of every other user's notifications.
+///
+/// Deferring the resolve to the first recipient that actually reaches payload
+/// construction keeps the once-per-event property and restores the property the
+/// per-recipient version had for free: an event nobody can be pushed for costs
+/// no profile work at all.
+struct LazyEventCopy {
+    cell: tokio::sync::OnceCell<EventScopedCopy>,
+    /// Whether any target renders the event body, decided over the whole target
+    /// list rather than the one recipient that happens to resolve it first.
+    needs_content: bool,
+}
+
+impl LazyEventCopy {
+    fn for_targets(targets: &[NotificationTarget]) -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new(),
+            needs_content: targets
+                .iter()
+                .any(|target| renders_event_content(target.notification_type)),
+        }
+    }
+
+    /// Pre-resolved copy, for tests that exercise delivery rather than copy.
+    #[cfg(test)]
+    fn resolved(copy: EventScopedCopy) -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new_with(Some(copy)),
+            needs_content: false,
+        }
+    }
+
+    async fn get(&self, state: &AppState, event: &Event) -> &EventScopedCopy {
+        self.cell
+            .get_or_init(|| resolve_event_scoped_copy(state, event, self.needs_content))
+            .await
+    }
+}
+
 /// Resolve the recipient-independent copy for an event, once.
 ///
 /// The content parse is skipped entirely unless some target actually renders the
@@ -788,7 +841,7 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
 async fn resolve_event_scoped_copy(
     state: &AppState,
     event: &Event,
-    targets: &[NotificationTarget],
+    needs_content: bool,
 ) -> EventScopedCopy {
     let Some(mention_parser) = state.mention_parser_service.as_ref() else {
         return EventScopedCopy {
@@ -808,10 +861,6 @@ async fn resolve_event_scoped_copy(
             format_short_npub(&event.pubkey)
         }
     };
-
-    let needs_content = targets
-        .iter()
-        .any(|target| renders_event_content(target.notification_type));
 
     let formatted_content = if needs_content {
         match mention_parser.format_content_for_push(&event.content).await {
@@ -1006,7 +1055,7 @@ async fn send_notification_to_user(
     event: &Event,
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
-    copy: &EventScopedCopy,
+    copy: &LazyEventCopy,
     token: CancellationToken,
 ) -> Result<()> {
     let event_id = event.id;
@@ -1124,6 +1173,17 @@ async fn send_notification_to_user(
         token_count = tokens.len(),
         "Found FCM tokens for recipient"
     );
+
+    // Every gate that could drop this recipient is behind us, so this delivery
+    // is the one that pays for the event's copy — once, for all recipients.
+    let copy = tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while resolving the event copy.");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+        resolved = copy.get(state, event) => resolved
+    };
 
     // Create FCM payload
     let payload = create_fcm_payload(event, target_pubkey, notification_type, copy);
@@ -1518,11 +1578,11 @@ mod tests {
     }
 
     /// Event-scoped copy for tests that exercise delivery rather than copy.
-    fn test_copy() -> EventScopedCopy {
-        EventScopedCopy {
+    fn test_copy() -> LazyEventCopy {
+        LazyEventCopy::resolved(EventScopedCopy {
             sender_name: "tester".to_string(),
             formatted_content: None,
-        }
+        })
     }
 
     #[test]
@@ -1859,6 +1919,126 @@ mod tests {
         assert!(!renders_event_content(NotificationType::Follow));
         assert!(!renders_event_content(NotificationType::Repost));
         assert!(!renders_event_content(NotificationType::NewPost));
+    }
+
+    #[test]
+    fn test_needs_content_is_decided_over_the_whole_target_list() {
+        // The copy resolves on whichever recipient clears the gates first, which
+        // need not be one that renders the body. Deciding `needs_content` from
+        // the full list keeps that ordering from silently downgrading a mention
+        // to raw, unparsed content.
+        let bell_first = LazyEventCopy::for_targets(&[
+            NotificationTarget {
+                recipient: Keys::generate().public_key(),
+                notification_type: NotificationType::NewPost,
+            },
+            NotificationTarget {
+                recipient: Keys::generate().public_key(),
+                notification_type: NotificationType::Mention,
+            },
+        ]);
+        assert!(bell_first.needs_content);
+
+        let bells_only = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient: Keys::generate().public_key(),
+            notification_type: NotificationType::NewPost,
+        }]);
+        assert!(!bells_only.needs_content);
+    }
+
+    #[tokio::test]
+    async fn test_a_recipient_without_tokens_never_resolves_the_event_copy() {
+        // The regression this guards is a throughput one, but the observable
+        // fact is binary: did the event pay for its copy at all? With no mention
+        // parser configured the resolve is free, so this asserts *whether* it
+        // happened, not what it cost. In production it costs a Redis GET and,
+        // on a cache miss, a relay round trip that is never negatively cached.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        let event = EventBuilder::text_note("hello")
+            .tag(Tag::public_key(recipient))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient,
+            notification_type: NotificationType::Mention,
+        }]);
+        send_notification_to_user(
+            &state,
+            &event,
+            &recipient,
+            NotificationType::Mention,
+            &copy,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            copy.cell.get().is_none(),
+            "an event with no deliverable recipient must not resolve its copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_delivered_push_resolves_the_event_copy() {
+        // The other half of the pair: deferring must not skip the resolve for a
+        // recipient that does get a push.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let fcm_token = format!("lazy-copy-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("hello")
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient: recipient.public_key(),
+            notification_type: NotificationType::Mention,
+        }]);
+        send_notification_to_user(
+            &state,
+            &event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            &copy,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+        assert_eq!(
+            copy.cell.get().map(|c| c.sender_name.as_str()),
+            Some(format_short_npub(&author.public_key()).as_str()),
+            "a delivered push resolves the copy the payload is built from"
+        );
+
+        redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
     }
 
     #[test]
