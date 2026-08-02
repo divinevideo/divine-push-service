@@ -948,6 +948,28 @@ fn video_recipient_claim_key(
     ))
 }
 
+/// The video-coordinate records a delivered push satisfies.
+///
+/// Type-scoping the claim key made the two directions independent, but they are
+/// not: a mention push names the video, so it necessarily tells the recipient
+/// that video exists — which is the entire content of a bell. Delivering one
+/// therefore satisfies the bell's record too. The converse does not hold, since
+/// "X posted a vine" says nothing about being mentioned, and that asymmetry is
+/// why the key carries the type at all.
+///
+/// This is `merge_watcher_targets`'s "mention wins on overlap" rule extended
+/// across edits. Without it, a watcher who was `p`-tagged in the original and
+/// dropped from an edit resolves to a bare `NewPost` target on the edit and is
+/// told "posted a new vine" about a video they were already pushed about.
+///
+/// Pure, so the rule is testable without Redis.
+fn satisfied_video_claims(notification_type: NotificationType) -> Vec<NotificationType> {
+    match notification_type {
+        NotificationType::Mention => vec![NotificationType::Mention, NotificationType::NewPost],
+        other => vec![other],
+    }
+}
+
 /// Find recipients for a NIP-22 comment event (kind 1111).
 ///
 /// Per NIP-22 the uppercase `P` tag is the root-scope author (for a video
@@ -1184,23 +1206,24 @@ async fn send_notification_to_user(
     }
 
     if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
-        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, notification_type)
-        else {
-            warn!(
-                event_id = %event_id,
-                target_pubkey = %target_pubkey,
-                "Successful video notification lacked an addressable d-tag"
-            );
-            return Ok(());
-        };
-        let redis_key = format!("dedup:{claim_key}");
-        redis_store::set_cached_string(
-            &state.redis_pool,
-            &redis_key,
-            "1",
-            state.settings.service.video_coordinate_dedup_ttl_secs,
-        )
-        .await?;
+        for satisfied in satisfied_video_claims(notification_type) {
+            let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, satisfied) else {
+                warn!(
+                    event_id = %event_id,
+                    target_pubkey = %target_pubkey,
+                    "Successful video notification lacked an addressable d-tag"
+                );
+                return Ok(());
+            };
+            let redis_key = format!("dedup:{claim_key}");
+            redis_store::set_cached_string(
+                &state.redis_pool,
+                &redis_key,
+                "1",
+                state.settings.service.video_coordinate_dedup_ttl_secs,
+            )
+            .await?;
+        }
     }
 
     // Remove invalid tokens
@@ -2174,6 +2197,116 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         redis::cmd("DEL")
             .arg(redis_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_a_mention_satisfies_the_bell_record_but_not_the_reverse() {
+        // The asymmetry is the whole point: a mention names the video, so it
+        // covers the bell, but a bell says nothing about being mentioned.
+        assert_eq!(
+            satisfied_video_claims(NotificationType::Mention),
+            vec![NotificationType::Mention, NotificationType::NewPost]
+        );
+        assert_eq!(
+            satisfied_video_claims(NotificationType::NewPost),
+            vec![NotificationType::NewPost]
+        );
+        assert_eq!(
+            satisfied_video_claims(NotificationType::Comment),
+            vec![NotificationType::Comment]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_mention_suppresses_a_later_bell_on_the_same_video() {
+        // The other direction of the same rule. `merge_watcher_targets` already
+        // says mention wins over bell on overlap; that has to hold across edits
+        // too. A watcher who was `p`-tagged in the original and dropped from the
+        // edit resolves to a bare NewPost target on the edit, and without the
+        // mention's record standing in for it they are told "posted a new vine"
+        // about a video they were already pushed about.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("mention-then-bell-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        // The watcher is `p`-tagged on the original, so mention wins and the
+        // bell is never delivered for this coordinate.
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("mention-then-bell"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the mention delivers"
+        );
+
+        // The creator edits the video and drops the `p` tag. The watcher is now
+        // only a bell target for the same coordinate.
+        let edit_dropping_mention = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("mention-then-bell"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &edit_dropping_mention,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "an edit must not re-announce an already-pushed video as a new post"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let bell_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let mention_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{bell_key}"))
+            .arg(format!("dedup:{mention_key}"))
+            .arg(redis_store::build_notify_rate_key(
+                &watcher.public_key(),
+                &owner.public_key(),
+            ))
             .query_async::<()>(&mut *conn)
             .await
             .unwrap();

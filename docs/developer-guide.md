@@ -281,6 +281,15 @@ mention targets with `SMEMBERS notify_watchers:{author}`.
 in the video gets one push, typed `mention`, because that is the more specific
 signal.
 
+The rule also holds across edits, which takes an extra step because the
+per-recipient coordinate record is scoped by notification type. A delivered
+mention writes the `newPost` record as well as its own: naming the video already
+tells the recipient it exists, which is the whole content of a bell. A delivered
+bell writes only its own, since "X posted a vine" says nothing about being
+mentioned. Without the one-directional carry, a watcher who was `p`-tagged in
+the original and dropped from an edit would be told "posted a new vine" about a
+video they were already pushed about.
+
 Delivery is capped at one push per (subscriber, creator) per
 `new_post_rate_limit_secs`. The window is opened only on a *delivered* push
 (check-then-set-on-success, mirroring the video-coordinate dedup) so a failed FCM
@@ -301,7 +310,7 @@ sees all six. That is intended.
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
 | `dedup:{event_id}` | String | Per-event processing claim with TTL. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
-| `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records |
+| `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered bell writes only its own |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
 | `notify_subs_ts:{subscriber}` | String | `created_at` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event. |

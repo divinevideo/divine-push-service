@@ -73,7 +73,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `stale_tokens` - Sorted set of token timestamps, for cleanup
 - `user_preferences:{pubkey}` - User's notification preferences (JSON)
 - `dedup:{event_id}` - Per-event processing claim with TTL. Notify lists are exempt: they are idempotent by `created_at`, so the claim prevents nothing and a failed handler would otherwise strand the list for the TTL
-- `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` - Per-recipient video delivery, so a NIP-33 edit does not re-notify. Scoped by notification type so a bell does not suppress a later mention on the same video
+- `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` - Per-recipient video delivery, so a NIP-33 edit does not re-notify. Scoped by notification type so a bell does not suppress a later mention on the same video. The scoping is one-directional: a delivered mention also writes the `newPost` record, because naming the video already tells the recipient it exists
 - `notify_subs:{subscriber}` - Creators this user has belled
 - `notify_subs_ts:{subscriber}` - `created_at` of the last applied notify list (out-of-order guard)
 - `notify_watchers:{creator}` - Subscribers watching this creator (hot read path)
