@@ -1257,13 +1257,26 @@ async fn send_notification_to_user(
     // blip is worse. Do not "fix" this into `SET NX EX`.
     if notification_type == NotificationType::NewPost && success_count > 0 {
         let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
-        redis_store::set_cached_string(
+        // Log and continue rather than `?`. Everything from here down is
+        // bookkeeping about a push that has already shipped, so propagating
+        // reports a delivered notification as failed and, worse, skips the
+        // bookkeeping below it: the coordinate claim that stops a NIP-33 edit
+        // re-notifying, and invalid-token removal.
+        if let Err(e) = redis_store::set_cached_string(
             &state.redis_pool,
             &rate_key,
             "1",
             state.settings.service.new_post_rate_limit_secs,
         )
-        .await?;
+        .await
+        {
+            error!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                error = %e,
+                "Failed to open the new-post rate-limit window after a delivered push"
+            );
+        }
     }
 
     if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
@@ -1277,13 +1290,26 @@ async fn send_notification_to_user(
                 return Ok(());
             };
             let redis_key = format!("dedup:{claim_key}");
-            redis_store::set_cached_string(
+            // Same reasoning as the rate-limit write above, and it matters more
+            // here: `satisfied_video_claims` can yield two records, and `?` on
+            // the first left the second unwritten. That is exactly the
+            // half-written state the type-scoped claim exists to prevent.
+            if let Err(e) = redis_store::set_cached_string(
                 &state.redis_pool,
                 &redis_key,
                 "1",
                 state.settings.service.video_coordinate_dedup_ttl_secs,
             )
-            .await?;
+            .await
+            {
+                error!(
+                    event_id = %event_id,
+                    target_pubkey = %target_pubkey,
+                    claim = %redis_key,
+                    error = %e,
+                    "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify"
+                );
+            }
         }
     }
 
@@ -2545,6 +2571,147 @@ mod tests {
             .query_async::<()>(&mut *conn)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_bookkeeping_failure_does_not_skip_the_video_claim() {
+        // The post-send writes are bookkeeping: the push has already shipped, so
+        // one of them failing must not take the others down with it. The
+        // coordinate record is what stops a NIP-33 edit re-notifying, so losing
+        // it because an unrelated write errored costs the user a duplicate push.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("bookkeeping-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        // `SETEX key 0 v` is a Redis error, so the rate-limit write fails while
+        // the send itself succeeds. Reachable in production via
+        // `NOSTR_PUSH__SERVICE__NEW_POST_RATE_LIMIT_SECS=0`, which nothing
+        // validates at load.
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.new_post_rate_limit_secs = 0;
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("bookkeeping-vid"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let result = send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let claim_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("dedup:{claim_key}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the push was delivered"
+        );
+        assert!(
+            record.is_some(),
+            "a delivered video push must record its coordinate, or the next edit re-notifies"
+        );
+        assert!(result.is_ok(), "a delivered push must not report failure");
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_claim_write_is_not_reported_as_a_delivery_failure() {
+        // Same class as the test above, one write further down: the claim loop.
+        // A delivered push that returns `Err` is not just cosmetic. The caller
+        // logs it as a failed notification, and the remaining post-send work,
+        // including invalid-token removal, is skipped.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("claim-write-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let mut settings = crate::config::Settings::new().unwrap();
+        // Makes the coordinate `SETEX` error while the send still succeeds.
+        settings.service.video_coordinate_dedup_ttl_secs = 0;
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("claim-write-vid"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let result = send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Without this the test could pass vacuously, by the claim write
+        // quietly succeeding and there being nothing to survive.
+        let claim_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the push was delivered"
+        );
+        assert!(
+            record.is_none(),
+            "the claim write must actually have failed, or this test proves nothing"
+        );
+        assert!(
+            result.is_ok(),
+            "a bookkeeping write failing is not a delivery failure"
+        );
     }
 
     #[tokio::test]
