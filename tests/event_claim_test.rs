@@ -122,8 +122,8 @@ async fn test_a_standing_claim_would_have_skipped_the_replayed_list() {
 #[tokio::test]
 async fn test_a_replayed_list_still_applies_without_a_claim() {
     // The other half: with the claim out of the way, re-applying the same list
-    // is safe. `replace_notify_subscriptions` rejects the duplicate on
-    // `created_at` and leaves the index intact, which is why the claim was
+    // is safe. `replace_notify_subscriptions` treats the duplicate as an
+    // idempotent repair and leaves the index intact, which is why the claim was
     // never load-bearing here.
     let Some(pool) = create_test_pool().await else {
         return;
@@ -170,7 +170,7 @@ async fn test_a_replayed_list_still_applies_without_a_claim() {
     }
 
     assert!(applied, "the list applies the first time");
-    assert!(!reapplied, "the duplicate is rejected on created_at");
+    assert!(reapplied, "the duplicate is safe to replay for repair");
     assert_eq!(
         watchers,
         vec![subscriber],

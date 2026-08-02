@@ -1015,6 +1015,22 @@ fn video_recipient_claim_key(
     ))
 }
 
+/// Legacy video-coordinate key written before the claim was scoped by type.
+///
+/// Those keys live for `video_coordinate_dedup_ttl_secs`, one year by default,
+/// so a deploy must keep reading them for one full TTL cycle. A legacy record
+/// came from a video mention, which also satisfies a bell for the same
+/// coordinate; see `satisfied_video_claims`.
+fn legacy_video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<String> {
+    let d_tag = event.tags.identifier()?;
+    Some(format!(
+        "{}:{}:{d_tag}:{}",
+        event.kind.as_u16(),
+        event.pubkey.to_hex(),
+        recipient.to_hex()
+    ))
+}
+
 /// The video-coordinate records a delivered push satisfies.
 ///
 /// Type-scoping the claim key made the two directions independent, but they are
@@ -1045,6 +1061,95 @@ fn satisfied_video_claims(notification_type: NotificationType) -> Vec<Notificati
         NotificationType::Mention => vec![NotificationType::Mention, NotificationType::NewPost],
         other => vec![other],
     }
+}
+
+async fn has_video_claim(
+    state: &AppState,
+    event: &Event,
+    target_pubkey: &PublicKey,
+    notification_type: NotificationType,
+    token: &CancellationToken,
+) -> Result<bool> {
+    let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, notification_type) else {
+        warn!(
+            event_id = %event.id,
+            target_pubkey = %target_pubkey,
+            "Skipping video notification without an addressable d-tag"
+        );
+        return Ok(true);
+    };
+    let redis_key = format!("dedup:{claim_key}");
+    let already_notified = tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event.id, target_pubkey = %target_pubkey, "Cancelled while checking video recipient delivery.");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+        lookup_result = redis_store::get_cached_string(&state.redis_pool, &redis_key) => {
+            lookup_result?.is_some()
+        }
+    };
+    if already_notified {
+        return Ok(true);
+    }
+
+    let Some(legacy_claim_key) = legacy_video_recipient_claim_key(event, target_pubkey) else {
+        return Ok(false);
+    };
+    let legacy_redis_key = format!("dedup:{legacy_claim_key}");
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event.id, target_pubkey = %target_pubkey, "Cancelled while checking legacy video recipient delivery.");
+            Err(crate::error::ServiceError::Cancelled)
+        }
+        lookup_result = redis_store::get_cached_string(&state.redis_pool, &legacy_redis_key) => {
+            Ok(lookup_result?.is_some())
+        }
+    }
+}
+
+async fn record_video_claims(
+    state: &AppState,
+    event: &Event,
+    target_pubkey: &PublicKey,
+    notification_type: NotificationType,
+    log_message: &'static str,
+) -> Result<()> {
+    if event.kind.as_u16() != KIND_VIDEO {
+        return Ok(());
+    }
+
+    for satisfied in satisfied_video_claims(notification_type) {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, satisfied) else {
+            warn!(
+                event_id = %event.id,
+                target_pubkey = %target_pubkey,
+                "Video notification lacked an addressable d-tag"
+            );
+            return Ok(());
+        };
+        let redis_key = format!("dedup:{claim_key}");
+        if let Err(e) = redis_store::set_cached_string(
+            &state.redis_pool,
+            &redis_key,
+            "1",
+            state.settings.service.video_coordinate_dedup_ttl_secs,
+        )
+        .await
+        {
+            error!(
+                event_id = %event.id,
+                target_pubkey = %target_pubkey,
+                claim = %redis_key,
+                error = %e,
+                message = log_message,
+                "Failed to record a video-coordinate claim"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Find recipients for a NIP-22 comment event (kind 1111).
@@ -1129,49 +1234,59 @@ async fn send_notification_to_user(
     )
     .await?;
 
-    if !notification_type.is_enabled(&prefs) {
-        info!(
-            event_id = %event_id,
-            target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
-            notification_type = ?notification_type,
-            "Notification type disabled by user preferences - skipping"
-        );
-        return Ok(());
-    }
+    let mut delivery_type = notification_type;
+    if !delivery_type.is_enabled(&prefs) {
+        let can_fall_back_to_bell = if event.kind.as_u16() == KIND_VIDEO
+            && delivery_type == NotificationType::Mention
+            && NotificationType::NewPost.is_enabled(&prefs)
+        {
+            match redis_store::get_notify_watchers(&state.redis_pool, &event.pubkey).await {
+                Ok(watchers) => watchers.contains(target_pubkey),
+                Err(e) => {
+                    error!(
+                        event_id = %event_id,
+                        target_pubkey = %target_pubkey,
+                        creator = %event.pubkey,
+                        error = %e,
+                        "Failed to check bell fallback for muted video mention"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
-    if event.kind.as_u16() == KIND_VIDEO {
-        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, notification_type)
-        else {
-            warn!(
+        if can_fall_back_to_bell {
+            delivery_type = NotificationType::NewPost;
+            info!(
                 event_id = %event_id,
-                target_pubkey = %target_pubkey,
-                "Skipping video notification without an addressable d-tag"
+                target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
+                "Video mention disabled but bell enabled for watcher - delivering new-post notification"
             );
-            return Ok(());
-        };
-        let redis_key = format!("dedup:{claim_key}");
-        let already_notified = tokio::select! {
-            biased;
-            _ = token.cancelled() => {
-                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while checking video recipient delivery.");
-                return Err(crate::error::ServiceError::Cancelled);
-            }
-            lookup_result = redis_store::get_cached_string(&state.redis_pool, &redis_key) => {
-                lookup_result?.is_some()
-            }
-        };
-
-        if already_notified {
-            trace!(
+        } else {
+            info!(
                 event_id = %event_id,
-                target_pubkey = %target_pubkey,
-                "Skipping video recipient already notified for this coordinate"
+                target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
+                notification_type = ?delivery_type,
+                "Notification type disabled by user preferences - skipping"
             );
             return Ok(());
         }
     }
 
-    if notification_type == NotificationType::NewPost {
+    if event.kind.as_u16() == KIND_VIDEO
+        && has_video_claim(state, event, target_pubkey, delivery_type, &token).await?
+    {
+        trace!(
+            event_id = %event_id,
+            target_pubkey = %target_pubkey,
+            "Skipping video recipient already notified for this coordinate"
+        );
+        return Ok(());
+    }
+
+    if delivery_type == NotificationType::NewPost {
         let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
         let within_window = tokio::select! {
             biased;
@@ -1191,6 +1306,14 @@ async fn send_notification_to_user(
                 creator = %event.pubkey,
                 "Skipping new-post notification inside the per-creator rate-limit window"
             );
+            record_video_claims(
+                state,
+                event,
+                target_pubkey,
+                delivery_type,
+                "Failed to record a rate-limited video-coordinate claim; an edit may re-notify",
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -1214,7 +1337,7 @@ async fn send_notification_to_user(
     };
 
     // Create FCM payload
-    let payload = create_fcm_payload(event, target_pubkey, notification_type, copy);
+    let payload = create_fcm_payload(event, target_pubkey, delivery_type, copy);
 
     // Send to all tokens
     info!(
@@ -1282,7 +1405,7 @@ async fn send_notification_to_user(
     // same instant can both pass the check and double-send. That race is rare,
     // bounded, and low-harm; silently eating an hour of notifications on an FCM
     // blip is worse. Do not "fix" this into `SET NX EX`.
-    if notification_type == NotificationType::NewPost && success_count > 0 {
+    if delivery_type == NotificationType::NewPost && success_count > 0 {
         let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
         // Log and continue rather than `?`. Everything from here down is
         // bookkeeping about a push that has already shipped, so propagating
@@ -1306,43 +1429,19 @@ async fn send_notification_to_user(
         }
     }
 
-    if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
-        for satisfied in satisfied_video_claims(notification_type) {
-            // Unreachable today: the pre-send gate above already returned if
-            // the d-tag were missing. `break` rather than `return` regardless —
-            // the d-tag does not depend on `satisfied`, so there is nothing for
-            // a second pass to find, and invalid-token removal below this block
-            // still has to run.
-            let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, satisfied) else {
-                warn!(
-                    event_id = %event_id,
-                    target_pubkey = %target_pubkey,
-                    "Successful video notification lacked an addressable d-tag"
-                );
-                break;
-            };
-            let redis_key = format!("dedup:{claim_key}");
-            // Same reasoning as the rate-limit write above, and it matters more
-            // here: `satisfied_video_claims` can yield two records, and `?` on
-            // the first left the second unwritten. That is exactly the
-            // half-written state the type-scoped claim exists to prevent.
-            if let Err(e) = redis_store::set_cached_string(
-                &state.redis_pool,
-                &redis_key,
-                "1",
-                state.settings.service.video_coordinate_dedup_ttl_secs,
-            )
-            .await
-            {
-                error!(
-                    event_id = %event_id,
-                    target_pubkey = %target_pubkey,
-                    claim = %redis_key,
-                    error = %e,
-                    "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify"
-                );
-            }
-        }
+    if success_count > 0 {
+        // Same reasoning as the rate-limit write above, and it matters more
+        // here: `satisfied_video_claims` can yield two records, and `?` on
+        // the first left the second unwritten. That is exactly the
+        // half-written state the type-scoped claim exists to prevent.
+        record_video_claims(
+            state,
+            event,
+            target_pubkey,
+            delivery_type,
+            "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify",
+        )
+        .await?;
     }
 
     // Remove invalid tokens
@@ -1642,6 +1741,12 @@ mod tests {
             sender_name: "tester".to_string(),
             formatted_content: None,
         })
+    }
+
+    fn test_event_id(seed: u64) -> EventId {
+        let mut bytes = [0u8; 32];
+        bytes[24..].copy_from_slice(&seed.to_be_bytes());
+        EventId::from_slice(&bytes).expect("32 bytes is a valid event id")
     }
 
     #[test]
@@ -2600,6 +2705,235 @@ mod tests {
                 &watcher.public_key(),
                 &owner.public_key(),
             ))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_legacy_video_claim_suppresses_type_scoped_delivery() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("legacy-claim-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("legacy-claim"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let legacy_key = legacy_video_recipient_claim_key(&event, &watcher.public_key()).unwrap();
+        redis_store::set_cached_string(&pool, &format!("dedup:{legacy_key}"), "1", 3600)
+            .await
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "a one-year legacy coordinate record must survive the key-format rollout"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{legacy_key}"))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_muted_video_mention_falls_back_to_enabled_bell_for_watcher() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("mention-fallback-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        preferences::set_user_preferences(
+            &pool,
+            &watcher.public_key().to_hex(),
+            &UserPreferences { kinds: vec![34236] },
+        )
+        .await
+        .unwrap();
+        redis_store::replace_notify_subscriptions(
+            &pool,
+            &watcher.public_key(),
+            &[owner.public_key()],
+            1000,
+            &test_event_id(1000),
+        )
+        .await
+        .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "mentioned watcher")
+            .tag(Tag::identifier("mention-fallback"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let sent = mock_sender.get_sent_messages();
+        assert_eq!(sent.len(), 1);
+        let payload_type = sent[0].1.data.as_ref().and_then(|data| data.get("type"));
+        assert_eq!(
+            payload_type,
+            Some(&"newPost".to_string()),
+            "the muted mention should deliver the bell the watcher enabled"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        preferences::delete_user_preferences(&pool, &watcher.public_key().to_hex())
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let bell_key =
+            video_recipient_claim_key(&event, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{bell_key}"))
+            .arg(redis_store::build_notify_rate_key(
+                &watcher.public_key(),
+                &owner.public_key(),
+            ))
+            .arg(format!("notify_subs:{}", watcher.public_key().to_hex()))
+            .arg(format!("notify_subs_ts:{}", watcher.public_key().to_hex()))
+            .arg(format!("notify_watchers:{}", owner.public_key().to_hex()))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_rate_limited_bell_records_the_video_coordinate() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("rate-limited-claim-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let rate_key =
+            redis_store::build_notify_rate_key(&watcher.public_key(), &owner.public_key());
+        redis_store::set_cached_string(&pool, &rate_key, "1", 3600)
+            .await
+            .unwrap();
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "inside the window")
+            .tag(Tag::identifier("rate-limited-claim"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &event,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let claim_key =
+            video_recipient_claim_key(&event, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "the rate-limited video itself is suppressed"
+        );
+        assert!(
+            record.is_some(),
+            "a suppressed new-post push must still mark the coordinate"
+        );
+
+        let edit = EventBuilder::new(Kind::from(KIND_VIDEO), "later edit")
+            .tag(Tag::identifier("rate-limited-claim"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&rate_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &edit,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "a later edit of the suppressed video must stay quiet"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{claim_key}"))
             .query_async::<()>(&mut *conn)
             .await
             .unwrap();

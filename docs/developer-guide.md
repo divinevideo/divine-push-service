@@ -234,10 +234,10 @@ Two properties are load-bearing:
 - **Notify lists are exempt from the replay horizon.** A list published three
   months ago and never touched since is still the user's current subscription
   set, so `is_notify_list` carves it out of the `is_event_too_old` check. The
-  historical query is likewise unbounded in time, with
-  `notify_list_history_limit` as the size safety valve instead. Without
-  historical replay, a restart against a fresh Redis silently drops every bell
-  until each user republishes.
+  historical query is likewise unbounded by `since` and pages backward with
+  `until`, using `notify_list_history_limit` as the per-page size valve.
+  Without historical replay, a restart against a fresh Redis silently drops
+  every bell until each user republishes.
 - **Notify lists are exempt from the event claim.** `run()` claims every other
   event before routing it, so two replicas cannot send the same push twice.
   Notify lists send nothing, and `replace_notify_subscriptions` already rejects
@@ -283,9 +283,11 @@ The protocol requires clients to publish the complete list on every change, so
 belling two creators in quick succession produces two full-list publishes that
 can share a second; resolving those by arrival order would leave this service
 holding a different list than the relay does, permanently. Watch the direction
-when reading the script: an equal-timestamp event is applied only when its id
-sorts *below* the stored one, which reads backwards from "newer wins", and an
-exact replay is still rejected.
+when reading the script: an equal-timestamp event is applied when its id sorts
+*below* the stored one, which reads backwards from "newer wins". An exact replay
+is also applied as an idempotent repair path, so startup replay can reassert
+`notify_watchers:*` entries if Redis lost the reverse index while the timestamp
+guard survived.
 
 Because the script runs as one blocking unit and Redis is single-threaded, the
 creator list is bounded by `notify_list_max_creators` before it reaches Redis —
@@ -331,6 +333,10 @@ different videos from the same creator in the same instant can both pass the
 check and double-send — rare, bounded, and preferable to silently eating an hour
 of notifications on an FCM blip.
 
+When the rate limit suppresses a new-post push, the video-coordinate record is
+still written. That video has been intentionally dropped for that watcher, and a
+later NIP-33 edit should not re-announce it as a fresh post.
+
 The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and
 sees all six. That is intended.
@@ -343,9 +349,9 @@ sees all six. That is intended.
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
 | `dedup:{event_id}` | String | Per-event processing claim with TTL. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
-| `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered bell writes only its own |
+| `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Per-recipient video delivery decision, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered or rate-limited bell writes its own |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
-| `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |
+| `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. Exact-id replays apply idempotently for repair. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |
 | `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path — one `SMEMBERS` per incoming video. |
 | `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |

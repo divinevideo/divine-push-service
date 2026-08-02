@@ -9,6 +9,7 @@ use crate::{
     state::AppState,
 };
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -30,15 +31,19 @@ const KIND_NOTIFY_LIST: u16 = 30000;
 /// to all of kind 30000 without the `#d` narrowing would pull every people list
 /// on the relay.
 ///
-/// Deliberately unbounded in time. A notify list is replaceable, so one
-/// published months ago and never touched since is still current; a `since`
-/// bound would silently drop those subscriptions. `limit` is the safety valve
-/// on result size instead.
-fn notify_list_history_filter(limit: usize) -> Filter {
-    Filter::new()
+/// Deliberately unbounded by `since`. A notify list is replaceable, so one
+/// published months ago and never touched since is still current. Historical
+/// rebuild pages backward with `until` instead of trusting one relay-limited
+/// fetch to contain every current list.
+fn notify_list_history_filter(limit: usize, until: Option<Timestamp>) -> Filter {
+    let filter = Filter::new()
         .kind(Kind::from(KIND_NOTIFY_LIST))
         .identifier(crate::event_handler::NOTIFY_LIST_D_TAG)
-        .limit(limit)
+        .limit(limit);
+    match until {
+        Some(until) => filter.until(until),
+        None => filter,
+    }
 }
 
 /// Build the notify-list filter for the live subscription.
@@ -210,60 +215,92 @@ impl NostrListener {
         token: &CancellationToken,
     ) -> Result<()> {
         let limit = self.state.settings.service.notify_list_history_limit;
-        let filter = notify_list_history_filter(limit);
+        let mut until = None;
+        let mut seen = HashSet::new();
+        let mut total = 0usize;
 
         info!(limit, "Querying historical notify lists...");
 
-        tokio::select! {
-            biased;
-            _ = token.cancelled() => {
-                info!("Cancelled before historical notify-list query");
-                return Ok(());
-            }
-            fetch_result = self.state.nostr_client.fetch_events(filter, Duration::from_secs(60)) => {
-                match fetch_result {
-                    Ok(lists) => {
-                        let count = lists.len();
-                        if count >= limit {
-                            warn!(
-                                count,
-                                limit,
-                                "Historical notify-list query hit its limit; some subscriptions may be missing"
-                            );
+        loop {
+            let filter = notify_list_history_filter(limit, until);
+
+            let lists = tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    info!("Cancelled before historical notify-list query");
+                    return Ok(());
+                }
+                fetch_result = self.state.nostr_client.fetch_events(filter, Duration::from_secs(60)) => {
+                    match fetch_result {
+                        Ok(lists) => lists,
+                        Err(e) => {
+                            error!("Failed to query historical notify lists: {}", e);
+                            warn!("Proceeding with partial historical notify-list replay - existing bells may not deliver until republished");
+                            break;
                         }
-                        info!(count, "Processing historical notify lists...");
-
-                        for event in lists {
-                            if event.pubkey == *service_pubkey {
-                                continue;
-                            }
-
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => {
-                                    info!("Cancelled during historical notify-list processing");
-                                    return Ok(());
-                                }
-                                send_res = event_tx.send((Box::new(event), EventContext::Historical)) => {
-                                    if let Err(e) = send_res {
-                                        error!("Failed to send historical notify list: {}", e);
-                                        return Err(ServiceError::Internal(
-                                            "Event handler channel closed".to_string()
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-
-                        info!("Finished processing historical notify lists");
                     }
-                    Err(e) => {
-                        error!("Failed to query historical notify lists: {}", e);
-                        warn!("Proceeding without historical notify lists - existing bells will not deliver until republished");
+                }
+            };
+
+            let count = lists.len();
+            if count == 0 {
+                break;
+            }
+            info!(count, total, until = ?until, "Processing historical notify-list page...");
+
+            let mut oldest = None;
+            let mut new_count = 0usize;
+            for event in lists {
+                oldest = match oldest {
+                    Some(current) if current <= event.created_at => Some(current),
+                    _ => Some(event.created_at),
+                };
+
+                if !seen.insert(event.id) {
+                    continue;
+                }
+                new_count += 1;
+                total += 1;
+
+                if event.pubkey == *service_pubkey {
+                    continue;
+                }
+
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        info!("Cancelled during historical notify-list processing");
+                        return Ok(());
+                    }
+                    send_res = event_tx.send((Box::new(event), EventContext::Historical)) => {
+                        if let Err(e) = send_res {
+                            error!("Failed to send historical notify list: {}", e);
+                            return Err(ServiceError::Internal(
+                                "Event handler channel closed".to_string()
+                            ));
+                        }
                     }
                 }
             }
+
+            if count < limit {
+                break;
+            }
+
+            if new_count == 0 {
+                warn!(
+                    count,
+                    limit,
+                    until = ?until,
+                    "Historical notify-list pagination made no progress; some subscriptions may be missing"
+                );
+                break;
+            }
+
+            until = oldest;
         }
+
+        info!(count = total, "Finished processing historical notify lists");
 
         Ok(())
     }

@@ -242,7 +242,7 @@ async fn test_older_replacement_is_ignored() {
 }
 
 #[tokio::test]
-async fn test_replaying_the_same_created_at_is_ignored() {
+async fn test_replaying_the_same_event_repairs_the_reverse_index() {
     let Some(pool) = create_test_pool().await else {
         return;
     };
@@ -262,18 +262,33 @@ async fn test_replaying_the_same_created_at_is_ignored() {
     .await
     .expect("initial replace");
 
+    let watchers_key = format!("notify_watchers:{}", creator.to_hex());
+    let mut conn = pool.get().await.expect("redis connection");
+    let _: () = redis::cmd("DEL")
+        .arg(&watchers_key)
+        .query_async(&mut *conn)
+        .await
+        .expect("simulate lost reverse index");
+
     let applied = redis_store::replace_notify_subscriptions(
         &pool,
         &subscriber,
-        &[],
+        &[creator],
         2000,
         &test_event_id(2000),
     )
     .await
-    .expect("equal-timestamp replace");
+    .expect("exact replay");
     assert!(
-        !applied,
-        "the same event delivered twice is a replay, not an update"
+        applied,
+        "the same event delivered twice is an idempotent repair path"
+    );
+    assert_eq!(
+        redis_store::get_notify_watchers(&pool, &creator)
+            .await
+            .expect("watchers lookup"),
+        vec![subscriber],
+        "an exact replay re-asserts the reverse index"
     );
 
     cleanup(&pool, &keys_for(&subscriber, &all)).await;

@@ -16,7 +16,7 @@ service:
   video_coordinate_dedup_ttl_secs: 31536000  # 1 year
   new_post_rate_limit_secs: 3600  # One new-post push per (subscriber, creator) per hour
   notify_list_max_creators: 1000  # Bounds the Lua diff so one huge list can't stall Redis
-  notify_list_history_limit: 5000  # Safety valve on the unbounded historical notify-list query
+  notify_list_history_limit: 5000  # Page size for historical notify-list replay
 
 redis:
   url: "redis://127.0.0.1:6379"

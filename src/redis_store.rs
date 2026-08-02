@@ -325,7 +325,8 @@ pub fn build_notify_rate_key(subscriber: &PublicKey, creator: &PublicKey) -> Str
 /// lists — a rebuild from relay history would then disagree with what we served
 /// live. Note the direction: an incoming event with an *equal* timestamp wins
 /// only when its id sorts *below* the stored one, which reads backwards from
-/// "newer wins". An exact replay (same timestamp, same id) is still rejected.
+/// "newer wins". An exact replay (same timestamp, same id) is allowed through
+/// as an idempotent repair path for startup rebuilds.
 ///
 /// `notify_subs_ts` therefore stores `created_at:event_id`. A bare integer left
 /// by an earlier build is read as a timestamp with no known id, which can only
@@ -396,9 +397,10 @@ pub async fn replace_notify_subscriptions(
             end
             if stored_at == incoming_at then
               -- NIP-01 retains the lowest id on a tie, so the incoming event
-              -- has to sort strictly below the stored one. With no stored id
-              -- there is nothing to compare, so the tie stays rejected.
-              if not stored_id or incoming_id >= stored_id then
+              -- has to sort below the stored one, or be the exact same event
+              -- replayed during a rebuild. With no stored id there is nothing
+              -- to compare, so the tie stays rejected.
+              if not stored_id or incoming_id > stored_id then
                 return 0
               end
             end
@@ -419,8 +421,10 @@ pub async fn replace_notify_subscriptions(
         -- recoverable; see the ordering note in the function doc. An empty
         -- incoming list is legitimate (the user unbelled everyone) and Redis
         -- drops the key once its last member is removed.
+        local had_previous = {}
         local previous = redis.call('SMEMBERS', KEYS[1])
         for _, creator in ipairs(previous) do
+          had_previous[creator] = true
           if not incoming[creator] then
             redis.call('SREM', prefix .. creator, subscriber)
             redis.call('SREM', KEYS[1], creator)
@@ -429,8 +433,16 @@ pub async fn replace_notify_subscriptions(
 
         -- Add the new ones, forward index first, for the same reason.
         for i = 5, #ARGV do
-          redis.call('SADD', KEYS[1], ARGV[i])
-          redis.call('SADD', prefix .. ARGV[i], subscriber)
+          local creator = ARGV[i]
+          if not had_previous[creator] then
+            redis.call('SADD', KEYS[1], creator)
+            redis.call('SADD', prefix .. creator, subscriber)
+          else
+            -- Exact replays are allowed as repair. Re-assert the reverse entry
+            -- in case Redis lost `notify_watchers:*` while `notify_subs:*`
+            -- survived.
+            redis.call('SADD', prefix .. creator, subscriber)
+          end
         end
 
         -- ARGV[1] verbatim rather than `incoming_at`, so the stored timestamp
