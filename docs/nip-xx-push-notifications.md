@@ -134,9 +134,15 @@ Requirements:
 - Services MUST ignore kind 30000 events whose `d` tag is not exactly `notify`.
 - Services MUST NOT age these events out on a replay horizon. A list published
   long ago and never edited is still current.
-- Services SHOULD guard against out-of-order delivery by tracking the
-  `created_at` of the last applied list and rejecting older or equal values;
-  relays may deliver a stale replacement after a newer one.
+- Services SHOULD guard against out-of-order delivery by tracking the last
+  applied list and rejecting anything older; relays may deliver a stale
+  replacement after a newer one.
+- Services MUST resolve a `created_at` tie the way NIP-01 resolves it, by
+  retaining the event with the lowest id. Resolving by arrival order instead
+  makes the service's state diverge permanently from the relay's, so a rebuild
+  from relay history answers differently than what was served live. Tracking the
+  last applied `created_at` alone is not enough for this; the id has to be kept
+  alongside it.
 
 Because the list is public, **who a user subscribes to is public**. Clients
 SHOULD surface that rather than implying the subscription is private.

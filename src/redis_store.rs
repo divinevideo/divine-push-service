@@ -286,7 +286,9 @@ fn build_notify_subs_key(subscriber: &PublicKey) -> String {
     format!("notify_subs:{}", subscriber.to_hex())
 }
 
-/// `created_at` of the last applied notify-list event for this subscriber.
+/// `created_at:event_id` of the last applied notify-list event for this
+/// subscriber. The id is carried so a `created_at` tie can resolve the way
+/// NIP-01 resolves it, by lowest event id.
 fn build_notify_subs_ts_key(subscriber: &PublicKey) -> String {
     format!("notify_subs_ts:{}", subscriber.to_hex())
 }
@@ -316,6 +318,20 @@ pub fn build_notify_rate_key(subscriber: &PublicKey, creator: &PublicKey) -> Str
 /// would still race. Returns `false` when the incoming event was rejected as
 /// stale or duplicate, `true` when it was applied.
 ///
+/// Ties on `created_at` resolve the way NIP-01 resolves them: "in case of
+/// replaceable events with the same timestamp, the event with the lowest id
+/// (first in lexical order) should be retained". Resolving by arrival order
+/// instead would let this service and the relay hold permanently different
+/// lists — a rebuild from relay history would then disagree with what we served
+/// live. Note the direction: an incoming event with an *equal* timestamp wins
+/// only when its id sorts *below* the stored one, which reads backwards from
+/// "newer wins". An exact replay (same timestamp, same id) is still rejected.
+///
+/// `notify_subs_ts` therefore stores `created_at:event_id`. A bare integer left
+/// by an earlier build is read as a timestamp with no known id, which can only
+/// make the guard more conservative: ties against it are rejected, exactly as
+/// they were before.
+///
 /// The atomicity is load-bearing because production runs more than one replica.
 /// `try_claim_event` only prevents two replicas handling the *same* event; two
 /// different list events from one subscriber can still land concurrently, and a
@@ -336,18 +352,45 @@ pub async fn replace_notify_subscriptions(
     subscriber: &PublicKey,
     creators: &[PublicKey],
     created_at: u64,
+    event_id: &EventId,
 ) -> Result<bool> {
     const REPLACE_SCRIPT: &str = r#"
+        local incoming_at = tonumber(ARGV[1])
+        local incoming_id = ARGV[4]
+
         local stored = redis.call('GET', KEYS[2])
-        if stored and tonumber(stored) >= tonumber(ARGV[1]) then
-          return 0
+        if stored then
+          -- `created_at:event_id`, or a bare integer written by an earlier
+          -- build. An unparseable value is treated as absent rather than
+          -- wedging the subscriber's list forever.
+          local stored_at, stored_id = string.match(stored, '^(%d+):(%x+)$')
+          if stored_at then
+            stored_at = tonumber(stored_at)
+          else
+            stored_at = tonumber(stored)
+            stored_id = nil
+          end
+
+          if stored_at then
+            if stored_at > incoming_at then
+              return 0
+            end
+            if stored_at == incoming_at then
+              -- NIP-01 retains the lowest id on a tie, so the incoming event
+              -- has to sort strictly below the stored one. With no stored id
+              -- there is nothing to compare, so the tie stays rejected.
+              if not stored_id or incoming_id >= stored_id then
+                return 0
+              end
+            end
+          end
         end
 
         local prefix = ARGV[2]
         local subscriber = ARGV[3]
 
         local incoming = {}
-        for i = 4, #ARGV do
+        for i = 5, #ARGV do
           incoming[ARGV[i]] = true
         end
 
@@ -362,12 +405,14 @@ pub async fn replace_notify_subscriptions(
         -- Replace the forward set wholesale. An empty incoming list is
         -- legitimate (the user unbelled everyone) and clears the key.
         redis.call('DEL', KEYS[1])
-        for i = 4, #ARGV do
+        for i = 5, #ARGV do
           redis.call('SADD', KEYS[1], ARGV[i])
           redis.call('SADD', prefix .. ARGV[i], subscriber)
         end
 
-        redis.call('SET', KEYS[2], ARGV[1])
+        -- ARGV[1] verbatim rather than `incoming_at`, so the stored timestamp
+        -- is the caller's decimal string and never Lua's float formatting.
+        redis.call('SET', KEYS[2], ARGV[1] .. ':' .. incoming_id)
         return 1
     "#;
 
@@ -383,7 +428,8 @@ pub async fn replace_notify_subscriptions(
         .key(build_notify_subs_ts_key(subscriber))
         .arg(created_at)
         .arg(NOTIFY_WATCHERS_PREFIX)
-        .arg(subscriber.to_hex());
+        .arg(subscriber.to_hex())
+        .arg(event_id.to_hex());
     for creator in creators {
         invocation.arg(creator.to_hex());
     }

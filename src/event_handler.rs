@@ -512,6 +512,7 @@ async fn handle_notify_list_update(state: &AppState, event: &Event) -> Result<()
         &event.pubkey,
         &creators,
         event.created_at.as_secs(),
+        &event.id,
     )
     .await?;
 

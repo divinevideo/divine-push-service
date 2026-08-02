@@ -132,12 +132,16 @@ async fn test_a_replayed_list_still_applies_without_a_claim() {
     let subscriber = Keys::generate().public_key();
     let creator = Keys::generate().public_key();
     let created_at = Timestamp::now().as_secs();
+    // A replay is the same event arriving twice, so both calls carry the same
+    // id — which is also what makes the guard's tie-break reject the second.
+    let event_id = list_event("notify").id;
 
     let applied = redis_store::replace_notify_subscriptions(
         &pool,
         &subscriber,
         std::slice::from_ref(&creator),
         created_at,
+        &event_id,
     )
     .await
     .expect("first apply");
@@ -147,6 +151,7 @@ async fn test_a_replayed_list_still_applies_without_a_claim() {
         &subscriber,
         std::slice::from_ref(&creator),
         created_at,
+        &event_id,
     )
     .await
     .expect("replayed apply");

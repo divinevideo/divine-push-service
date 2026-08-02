@@ -258,6 +258,15 @@ relation and must move together. The script re-checks the stored `created_at`
 internally — a relay can deliver an older replacement after a newer one, and an
 advisory check in the caller would still race.
 
+Ties on `created_at` resolve by NIP-01's rule, retaining the lowest event id.
+The protocol requires clients to publish the complete list on every change, so
+belling two creators in quick succession produces two full-list publishes that
+can share a second; resolving those by arrival order would leave this service
+holding a different list than the relay does, permanently. Watch the direction
+when reading the script: an equal-timestamp event is applied only when its id
+sorts *below* the stored one, which reads backwards from "newer wins", and an
+exact replay is still rejected.
+
 Because the script runs as one blocking unit and Redis is single-threaded, the
 creator list is bounded by `notify_list_max_creators` before it reaches Redis —
 otherwise one user with an absurd number of bells stalls the instance for
@@ -317,6 +326,6 @@ sees all six. That is intended.
 | `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered bell writes only its own |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
-| `notify_subs_ts:{subscriber}` | String | `created_at` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event. |
+| `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |
 | `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path — one `SMEMBERS` per incoming video. |
 | `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |
