@@ -794,9 +794,12 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
 ///
 /// An eager resolve therefore pays `get_display_name` for events that deliver
 /// nothing. That is a Redis GET plus, on a cache miss, a relay `fetch_events`
-/// bounded by `query_timeout_secs` — and misses are never written back, so an
-/// author with no kind-0 pays it on every event forever. All of it on the single
-/// sequential handler task, ahead of every other user's notifications.
+/// bounded by the five seconds hard-coded in `MentionParser::fetch_from_relays`
+/// — not by `query_timeout_secs`, which is declared in config and read nowhere,
+/// so it is not a knob an operator can turn on this path. Misses are never
+/// written back either, so an author with no kind-0 pays it on every event
+/// forever. All of it on the single sequential handler task, ahead of every
+/// other user's notifications.
 ///
 /// Deferring the resolve to the first recipient that actually reaches payload
 /// construction keeps the once-per-event property and restores the property the

@@ -41,6 +41,11 @@ pub struct NostrSettings {
     pub profile_relays: Vec<String>,
     #[serde(default = "default_profile_cache_ttl")]
     pub profile_cache_ttl_secs: u64,
+    /// Currently inert: no code reads this. The profile fetch that an operator
+    /// would reach for it to bound is hard-coded to five seconds in
+    /// `MentionParser::fetch_from_relays`. Left in place rather than removed
+    /// because deleting it would break existing config files, but do not expect
+    /// changing it to affect anything.
     #[serde(default = "default_query_timeout")]
     pub query_timeout_secs: u64,
 }
