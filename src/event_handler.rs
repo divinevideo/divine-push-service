@@ -1308,13 +1308,18 @@ async fn send_notification_to_user(
 
     if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
         for satisfied in satisfied_video_claims(notification_type) {
+            // Unreachable today: the pre-send gate above already returned if
+            // the d-tag were missing. `break` rather than `return` regardless —
+            // the d-tag does not depend on `satisfied`, so there is nothing for
+            // a second pass to find, and invalid-token removal below this block
+            // still has to run.
             let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, satisfied) else {
                 warn!(
                     event_id = %event_id,
                     target_pubkey = %target_pubkey,
                     "Successful video notification lacked an addressable d-tag"
                 );
-                return Ok(());
+                break;
             };
             let redis_key = format!("dedup:{claim_key}");
             // Same reasoning as the rate-limit write above, and it matters more
