@@ -270,13 +270,19 @@ reverse index still holds cannot be repaired by anything the user can publish.
 Do not "simplify" the diff back into a `DEL` and rebuild.
 
 This covers the script failing on its own. It does not cover the index being
-lost some other way, and the startup replay only partly does. A *total* loss
-rebuilds: `notify_subs_ts` goes with everything else, so every replayed list
-passes the guard and re-applies. A *partial* loss does not: if the index is gone
-but `notify_subs_ts` survives, the replay re-fetches the same replaceable event
-and the guard rejects it on exact-id match, leaving those bells dead until the
-user next publishes a genuinely newer list. Deleting `notify_subs_ts` for the
-affected subscribers is currently the only lever.
+lost some other way, and the startup replay covers that in one direction only.
+A *total* loss rebuilds: `notify_subs_ts` goes with everything else, so every
+replayed list passes the guard and re-applies. A lost *reverse* index rebuilds
+as well, even with `notify_subs_ts` intact, because an exact-id replay is
+applied rather than rejected (see the tie-break note below) and re-asserts every
+`notify_watchers:*` entry the list implies.
+
+The mirror case is the one the replay cannot repair: if `notify_subs` is lost
+while the reverse index survives, the removal loop has nothing to diff against,
+so watcher entries for creators the subscriber has since unbelled stay behind
+and keep delivering. Republishing does not clear them — a new list only adds —
+which is the same asymmetry the write ordering above exists to avoid creating.
+Removing those `notify_watchers:*` entries directly is the only lever.
 
 Ties on `created_at` resolve by NIP-01's rule, retaining the lowest event id.
 The protocol requires clients to publish the complete list on every change, so
