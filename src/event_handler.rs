@@ -2656,6 +2656,70 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_a_failed_send_does_not_burn_the_rate_limit_window() {
+        // Check-then-set-on-success is a deliberate choice over `SET NX EX`, and
+        // this is the behaviour it was chosen for: an FCM blip must not cost the
+        // watcher an hour of bells. The comment above the write says so and asks
+        // that it not be "fixed" later, which is precisely why it needs a test
+        // rather than a comment.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("failed-send-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        // Transient, not `TokenNotRegistered`: the token stays registered so the
+        // next attempt can still succeed, which is the case the window protects.
+        mock_sender.set_error_for_token(&fcm_token, FcmError::InternalError);
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("failed-send"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let rate_key =
+            redis_store::build_notify_rate_key(&watcher.public_key(), &owner.public_key());
+        let marker = redis_store::get_cached_string(&pool, &rate_key)
+            .await
+            .unwrap();
+
+        // Cleanup before the assertions, so a failure does not leave a
+        // registered token behind in the developer's Redis.
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "the send was supposed to fail"
+        );
+        assert!(
+            marker.is_none(),
+            "a bell nobody received must not consume the watcher's hour"
+        );
+    }
+
     #[test]
     fn test_find_comment_recipients_reply_notifies_root_and_parent_authors() {
         let actor = Keys::generate();
