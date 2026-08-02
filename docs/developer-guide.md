@@ -258,6 +258,26 @@ relation and must move together. The script re-checks the stored `created_at`
 internally — a relay can deliver an older replacement after a newer one, and an
 advisory check in the caller would still race.
 
+The write order inside the script is deliberate. Redis runs a script without
+interleaving anything else, but it does not roll one back, so a script that dies
+partway keeps what it already wrote. Removals therefore clear the reverse index
+before the forward one and additions write the forward index first, which keeps
+`notify_subs` a *superset* of the true relation at every intermediate step. That
+matters because `notify_subs` is the only record of which `notify_watchers:*`
+keys name a subscriber, and removals are computed from it: a superset is
+reconciled by the next list, while a forward index that is missing entries the
+reverse index still holds cannot be repaired by anything the user can publish.
+Do not "simplify" the diff back into a `DEL` and rebuild.
+
+This covers the script failing on its own. It does not cover the index being
+lost some other way, and the startup replay only partly does. A *total* loss
+rebuilds: `notify_subs_ts` goes with everything else, so every replayed list
+passes the guard and re-applies. A *partial* loss does not: if the index is gone
+but `notify_subs_ts` survives, the replay re-fetches the same replaceable event
+and the guard rejects it on exact-id match, leaving those bells dead until the
+user next publishes a genuinely newer list. Deleting `notify_subs_ts` for the
+affected subscribers is currently the only lever.
+
 Ties on `created_at` resolve by NIP-01's rule, retaining the lowest event id.
 The protocol requires clients to publish the complete list on every change, so
 belling two creators in quick succession produces two full-list publishes that
