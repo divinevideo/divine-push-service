@@ -37,6 +37,7 @@ sequenceDiagram
 | 3079 | Client → Relay → Service | Register FCM push token (NIP-44 encrypted) |
 | 3080 | Client → Relay → Service | Deregister push token (NIP-44 encrypted) |
 | 3083 | Client → Relay → Service | Update notification preferences (optional) |
+| 30000 | Client → Relay → Service | NIP-51 people list; `d=notify` carries new-post ("bell") subscriptions. Public and unencrypted, and addressed to the world rather than `p`-tagged to the service |
 
 See [NIP-XX Push Notifications](nip-xx-push-notifications.md) for the full protocol specification.
 
@@ -53,8 +54,9 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
+| NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
 
-> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, and reposts are the types actually delivered today.
+> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, reposts, and new posts are the types actually delivered today.
 
 > **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
 
@@ -103,7 +105,7 @@ When the triggering event is not addressable and carries no addressable referenc
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `like`, `comment`, `follow`, `mention`, or `repost` (lowercase) |
+| `type` | string | `like`, `comment`, `follow`, `mention`, `repost`, or `newPost`. Match the exact string: the first five are lowercase, `newPost` is camelCase |
 | `eventId` | hex | The Nostr event that triggered the notification (the like/comment/repost/follow event itself); stable id for dedup and a routing fallback |
 | `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes follows and otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
@@ -180,7 +182,9 @@ Clients use this pubkey to:
 
 ## Deduplication
 
-The service uses atomic Redis `SET NX EX` per-event keys to prevent duplicate notifications across multiple replicas. Each event is claimed exactly once with a 7-day TTL.
+The service uses atomic Redis `SET NX EX` per-event keys to prevent duplicate notifications across multiple replicas. Each event that sends a push is claimed exactly once with a 7-day TTL.
+
+Notify lists (kind 30000, `d=notify`) are the exception: they send no push, and claiming them would strand a subscriber's bells for the TTL if the handler failed. See [Ingestion](#ingestion) for why the claim buys nothing there.
 
 ## User Preferences
 
