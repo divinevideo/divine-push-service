@@ -1109,15 +1109,24 @@ async fn has_video_claim(
     }
 }
 
+/// Record the video-coordinate claims a decision about `target_pubkey` settles.
+///
+/// Infallible on purpose. Every caller reaches this after the delivery decision
+/// is final — the push has shipped, or the rate limit has deliberately dropped
+/// it — so a failed write here is bookkeeping loss, not a reason to abandon the
+/// work that follows. `a10a02b`'s `return` in the old inline loop skipped
+/// invalid-token removal for the same reason `726bd1e` had to make it a
+/// `break`; returning `()` keeps that class of bug from coming back through a
+/// `?` at a call site.
 async fn record_video_claims(
     state: &AppState,
     event: &Event,
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
     log_message: &'static str,
-) -> Result<()> {
+) {
     if event.kind.as_u16() != KIND_VIDEO {
-        return Ok(());
+        return;
     }
 
     for satisfied in satisfied_video_claims(notification_type) {
@@ -1127,7 +1136,7 @@ async fn record_video_claims(
                 target_pubkey = %target_pubkey,
                 "Video notification lacked an addressable d-tag"
             );
-            return Ok(());
+            return;
         };
         let redis_key = format!("dedup:{claim_key}");
         if let Err(e) = redis_store::set_cached_string(
@@ -1148,8 +1157,6 @@ async fn record_video_claims(
             );
         }
     }
-
-    Ok(())
 }
 
 /// Find recipients for a NIP-22 comment event (kind 1111).
@@ -1315,7 +1322,7 @@ async fn send_notification_to_user(
                 delivery_type,
                 "Failed to record a rate-limited video-coordinate claim; an edit may re-notify",
             )
-            .await?;
+            .await;
             return Ok(());
         }
     }
@@ -1443,7 +1450,7 @@ async fn send_notification_to_user(
             delivery_type,
             "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify",
         )
-        .await?;
+        .await;
     }
 
     // Remove invalid tokens
@@ -3079,6 +3086,89 @@ mod tests {
         assert!(
             result.is_ok(),
             "a bookkeeping write failing is not a delivery failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_claim_write_still_removes_the_invalid_token() {
+        // The consequence the test above only implies. Invalid-token removal
+        // runs after the claim writes, so a `?` on them strands a token FCM has
+        // already rejected: every later push to this user pays for a delivery
+        // that cannot land, and nothing retries the removal.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        // Two tokens: one has to succeed, or `success_count` stays 0 and the
+        // claim write this test needs to fail never runs at all.
+        let live_token = format!("live-{}", watcher.public_key().to_hex());
+        let stale_token = format!("stale-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &live_token)
+            .await
+            .unwrap();
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &stale_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(&stale_token, FcmError::TokenNotRegistered);
+        let mut settings = crate::config::Settings::new().unwrap();
+        // Makes both coordinate `SETEX` calls error while the send succeeds.
+        settings.service.video_coordinate_dedup_ttl_secs = 0;
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("stale-token-vid"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let result = send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let claim_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+        let remaining = redis_store::get_tokens_for_pubkey(&pool, &watcher.public_key())
+            .await
+            .unwrap();
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &live_token)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &watcher.public_key(), &stale_token)
+            .await
+            .unwrap();
+
+        assert!(
+            record.is_none(),
+            "the claim write must actually have failed, or this test proves nothing"
+        );
+        assert!(
+            result.is_ok(),
+            "a bookkeeping failure is not a send failure"
+        );
+        assert!(
+            !remaining.contains(&stale_token),
+            "a token FCM reported as unregistered must be removed even when the claim write failed"
+        );
+        assert!(
+            remaining.contains(&live_token),
+            "the token that delivered must survive"
         );
     }
 
