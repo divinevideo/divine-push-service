@@ -1240,8 +1240,10 @@ async fn send_notification_to_user(
             && delivery_type == NotificationType::Mention
             && NotificationType::NewPost.is_enabled(&prefs)
         {
-            match redis_store::get_notify_watchers(&state.redis_pool, &event.pubkey).await {
-                Ok(watchers) => watchers.contains(target_pubkey),
+            match redis_store::is_notify_watcher(&state.redis_pool, &event.pubkey, target_pubkey)
+                .await
+            {
+                Ok(is_watcher) => is_watcher,
                 Err(e) => {
                     error!(
                         event_id = %event_id,

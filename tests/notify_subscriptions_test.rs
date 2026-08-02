@@ -100,6 +100,66 @@ async fn test_publishing_a_list_populates_the_reverse_index() {
 }
 
 #[tokio::test]
+async fn test_membership_agrees_with_the_full_watcher_read() {
+    // `is_notify_watcher` is the bell fallback's read, and it has to answer
+    // exactly what `get_notify_watchers(..).contains(..)` answered before it,
+    // including for a creator whose watcher key does not exist at all.
+    let Some(pool) = create_test_pool().await else {
+        return;
+    };
+
+    let subscriber = Keys::generate().public_key();
+    let stranger = Keys::generate().public_key();
+    let creator = Keys::generate().public_key();
+    let unwatched = Keys::generate().public_key();
+    let all = [creator, unwatched];
+    cleanup(&pool, &keys_for(&subscriber, &all)).await;
+
+    redis_store::replace_notify_subscriptions(
+        &pool,
+        &subscriber,
+        &[creator],
+        1000,
+        &test_event_id(1),
+    )
+    .await
+    .expect("replace should succeed");
+
+    for (creator_under_test, candidate) in [
+        (creator, subscriber),
+        (creator, stranger),
+        (unwatched, subscriber),
+    ] {
+        let full = redis_store::get_notify_watchers(&pool, &creator_under_test)
+            .await
+            .expect("watchers lookup")
+            .contains(&candidate);
+        let member = redis_store::is_notify_watcher(&pool, &creator_under_test, &candidate)
+            .await
+            .expect("membership lookup");
+        assert_eq!(
+            member, full,
+            "SISMEMBER must agree with SMEMBERS for creator {creator_under_test} and candidate {candidate}"
+        );
+    }
+
+    assert!(
+        redis_store::is_notify_watcher(&pool, &creator, &subscriber)
+            .await
+            .expect("membership lookup"),
+        "the subscriber watches the creator they belled"
+    );
+    assert!(
+        !redis_store::is_notify_watcher(&pool, &unwatched, &subscriber)
+            .await
+            .expect("membership lookup"),
+        "a missing watcher key is not a membership"
+    );
+
+    cleanup(&pool, &keys_for(&subscriber, &all)).await;
+}
+
+#[tokio::test]
 async fn test_shrinking_a_list_removes_only_the_dropped_creator() {
     let Some(pool) = create_test_pool().await else {
         return;

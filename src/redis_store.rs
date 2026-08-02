@@ -509,6 +509,32 @@ pub async fn get_notify_watchers(pool: &RedisPool, creator: &PublicKey) -> Resul
     Ok(watchers)
 }
 
+/// Test whether `subscriber` watches `creator`.
+///
+/// The membership question on its own. The bell fallback in
+/// `send_notification_to_user` asks it per muted-mention recipient, and it is
+/// the whole answer it needs, so it must not pay `get_notify_watchers`'s
+/// transfer-and-parse of a creator's entire watcher set. `SISMEMBER` answers in
+/// the server. `get_notify_watchers` stays the read for the fan-out, which does
+/// need every member.
+pub async fn is_notify_watcher(
+    pool: &RedisPool,
+    creator: &PublicKey,
+    subscriber: &PublicKey,
+) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    redis::cmd("SISMEMBER")
+        .arg(build_notify_watchers_key(creator))
+        .arg(subscriber.to_hex())
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)
+}
+
 // =============================================================================
 // Caching
 // =============================================================================
