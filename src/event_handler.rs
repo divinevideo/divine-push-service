@@ -2608,6 +2608,150 @@ mod tests {
     }
 
     #[test]
+    fn test_a_watcher_page_types_every_watcher_as_new_post() {
+        let author = Keys::generate().public_key();
+        let watcher = Keys::generate().public_key();
+
+        let targets = watcher_page_targets(vec![watcher], &author, &HashSet::new());
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, watcher);
+        assert_eq!(targets[0].notification_type, NotificationType::NewPost);
+    }
+
+    #[test]
+    fn test_a_watcher_page_drops_an_author_watching_themselves() {
+        let author = Keys::generate().public_key();
+
+        let targets = watcher_page_targets(vec![author], &author, &HashSet::new());
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_a_mentioned_watcher_is_not_also_belled() {
+        // Mention wins on overlap, which is what README and the developer guide
+        // promise. The rule used to live in `merge_watcher_targets` and moved to
+        // the page path, so it needs a test on the page path: without one,
+        // deleting the `mentioned` filter leaves the whole suite green while
+        // every mentioned watcher gets two pushes for one video.
+        let author = Keys::generate().public_key();
+        let both = Keys::generate().public_key();
+        let mentioned = HashSet::from([both]);
+
+        let targets = watcher_page_targets(vec![both], &author, &mentioned);
+
+        assert!(
+            targets.is_empty(),
+            "the mention already covers this recipient, so no bell is owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_fan_out_reaches_watchers_past_the_first_page() {
+        // The paging loop is the point of the fan-out bound, and nothing failed
+        // when it was broken: stopping after page one, or never advancing the
+        // cursor, left the suite green. It needs a creator whose watcher set is
+        // big enough for Redis to page at all. Below Redis's
+        // `set-max-listpack-entries` (128 by default) a set is listpack-encoded
+        // and SSCAN returns every member in one reply whatever COUNT says, so a
+        // handful of watchers cannot exercise a second page.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        const WATCHERS: usize = 150;
+        const PAGE_SIZE: usize = 10;
+
+        let author = Keys::generate();
+        let creator = author.public_key();
+        let watchers: Vec<Keys> = (0..WATCHERS).map(|_| Keys::generate()).collect();
+
+        for (idx, watcher) in watchers.iter().enumerate() {
+            redis_store::add_or_update_token(
+                &pool,
+                &watcher.public_key(),
+                &format!("fanout_token_{}", idx),
+            )
+            .await
+            .expect("register token");
+            redis_store::replace_notify_subscriptions(
+                &pool,
+                &watcher.public_key(),
+                &[creator],
+                1_000 + idx as u64,
+                &EventId::all_zeros(),
+            )
+            .await
+            .expect("bell the creator");
+        }
+
+        // Without this the assertion below could be met by one oversized page.
+        let first_page = redis_store::get_notify_watchers_page(&pool, &creator, 0, PAGE_SIZE)
+            .await
+            .expect("first watcher page");
+        assert_ne!(
+            first_page.next_cursor, 0,
+            "the seeded set must be large enough for Redis to page"
+        );
+
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.new_post_fanout_page_size = PAGE_SIZE;
+        settings.service.new_post_delivery_concurrency = 4;
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("paged-fanout-vid"))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let result = handle_video_content_event(&state, &event, CancellationToken::new()).await;
+
+        for (idx, watcher) in watchers.iter().enumerate() {
+            let _ = redis_store::remove_token(
+                &pool,
+                &watcher.public_key(),
+                &format!("fanout_token_{}", idx),
+            )
+            .await;
+            // The coordinate claim carries a one-year TTL, so it has to go with
+            // the rest or every run leaves 150 keys behind for a year.
+            let claim_key =
+                video_recipient_claim_key(&event, &watcher.public_key(), NotificationType::NewPost)
+                    .expect("the test event has a d-tag");
+            let mut conn = pool.get().await.unwrap();
+            let _: () = redis::cmd("DEL")
+                .arg(format!("notify_subs:{}", watcher.public_key().to_hex()))
+                .arg(format!("notify_subs_ts:{}", watcher.public_key().to_hex()))
+                .arg(redis_store::build_notify_rate_key(
+                    &watcher.public_key(),
+                    &creator,
+                ))
+                .arg(format!("dedup:{claim_key}"))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("notify_watchers:{}", creator.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        result.expect("the fan-out completes");
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            WATCHERS,
+            "every watcher is notified, not just the ones on the first page"
+        );
+    }
+
+    #[test]
     fn test_watcher_and_separate_mention_both_get_their_own_type() {
         let author = Keys::generate().public_key();
         let mentioned = Keys::generate().public_key();
