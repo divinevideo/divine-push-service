@@ -523,3 +523,4 @@ The canonical registration and removal rules live in the push specification's
 | `coalesce:leases` | Sorted Set | Groups owned by an in-flight flush, scored by lease expiry. Reconciliation returns expired leases with pending work to `coalesce:due`, never re-adding a group with nothing pending |
 | `coalesce:throttle:{owner}` | Hash | Per-recipient immediate-push token bucket (`tokens`, `ts`) |
 | `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: one member per emitted like/repost notification scored by send time, pruned to `recipient_daily_window_secs` and counted against `recipient_daily_cap` before the bucket is spent |
+| `campaign_delivery:{idempotencyKey}` | String | Campaign delivery claim, retained for `campaign_delivery.dedup_ttl_secs` (7 days by default) |

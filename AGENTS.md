@@ -98,6 +98,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `coalesce:leases` - Sorted set of groups owned by an in-flight flush, scored by lease expiry; reconciliation never re-adds a group with nothing pending
 - `coalesce:throttle:{owner}` - Per-recipient token bucket shared by immediate like/repost pushes and summary flushes: a summary with an empty bucket defers to the next refill instead of sending
 - `coalesce:emitted:{owner}` - Per-recipient rolling emission window: one member per emitted like/repost notification (trigger event id for an immediate push, group id for a summary), scored by the Redis server time of the send. Reads drop members older than `recipient_daily_window_secs` and `ZCARD` is checked against `recipient_daily_cap` before either path spends, so immediates and summaries share the same 24-hour budget; a summary refused by the cap requeues for the moment the oldest member ages out, and a failure that emitted nothing removes its member again
+- `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
 
 ### Notification Types
 | Type | Trigger Kind | Description |
@@ -107,6 +108,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 | Mention | 30023, 34236 | Long-form content or videos mentioning a user |
 | Repost | 16 | Reposts of user's notes |
 | NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
+| Campaign | n/a | Approved campaign notifications collected from the campaign tool. Not triggered by a Nostr event; off by default. |
 
 Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes. Like and Repost are coalesced into bucket summaries (see `docs/plans/like-repost-coalescing.md`); Comment, Mention, and NewPost are not, because collapsing them can lose a notification with no durable inbox row.
 
