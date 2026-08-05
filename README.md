@@ -120,7 +120,13 @@ Configuration is layered: a YAML file selected by `APP_ENV`, then environment va
 - `APP_ENV=production` loads `config/settings.yaml`.
 - Any other value loads `config/settings.<APP_ENV>.yaml`.
 
-These files set the relay (`wss://relay.divine.video`), profile relays, notification kinds, cleanup schedule, the Firebase project, and the listen address (`0.0.0.0:8000`).
+These files set the relay (`wss://relay.divine.video`), profile relays, notification kinds, cleanup schedule, the Firebase project, the listen address (`0.0.0.0:8000`), and campaign delivery collection (off by default; see below).
+
+### Campaign delivery collection
+
+Optional. When enabled, the service polls the campaign tool's internal delivery API for approved campaign notifications and delivers them over the existing FCM path, reporting each outcome back.
+
+It is off by default, and it refuses to start unless `api_base_url` is a valid `https` URL and both Access credentials are set. Even when running, it delivers nothing until `allow_unverified_consent` is `true` — this service cannot yet evaluate marketing consent or recipient-local quiet hours, so every delivery is suppressed as `consent_not_verifiable` until an operator asserts the audience opted in out of band.
 
 ### Environment variables
 
@@ -131,6 +137,11 @@ Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nes
 | `NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX` | Yes | Service's Nostr private key (hex), used for NIP-44 decryption |
 | `NOSTR_PUSH__REDIS__URL` | No | Redis connection URL (overrides the config file) |
 | `NOSTR_PUSH__NOSTR__RELAY_URL` | No | Nostr relay to subscribe to |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ENABLED` | No | Turns campaign delivery collection on (default `false`) |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__API_BASE_URL` | No | Base URL of the campaign tool's delivery API. Must be `https`. |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_ID` | No | Cloudflare Access service token client id |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_SECRET` | No | Cloudflare Access service token secret |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ALLOW_UNVERIFIED_CONSENT` | No | Must be `true` before any campaign is delivered (default `false`) |
 | `APP_ENV` | No | Selects the config file (default `development`) |
 | `RUST_LOG` | No | Log level (default `info`) |
 
