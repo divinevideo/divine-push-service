@@ -202,3 +202,4 @@ This is a list of event kinds the user wants notifications for. If no preference
 | `dedup:{event_id}` | String | Deduplication lock with TTL |
 | `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default) |
 | `divine:preferences:{pubkey}` | String | JSON notification preferences |
+| `campaign_delivery:{idempotencyKey}` | String | Campaign delivery claim, retained for `campaign_delivery.dedup_ttl_secs` (7 days by default) |

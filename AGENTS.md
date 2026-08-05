@@ -70,6 +70,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `divine:token:{pubkey}` - User's FCM token
 - `divine:preferences:{pubkey}` - User's notification preferences (JSON)
 - `divine:dedup:{pubkey}:{event_id}` - Deduplication with TTL
+- `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
 
 ### Notification Types
 | Type | Kind | Description |
@@ -79,6 +80,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 | Follow | 3 | New followers |
 | Mention | 1 | Notes mentioning user |
 | Repost | 16 | Reposts of user's notes |
+| Campaign | n/a | Approved campaign notifications collected from the campaign tool. Not triggered by a Nostr event; off by default. |
 
 ## Unblocking Workflow
 
