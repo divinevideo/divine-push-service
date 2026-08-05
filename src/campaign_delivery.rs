@@ -407,7 +407,7 @@ mod tests {
         let json = r#"{
             "idempotencyKey": "rev-1:abc",
             "campaignRevisionId": "rev-1",
-            "recipientPubkey": "aaaa",
+            "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "category": "engagement",
             "title": "t",
             "body": "b",
@@ -430,7 +430,7 @@ mod tests {
         let json = r#"{
             "idempotencyKey": "rev-1:abc",
             "campaignRevisionId": "rev-1",
-            "recipientPubkey": "aaaa",
+            "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "category": "engagement",
             "title": "t",
             "body": "b",
