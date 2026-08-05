@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+use divine_push_service::campaign_delivery;
 use divine_push_service::cleanup_service;
 use divine_push_service::config;
 use divine_push_service::error::Result;
@@ -107,6 +108,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     tracing::info!("Event handler started");
+
+    // Start campaign delivery collection
+    let state_campaign = Arc::clone(&app_state);
+    let token_campaign = token.clone();
+    tracker.spawn(async move {
+        if let Err(e) =
+            campaign_delivery::run_campaign_delivery_service(state_campaign, token_campaign).await
+        {
+            tracing::error!(error = %e, "Campaign delivery service exited with error");
+        }
+    });
 
     // Start cleanup service
     let state_cleanup = Arc::clone(&app_state);

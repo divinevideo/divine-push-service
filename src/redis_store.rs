@@ -162,6 +162,32 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
 }
 
 /// Cleans up stale tokens based on their last_seen timestamp.
+/// Claims a campaign delivery, returning false if it was already claimed.
+///
+/// `SET NX EX`, the same primitive `try_claim_event` uses. Final idempotency
+/// belongs here rather than in `divine-engagement`: a lease there can expire
+/// after this service accepted a message but before the result was reported,
+/// so the same key is legitimately re-offered and must not become a second
+/// push.
+pub async fn claim_campaign_delivery(pool: &RedisPool, key: &str, ttl_secs: u64) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let claimed: Option<String> = redis::cmd("SET")
+        .arg(key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(claimed.is_some())
+}
+
 pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Result<usize> {
     let mut conn = pool
         .get()
