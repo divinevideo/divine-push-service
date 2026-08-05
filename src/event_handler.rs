@@ -745,6 +745,15 @@ async fn handle_video_content_event(
         .map(|target| target.recipient)
         .collect();
 
+    // One copy for the whole event, spanning the mention pass and every watcher
+    // page. Building it per page would put the cost back on a per-page footing:
+    // `get_display_name` misses are never negatively cached, so a creator with
+    // no kind-0 metadata pays a five-second relay round-trip for each page, on
+    // the event-handler loop that every other user's notifications queue behind.
+    // `needs_content` is decided by the mention targets alone because `NewPost`
+    // does not render the event body, so no watcher page can widen it.
+    let copy = LazyEventCopy::for_targets(&mention_targets);
+
     let mut target_count = 0usize;
     if !mention_targets.is_empty() {
         info!(
@@ -754,7 +763,6 @@ async fn handle_video_content_event(
             notification_types = ?vec![(NotificationType::Mention.display_name(), mention_targets.len())],
             "Processing notification event"
         );
-        let copy = LazyEventCopy::for_targets(&mention_targets);
         send_notifications_sequential(state, event, mention_targets, &copy, token.clone()).await?;
         target_count += mentioned.len();
     }
@@ -802,7 +810,6 @@ async fn handle_video_content_event(
                 next_cursor,
                 "Processing new-post notification page"
             );
-            let copy = LazyEventCopy::for_targets(&new_post_targets);
             send_notifications_bounded(
                 state,
                 event,
