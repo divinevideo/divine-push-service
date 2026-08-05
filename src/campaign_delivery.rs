@@ -203,7 +203,7 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
         Ok(true) => {}
         Ok(false) => return refuse(DeliveryStatus::Suppressed, "already_delivered"),
         Err(e) => {
-            error!(error = %e, "Failed to claim campaign delivery");
+            error!(error = %e, key = %delivery.idempotency_key, "Failed to claim campaign delivery");
             return refuse(DeliveryStatus::RetryableFailure, "dedup_unavailable");
         }
     }
@@ -211,7 +211,7 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
     let tokens = match redis_store::get_tokens_for_pubkey(&state.redis_pool, &recipient).await {
         Ok(tokens) => tokens,
         Err(e) => {
-            error!(error = %e, "Failed to load device tokens");
+            error!(error = %e, key = %delivery.idempotency_key, "Failed to load device tokens");
             return refuse(DeliveryStatus::RetryableFailure, "token_lookup_failed");
         }
     };
@@ -328,6 +328,12 @@ async fn poll_once(
         // passed is exactly what is_expired exists to prevent.
         let now = chrono::Utc::now().timestamp();
         results.push(deliver(state, delivery, now).await);
+    }
+
+    if results.is_empty() {
+        // Cancelled before anything was processed. Nothing to report, and the
+        // leases expire on their own.
+        return Ok(0);
     }
 
     let count = results.len();
@@ -546,8 +552,8 @@ mod tests {
     fn test_refusal_always_carries_the_idempotency_key() {
         // divine-engagement settles rows by this key; a refusal without one
         // cannot be recorded against anything.
-        let refused =
-            precheck(&CampaignDeliverySettings::default(), &delivery(None), 0).expect_err("refused");
+        let refused = precheck(&CampaignDeliverySettings::default(), &delivery(None), 0)
+            .expect_err("refused");
         assert_eq!(refused.idempotency_key, "rev-1:abc");
     }
 
