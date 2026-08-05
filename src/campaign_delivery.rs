@@ -11,7 +11,8 @@
 //! actually be interrupted is decided here.
 
 use crate::{
-    error::Result, fcm_sender::FcmError, models::FcmPayload, redis_store, state::AppState,
+    config::CampaignDeliverySettings, error::Result, fcm_sender::FcmError, models::FcmPayload,
+    redis_store, state::AppState,
 };
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -134,33 +135,68 @@ pub fn campaign_payload(delivery: &PendingDelivery, recipient: &PublicKey) -> Fc
     }
 }
 
-/// Delivers one campaign notification, or explains why it will not.
-///
-/// Order matters. Consent is refused before anything is looked up, so an
-/// unconfigured deployment cannot leak the existence of a recipient by
-/// behaving differently for one who has devices.
-pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> DeliveryResult {
-    let settings = &state.settings.campaign_delivery;
-
-    let refuse = |status, reason: &str| DeliveryResult {
+fn refusal(delivery: &PendingDelivery, status: DeliveryStatus, reason: &str) -> DeliveryResult {
+    DeliveryResult {
         idempotency_key: delivery.idempotency_key.clone(),
         status,
         reason: Some(reason.to_string()),
-    };
+    }
+}
 
+/// The decisions that can be made before touching Redis or FCM.
+///
+/// Ordering is load-bearing: consent is refused before anything is looked up,
+/// so an unconfigured deployment cannot leak the existence of a recipient by
+/// behaving differently for one who has devices. Keeping these in one pure
+/// function is what lets that order be asserted without a live Redis.
+///
+/// Returns the parsed recipient when delivery may proceed, or the refusal to
+/// report back.
+fn precheck(
+    settings: &CampaignDeliverySettings,
+    delivery: &PendingDelivery,
+    now: i64,
+) -> std::result::Result<PublicKey, DeliveryResult> {
     if !settings.allow_unverified_consent {
         // Marketing consent is not expressible in kind 3083 yet, and no
         // recipient timezone is stored, so quiet hours cannot be evaluated
         // either. Refusing is the only honest answer.
-        return refuse(DeliveryStatus::Suppressed, "consent_not_verifiable");
+        return Err(refusal(
+            delivery,
+            DeliveryStatus::Suppressed,
+            "consent_not_verifiable",
+        ));
     }
 
     if is_expired(delivery.expires_at.as_deref(), now) {
-        return refuse(DeliveryStatus::Suppressed, "campaign_expired");
+        return Err(refusal(
+            delivery,
+            DeliveryStatus::Suppressed,
+            "campaign_expired",
+        ));
     }
 
-    let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
-        return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
+    PublicKey::from_str(&delivery.recipient_pubkey).map_err(|_| {
+        refusal(
+            delivery,
+            DeliveryStatus::PermanentFailure,
+            "invalid_recipient_pubkey",
+        )
+    })
+}
+
+/// Delivers one campaign notification, or explains why it will not.
+///
+/// Order matters. Consent is refused before anything is looked up; see
+/// [`precheck`].
+pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> DeliveryResult {
+    let settings = &state.settings.campaign_delivery;
+
+    let refuse = |status, reason: &str| refusal(delivery, status, reason);
+
+    let recipient = match precheck(settings, delivery, now) {
+        Ok(recipient) => recipient,
+        Err(refused) => return refused,
     };
 
     // Final idempotency lives here, not in the campaign tool. A lease can
@@ -374,6 +410,90 @@ mod tests {
             },
             expires_at: expires_at.map(str::to_string),
         }
+    }
+
+    /// Consent allowed, so `precheck` turns on the remaining gates alone.
+    fn consenting() -> CampaignDeliverySettings {
+        CampaignDeliverySettings {
+            allow_unverified_consent: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_consent_gate_suppresses_by_default() {
+        // The single control between the campaign tool and every user's phone.
+        let settings = CampaignDeliverySettings::default();
+        assert!(
+            !settings.allow_unverified_consent,
+            "consent must default to refused"
+        );
+
+        let refused = precheck(&settings, &delivery(None), 1_800_000_000)
+            .expect_err("delivery must be refused while consent is unverifiable");
+        assert_eq!(refused.status, DeliveryStatus::Suppressed);
+        assert_eq!(refused.reason.as_deref(), Some("consent_not_verifiable"));
+    }
+
+    #[test]
+    fn test_consent_is_refused_before_the_recipient_is_even_parsed() {
+        // The privacy claim: an unconfigured deployment must not behave
+        // differently for a recipient who is valid, so the consent refusal has
+        // to win over an unparseable pubkey.
+        let mut invalid = delivery(None);
+        invalid.recipient_pubkey = "not-a-pubkey".to_string();
+
+        let refused = precheck(
+            &CampaignDeliverySettings::default(),
+            &invalid,
+            1_800_000_000,
+        )
+        .expect_err("refused");
+        assert_eq!(refused.reason.as_deref(), Some("consent_not_verifiable"));
+
+        // With consent allowed, the same delivery reaches the pubkey check.
+        let refused = precheck(&consenting(), &invalid, 1_800_000_000).expect_err("refused");
+        assert_eq!(refused.status, DeliveryStatus::PermanentFailure);
+        assert_eq!(refused.reason.as_deref(), Some("invalid_recipient_pubkey"));
+    }
+
+    #[test]
+    fn test_consent_wins_over_expiry() {
+        let refused = precheck(
+            &CampaignDeliverySettings::default(),
+            &delivery(Some("2020-01-01T00:00:00Z")),
+            1_800_000_000,
+        )
+        .expect_err("refused");
+        assert_eq!(refused.reason.as_deref(), Some("consent_not_verifiable"));
+    }
+
+    #[test]
+    fn test_expired_campaign_is_suppressed_when_consent_is_allowed() {
+        let refused = precheck(
+            &consenting(),
+            &delivery(Some("2020-01-01T00:00:00Z")),
+            1_800_000_000,
+        )
+        .expect_err("refused");
+        assert_eq!(refused.status, DeliveryStatus::Suppressed);
+        assert_eq!(refused.reason.as_deref(), Some("campaign_expired"));
+    }
+
+    #[test]
+    fn test_precheck_passes_a_live_delivery_through() {
+        let recipient = precheck(&consenting(), &delivery(None), 1_800_000_000)
+            .expect("a live delivery to a valid pubkey proceeds");
+        assert_eq!(recipient.to_hex(), "a".repeat(64));
+    }
+
+    #[test]
+    fn test_refusal_always_carries_the_idempotency_key() {
+        // divine-engagement settles rows by this key; a refusal without one
+        // cannot be recorded against anything.
+        let refused = precheck(&CampaignDeliverySettings::default(), &delivery(None), 0)
+            .expect_err("refused");
+        assert_eq!(refused.idempotency_key, "rev-1:abc");
     }
 
     #[test]
