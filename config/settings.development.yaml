@@ -55,7 +55,10 @@ server:
 
 campaign_delivery:
   enabled: false  # Off until the Access service token is configured
-  api_base_url: "https://engagement.admin.divine.video"
+  # Intentionally blank in development. Reporting results mutates lease state
+  # in the campaign tool, so enabling this locally must be a deliberate act:
+  # set NOSTR_PUSH__CAMPAIGN_DELIVERY__API_BASE_URL to the environment you mean.
+  api_base_url: ""
   access_client_id: ""      # CF-Access-Client-Id, from GCP secret divine-engagement-delivery-token-id
   access_client_secret: ""  # CF-Access-Client-Secret, from GCP secret divine-engagement-delivery-token-secret
   poll_interval_secs: 30
