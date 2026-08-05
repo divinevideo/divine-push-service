@@ -24,6 +24,9 @@ dump.rdb
 test_results.txt
 dm_event.json
 prompt-plan.md
+/tmp/
+/output/.DS_Store
+/.worktrees/
 
 # Claude Code
 /.claude/
