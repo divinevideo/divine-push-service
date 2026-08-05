@@ -392,6 +392,34 @@ pub async fn run_campaign_delivery_service(
         error!("Campaign delivery is enabled but not configured. Not polling.");
         return Ok(());
     }
+    // The Access service token is attached to every request to this URL, so
+    // refuse to start rather than put a long-lived credential on the wire in
+    // cleartext or discover a malformed URL one failed poll at a time.
+    match reqwest::Url::parse(&settings.api_base_url) {
+        Ok(url) if url.scheme() == "https" => {}
+        Ok(url) => {
+            error!(
+                scheme = url.scheme(),
+                "Campaign delivery api_base_url must be https; the Access service token would be \
+                 sent in cleartext. Not polling."
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            error!(error = %e, "Campaign delivery api_base_url is not a valid URL. Not polling.");
+            return Ok(());
+        }
+    }
+    if settings.dedup_ttl_secs == 0 {
+        // Redis rejects `SET ... EX 0`, which would make every delivery fail
+        // as dedup_unavailable for as long as the service ran.
+        error!("Campaign delivery dedup_ttl_secs must be greater than zero. Not polling.");
+        return Ok(());
+    }
+    if settings.batch_size == 0 {
+        error!("Campaign delivery batch_size must be greater than zero. Not polling.");
+        return Ok(());
+    }
     if !settings.allow_unverified_consent {
         warn!(
             "Campaign delivery is polling, but consent and quiet hours cannot be verified, so \
