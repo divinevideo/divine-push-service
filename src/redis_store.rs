@@ -474,7 +474,13 @@ pub async fn replace_notify_subscriptions(
     Ok(applied == 1)
 }
 
-/// Read the subscribers watching `creator`.
+/// Read every subscriber watching `creator` in one `SMEMBERS`.
+///
+/// **Not the fan-out read.** Delivery pages with `get_notify_watchers_page`,
+/// and the bell fallback asks `is_notify_watcher`; this is the unbounded read
+/// both of those exist to keep off the hot path, and it has no caller in `src/`.
+/// It survives as the whole-set assertion helper the notify-list tests are
+/// written against. Do not reintroduce it into delivery.
 ///
 /// Unparseable members are skipped with a warning rather than failing the whole
 /// lookup, so one corrupt entry cannot block delivery to everyone else.

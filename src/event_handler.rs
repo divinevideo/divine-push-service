@@ -691,10 +691,30 @@ async fn send_notifications_bounded(
         })
         .buffer_unordered(concurrency);
 
+    // Drain on cancellation rather than returning at the first `Cancelled`.
+    //
+    // Returning early drops the `buffer_unordered` stream, and with it every
+    // still-running delivery, at whatever await point it had reached. Up to
+    // `concurrency - 1` of them can be sitting between the FCM send and the
+    // bookkeeping that follows it: the rate-limit window, the coordinate claim,
+    // invalid-token removal. Those pushes have already shipped, so dropping
+    // them there double-pushes on restart and leaves tokens FCM has already
+    // rejected registered — the same failure the post-send writes were made
+    // log-and-continue to avoid, arriving through the other door. Sequential
+    // delivery could strand one recipient this way; bounded delivery strands a
+    // page's worth, and silently, because a dropped future logs nothing.
+    //
+    // Draining costs little on shutdown: every in-flight delivery holds the
+    // same token and bails at its own next checkpoint, so the ones that have
+    // not sent yet return immediately. It does not close the window inside
+    // `send_notification_to_user`, which still returns `Cancelled` between the
+    // FCM send and the writes below it; that one predates this branch.
+    let mut cancelled = None;
     while let Some((recipient, result)) = deliveries.next().await {
         if let Err(e) = result {
             if matches!(e, crate::error::ServiceError::Cancelled) {
-                return Err(e);
+                cancelled.get_or_insert(e);
+                continue;
             }
             error!(
                 event_id = %event.id,
@@ -705,7 +725,10 @@ async fn send_notifications_bounded(
         }
     }
 
-    Ok(())
+    match cancelled {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 async fn deliver_notification_target(
@@ -791,7 +814,8 @@ async fn handle_video_content_event(
                     creator = %event.pubkey,
                     cursor,
                     error = %e,
-                    "Failed to read notify watcher page - delivering mentions without remaining bells"
+                    delivered_so_far = target_count,
+                    "Failed to read notify watcher page - abandoning the rest of the bell fan-out for this video"
                 );
                 break;
             }
@@ -2465,6 +2489,56 @@ mod tests {
             mock_sender.get_sent_messages().len(),
             1,
             "the mention survives the failed watcher page lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cancelled_bell_page_reports_cancellation() {
+        // Deleting the `Cancelled` arm from `send_notifications_bounded` left
+        // the suite green, so shutdown on the bell path was propagating by
+        // nobody's assertion. The page must report cancellation upward rather
+        // than returning Ok and letting the walk advance to the next cursor.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("cancelled-page-vid"))
+            .sign_with_keys(&author)
+            .unwrap();
+        let targets: Vec<NotificationTarget> = (0..3)
+            .map(|_| NotificationTarget {
+                recipient: Keys::generate().public_key(),
+                notification_type: NotificationType::NewPost,
+            })
+            .collect();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = send_notifications_bounded(
+            &state,
+            &event,
+            targets,
+            &LazyEventCopy::for_targets(&[]),
+            token,
+            4,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::error::ServiceError::Cancelled)),
+            "a cancelled page must not report success"
+        );
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "nothing ships after cancellation"
         );
     }
 
