@@ -395,11 +395,35 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_never_carries_a_device_token() {
+    fn test_payload_carries_exactly_the_expected_keys() {
+        // Asserting the exact key set, rather than searching the encoded form
+        // for the substring "token". Real FCM registration tokens do not
+        // contain that word, so a substring check cannot detect one; this can
+        // only pass while the map is exactly these keys.
         let recipient = Keys::generate().public_key();
         let payload = campaign_payload(&delivery(None), &recipient);
-        let encoded = serde_json::to_string(&payload).unwrap();
-        assert!(!encoded.to_lowercase().contains("token"));
+
+        assert!(payload.notification.is_none(), "must stay data-only");
+        let data = payload.data.expect("data");
+
+        let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "body",
+                "campaignRevisionId",
+                "category",
+                "receiverNpub",
+                "receiverPubkey",
+                "tapTargetType",
+                "tapTargetValue",
+                "title",
+                "type",
+            ],
+            "campaign payload key set changed; confirm no device token or other \
+             sensitive field was introduced before updating this list"
+        );
     }
 
     #[test]
