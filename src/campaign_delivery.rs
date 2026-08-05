@@ -421,6 +421,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decoded_expiry_reaches_the_gate() {
+        // The expiry tests above feed `is_expired` hand-written literals and the
+        // decode test only ever sees `null`, so nothing carried a real
+        // `expiresAt` across serde into the gate. Without this, dropping the
+        // field from deserialization makes every campaign never-expiring and
+        // the whole suite stays green.
+        let json = r#"{
+            "idempotencyKey": "rev-1:abc",
+            "campaignRevisionId": "rev-1",
+            "recipientPubkey": "aaaa",
+            "category": "engagement",
+            "title": "t",
+            "body": "b",
+            "tapTarget": { "type": "app_route", "value": "/x" },
+            "expiresAt": "2026-08-05T12:00:00Z"
+        }"#;
+        let parsed: PendingDelivery = serde_json::from_str(json).expect("decodes");
+        assert_eq!(parsed.expires_at.as_deref(), Some("2026-08-05T12:00:00Z"));
+
+        // 2026-08-05T12:00:00Z is 1785931200.
+        assert!(!is_expired(parsed.expires_at.as_deref(), 1_785_931_199));
+        assert!(is_expired(parsed.expires_at.as_deref(), 1_785_931_201));
+    }
+
+    #[test]
     fn test_result_serialises_to_the_contract_statuses() {
         let encoded = serde_json::to_string(&DeliveryResult {
             idempotency_key: "k".to_string(),
