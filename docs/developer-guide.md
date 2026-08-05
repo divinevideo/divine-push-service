@@ -315,8 +315,9 @@ key layout.
 
 ### Delivery
 
-On each incoming kind 34236, `video_notification_targets` unions the video's
-mention targets with `SMEMBERS notify_watchers:{author}`.
+On each incoming kind 34236, the handler sends the video's mention targets first,
+then walks `notify_watchers:{author}` with paged `SSCAN` reads and bounded
+delivery for each page.
 
 **Mention wins on overlap.** A user who both watches the creator and is mentioned
 in the video gets one push, typed `mention`, because that is the more specific
@@ -343,6 +344,14 @@ When the rate limit suppresses a new-post push, the video-coordinate record is
 still written. That video has been intentionally dropped for that watcher, and a
 later NIP-33 edit should not re-announce it as a fresh post.
 
+New-post fan-out is paged by `new_post_fanout_page_size` and each page is
+delivered with at most `new_post_delivery_concurrency` concurrent recipient
+sends. This is separate from the notify-list write cap: one user's list cannot
+stall Redis on write, and one popular creator's audience cannot turn a single
+video into one unbounded Redis read or unbounded sequential delivery loop. The
+page size is not a recipient cap; the handler continues until Redis returns
+cursor 0.
+
 The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and
 sees all six. That is intended.
@@ -359,5 +368,5 @@ sees all six. That is intended.
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
 | `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. Exact-id replays apply idempotently for repair. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |
-| `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path — one `SMEMBERS` per incoming video. |
+| `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path walks this set with paged `SSCAN` reads. |
 | `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |

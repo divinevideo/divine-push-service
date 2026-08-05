@@ -12,7 +12,26 @@ async fn get_test_pool() -> Option<redis_store::RedisPool> {
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
     match redis_store::create_pool(&redis_url, 5).await {
-        Ok(pool) => Some(pool),
+        Ok(pool) => {
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(_) => {
+                    println!("Skipping test: Redis not available");
+                    return None;
+                }
+            };
+
+            let ping_result: redis::RedisResult<String> =
+                redis::cmd("PING").query_async(&mut *conn).await;
+
+            if ping_result.is_err() {
+                println!("Skipping test: Redis not available");
+                return None;
+            }
+
+            drop(conn);
+            Some(pool)
+        }
         Err(_) => {
             println!("Skipping test: Redis not available");
             None

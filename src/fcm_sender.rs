@@ -10,10 +10,13 @@ use firebase_messaging_rs::{
     },
     FCMClient as FirebaseClient,
 };
+use futures_util::{stream, StreamExt};
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
 use tracing;
+
+const FCM_BATCH_CONCURRENCY: usize = 100;
 
 #[derive(Error, Debug, Clone)]
 pub enum FcmError {
@@ -282,18 +285,24 @@ impl FcmClient {
         tokens: &[String],
         payload: FcmPayload,
     ) -> HashMap<String, std::result::Result<(), FcmError>> {
-        let mut results = HashMap::new();
-        for token in tokens {
-            // Delegate to the trait object's method
-            let result = self.client.send_single(token, payload.clone()).await;
-            results.insert(token.clone(), result);
-        }
+        let results = stream::iter(tokens.iter().cloned())
+            .map(|token| {
+                let payload = payload.clone();
+                async move {
+                    let result = self.client.send_single(&token, payload).await;
+                    (token, result)
+                }
+            })
+            .buffer_unordered(FCM_BATCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
         // Note: We are not returning a Result here anymore, but a HashMap of results.
         // The original code returned Result<HashMap<...>, FcmError> which seemed incorrect
         // as individual sends could fail without the whole batch failing.
         // If a top-level error IS needed (e.g., impossible to even start sending),
         // this signature might need adjustment, but usually, per-token results are desired.
-        results // Return the map directly
+        results.into_iter().collect()
     }
 
     /// Sends a notification payload to a single FCM token.
