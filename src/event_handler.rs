@@ -835,15 +835,6 @@ async fn handle_video_content_event(
     Ok(())
 }
 
-#[cfg(test)]
-fn split_delivery_targets(
-    targets: Vec<NotificationTarget>,
-) -> (Vec<NotificationTarget>, Vec<NotificationTarget>) {
-    targets
-        .into_iter()
-        .partition(|target| target.notification_type != NotificationType::NewPost)
-}
-
 /// Find recipients for a reaction event (kind 7)
 /// Returns the author of the event being reacted to
 fn find_reaction_recipients(event: &Event) -> Vec<PublicKey> {
@@ -904,7 +895,7 @@ struct NotificationTarget {
 ///
 /// An event that `p`-tags its own sender — a self-reaction, a self-repost —
 /// resolves to the author as a recipient, and nobody should be notified about
-/// their own activity. Kept as a pure function, like `merge_watcher_targets`,
+/// their own activity. Kept as a pure function, like `watcher_page_targets`,
 /// so the rule is testable without an `AppState`.
 fn deliverable_targets(
     targets: Vec<NotificationTarget>,
@@ -1106,37 +1097,14 @@ fn video_mention_targets(event: &Event) -> Vec<NotificationTarget> {
         .collect()
 }
 
-/// Merge bell watchers into a video's mention targets.
+/// Turn one page of bell watchers into new-post targets.
 ///
 /// Mention wins on overlap: someone who both watches `author` and is mentioned
 /// in the video gets exactly one push, typed `Mention`, because that is the more
-/// specific signal. Watchers already present as mention targets are therefore
-/// skipped rather than added.
+/// specific signal. The mention pass runs first and hands its recipients here as
+/// `mentioned`, so watchers it already covered are dropped rather than belled.
 ///
-/// Kept separate from the Redis read so the dedup rule is testable on its own.
-#[cfg(test)]
-fn merge_watcher_targets(
-    mut targets: Vec<NotificationTarget>,
-    author: &PublicKey,
-    watchers: Vec<PublicKey>,
-) -> Vec<NotificationTarget> {
-    for watcher in watchers {
-        // `deliverable_targets` drops self-targets for every event kind, but
-        // filtering here keeps the merge rule complete on its own terms.
-        if watcher == *author {
-            continue;
-        }
-        if targets.iter().any(|t| t.recipient == watcher) {
-            continue;
-        }
-        targets.push(NotificationTarget {
-            recipient: watcher,
-            notification_type: NotificationType::NewPost,
-        });
-    }
-    targets
-}
-
+/// Kept separate from the Redis read so the rule is testable on its own.
 fn watcher_page_targets(
     watchers: Vec<PublicKey>,
     author: &PublicKey,
@@ -1153,32 +1121,6 @@ fn watcher_page_targets(
         .collect()
 }
 
-/// Resolve a watcher lookup into the watchers to notify, degrading to none.
-///
-/// Bells are enrichment layered on top of mentions, and they are the only part
-/// of a video's targets that needs Redis. A failed lookup must therefore cost
-/// the bells and nothing else. Propagating it would discard the mention
-/// notifications the same event produced before this feature existed, from
-/// tags that were already in hand.
-///
-/// Kept separate from the read so the degradation is testable without an
-/// `AppState`.
-#[cfg(test)]
-fn watchers_or_degrade(event: &Event, lookup: Result<Vec<PublicKey>>) -> Vec<PublicKey> {
-    match lookup {
-        Ok(watchers) => watchers,
-        Err(e) => {
-            error!(
-                event_id = %event.id,
-                creator = %event.pubkey,
-                error = %e,
-                "Failed to read notify watchers - delivering mentions without bells"
-            );
-            Vec::new()
-        }
-    }
-}
-
 /// Build the coordinate-and-recipient key used to deduplicate video edits.
 ///
 /// Scoped by notification type as well as coordinate, because the two are
@@ -1189,7 +1131,7 @@ fn watchers_or_degrade(event: &Event, lookup: Result<Vec<PublicKey>>) -> Vec<Pub
 /// Without the type, a watcher who got a NewPost push for a video and was then
 /// `p`-tagged in an edit of that same video had the mention suppressed for
 /// `video_coordinate_dedup_ttl_secs` — a year by default. Belling a creator
-/// quietly cost you mention notifications from them. `merge_watcher_targets`
+/// quietly cost you mention notifications from them. `watcher_page_targets`
 /// already makes mention win over bell within a single event; this extends the
 /// same rule across edits, where the two pushes carry genuinely different
 /// information ("X posted a vine" versus "X mentioned you").
@@ -1233,7 +1175,7 @@ fn legacy_video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Opt
 /// "X posted a vine" says nothing about being mentioned, and that asymmetry is
 /// why the key carries the type at all.
 ///
-/// This is `merge_watcher_targets`'s "mention wins on overlap" rule extended
+/// This is `watcher_page_targets`'s "mention wins on overlap" rule extended
 /// across edits. Without it, a watcher who was `p`-tagged in the original and
 /// dropped from an edit resolves to a bare `NewPost` target on the edit and is
 /// told "posted a new vine" about a video they were already pushed about.
@@ -2205,18 +2147,6 @@ mod tests {
     }
 
     #[test]
-    fn test_watcher_yields_a_new_post_target() {
-        let author = Keys::generate().public_key();
-        let watcher = Keys::generate().public_key();
-
-        let targets = merge_watcher_targets(Vec::new(), &author, vec![watcher]);
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].recipient, watcher);
-        assert_eq!(targets[0].notification_type, NotificationType::NewPost);
-    }
-
-    #[test]
     fn test_new_post_copy_has_required_non_empty_body() {
         let (title, body) = new_post_copy("Alice");
 
@@ -2474,75 +2404,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mentioned_watcher_yields_exactly_one_mention_target() {
-        let author = Keys::generate().public_key();
-        let both = Keys::generate().public_key();
-
-        let mentions = vec![NotificationTarget {
-            recipient: both,
-            notification_type: NotificationType::Mention,
-        }];
-        let targets = merge_watcher_targets(mentions, &author, vec![both]);
-
-        assert_eq!(targets.len(), 1, "mention wins, so no second push");
-        assert_eq!(targets[0].notification_type, NotificationType::Mention);
-    }
-
-    #[test]
-    fn test_author_watching_themselves_yields_nothing() {
-        let author = Keys::generate().public_key();
-
-        let targets = merge_watcher_targets(Vec::new(), &author, vec![author]);
-
-        assert!(targets.is_empty());
-    }
-
-    #[test]
-    fn test_no_watchers_leaves_mention_targets_unchanged() {
-        let author = Keys::generate().public_key();
-        let mentioned = Keys::generate().public_key();
-
-        let mentions = vec![NotificationTarget {
-            recipient: mentioned,
-            notification_type: NotificationType::Mention,
-        }];
-        let targets = merge_watcher_targets(mentions, &author, Vec::new());
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].recipient, mentioned);
-        assert_eq!(targets[0].notification_type, NotificationType::Mention);
-    }
-
-    #[test]
-    fn test_failed_watcher_lookup_still_delivers_mentions() {
-        let author = Keys::generate();
-        let mentioned = Keys::generate().public_key();
-        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
-            .tag(Tag::identifier("vid-1"))
-            .tag(Tag::public_key(mentioned))
-            .sign_with_keys(&author)
-            .unwrap();
-
-        // Redis is down. The bells are lost; the mentions must not be, because
-        // they came from the event's own tags and needed no lookup at all.
-        let lookup = Err(crate::error::ServiceError::Internal(
-            "redis down".to_string(),
-        ));
-        let watchers = watchers_or_degrade(&event, lookup);
-        assert!(watchers.is_empty());
-
-        let targets = merge_watcher_targets(
-            video_mention_targets(&event),
-            &author.public_key(),
-            watchers,
-        );
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].recipient, mentioned);
-        assert_eq!(targets[0].notification_type, NotificationType::Mention);
-    }
-
     #[tokio::test]
     async fn test_a_real_watcher_page_failure_still_delivers_mentions() {
         // This drives a genuine watcher-page failure through the real video
@@ -2631,8 +2492,8 @@ mod tests {
     #[test]
     fn test_a_mentioned_watcher_is_not_also_belled() {
         // Mention wins on overlap, which is what README and the developer guide
-        // promise. The rule used to live in `merge_watcher_targets` and moved to
-        // the page path, so it needs a test on the page path: without one,
+        // promise. The rule moved onto the page path with the fan-out rewrite
+        // and arrived there without a test: without one,
         // deleting the `mentioned` filter leaves the whole suite green while
         // every mentioned watcher gets two pushes for one video.
         let author = Keys::generate().public_key();
@@ -2752,45 +2613,22 @@ mod tests {
     }
 
     #[test]
-    fn test_watcher_and_separate_mention_both_get_their_own_type() {
+    fn test_a_watcher_page_keeps_the_watchers_who_were_not_mentioned() {
+        // Partial overlap: the mention pass already covers `mentioned`, so the
+        // page owes a bell to `watcher` and nothing to them.
         let author = Keys::generate().public_key();
         let mentioned = Keys::generate().public_key();
         let watcher = Keys::generate().public_key();
 
-        let mentions = vec![NotificationTarget {
-            recipient: mentioned,
-            notification_type: NotificationType::Mention,
-        }];
-        let targets = merge_watcher_targets(mentions, &author, vec![watcher]);
+        let targets = watcher_page_targets(
+            vec![mentioned, watcher],
+            &author,
+            &HashSet::from([mentioned]),
+        );
 
-        assert_eq!(targets.len(), 2);
-        let mention = targets.iter().find(|t| t.recipient == mentioned).unwrap();
-        let bell = targets.iter().find(|t| t.recipient == watcher).unwrap();
-        assert_eq!(mention.notification_type, NotificationType::Mention);
-        assert_eq!(bell.notification_type, NotificationType::NewPost);
-    }
-
-    #[test]
-    fn test_delivery_targets_split_new_post_from_regular_notifications() {
-        let mention_recipient = Keys::generate().public_key();
-        let watcher = Keys::generate().public_key();
-        let targets = vec![
-            NotificationTarget {
-                recipient: mention_recipient,
-                notification_type: NotificationType::Mention,
-            },
-            NotificationTarget {
-                recipient: watcher,
-                notification_type: NotificationType::NewPost,
-            },
-        ];
-
-        let (regular, new_posts) = split_delivery_targets(targets);
-
-        assert_eq!(regular.len(), 1);
-        assert_eq!(regular[0].notification_type, NotificationType::Mention);
-        assert_eq!(new_posts.len(), 1);
-        assert_eq!(new_posts[0].notification_type, NotificationType::NewPost);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, watcher);
+        assert_eq!(targets[0].notification_type, NotificationType::NewPost);
     }
 
     #[test]
@@ -2999,7 +2837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_mention_suppresses_a_later_bell_on_the_same_video() {
-        // The other direction of the same rule. `merge_watcher_targets` already
+        // The other direction of the same rule. `watcher_page_targets` already
         // says mention wins over bell on overlap; that has to hold across edits
         // too. A watcher who was `p`-tagged in the original and dropped from the
         // edit resolves to a bare NewPost target on the edit, and without the
