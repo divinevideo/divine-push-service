@@ -356,6 +356,31 @@ The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and
 sees all six. That is intended.
 
+### Subscription retention on deregistration
+
+Nothing removes a subscriber. `notify_subs:*`, `notify_subs_ts:*` and
+`notify_watchers:*` carry no TTL, `handle_deregistration` does not touch them,
+and the cleanup service does not sweep them. A user who deregisters their push
+token leaves their bell subscriptions in place indefinitely.
+
+This is accepted for now, not overlooked:
+
+- It is not a data-exposure question. The bell list is a kind 30000 `d=notify`
+  event and deliberately unencrypted, so it is already public on relays; the
+  reverse index holds nothing the relay does not.
+- It sends nothing. A deregistered user has no tokens, so
+  `send_notification_to_user` returns before any push.
+- The real cost is wasted fan-out iteration: those pubkeys stay in
+  `notify_watchers:{creator}` and are read, paged and gated on every video from
+  a creator they will never hear from.
+
+The obvious fix has a trap, which is why it is not a one-line addition to
+`handle_deregistration`. Deleting the subscriptions on deregistration means they
+do not come back when the same user re-registers, because the historical
+notify-list replay that would rebuild them runs only at startup. Deregistration
+cleanup therefore belongs with rebuild-on-registration, and both are tracked in
+the fan-out follow-up rather than done by halves here.
+
 ## Redis Keys
 
 | Key Pattern | Type | Description |
