@@ -257,7 +257,11 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
     }
 }
 
-async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
+async fn poll_once(
+    state: &AppState,
+    http: &reqwest::Client,
+    token: &CancellationToken,
+) -> Result<usize> {
     let settings = &state.settings.campaign_delivery;
     let pending_url = format!(
         "{}/api/internal/deliveries/pending?limit={}",
@@ -290,9 +294,22 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         return Ok(0);
     }
 
-    let now = chrono::Utc::now().timestamp();
     let mut results = Vec::with_capacity(pending.deliveries.len());
     for delivery in &pending.deliveries {
+        if token.is_cancelled() {
+            // Stop claiming new work on shutdown. Whatever is already claimed
+            // but unreported is re-offered once the lease expires.
+            warn!(
+                processed = results.len(),
+                remaining = pending.deliveries.len() - results.len(),
+                "Cancelled mid-batch. Reporting what was processed."
+            );
+            break;
+        }
+        // Recomputed per delivery rather than once per batch: a batch of
+        // batch_size sends can outlive an expiry, and delivering after it has
+        // passed is exactly what is_expired exists to prevent.
+        let now = chrono::Utc::now().timestamp();
         results.push(deliver(state, delivery, now).await);
     }
 
@@ -309,12 +326,20 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         .send()
         .await;
 
+    // A failed report loses the outcome for every delivery in the batch. The
+    // dedup key stops the re-offer becoming a second push, but it does not
+    // preserve the outcome: each of these rows comes back and settles
+    // "already_delivered", so a genuine delivery is recorded as suppressed and
+    // a genuine retryable failure is never retried. Logged loudly for that
+    // reason rather than because the push itself is at risk.
     match reported {
         Ok(response) if response.status().is_success() => {}
-        Ok(response) => warn!(status = %response.status(), "Reporting delivery results failed"),
-        // Not fatal. The lease expires and the work is offered again, and the
-        // dedup key above stops that becoming a second push.
-        Err(e) => warn!(error = %e, "Reporting delivery results failed"),
+        Ok(response) => {
+            error!(status = %response.status(), count, "Reporting delivery results failed. Outcomes for this batch are lost.")
+        }
+        Err(e) => {
+            error!(error = %e, count, "Reporting delivery results failed. Outcomes for this batch are lost.")
+        }
     }
 
     Ok(count)
@@ -365,7 +390,7 @@ pub async fn run_campaign_delivery_service(
                 break;
             }
             _ = ticker.tick() => {
-                match poll_once(&state, &http).await {
+                match poll_once(&state, &http, &token).await {
                     Ok(0) => debug!("No campaign deliveries pending."),
                     Ok(count) => info!(count, "Processed campaign deliveries."),
                     Err(e) => error!(error = %e, "Campaign delivery poll failed."),
