@@ -225,20 +225,30 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
 
     let mut accepted = false;
     let mut retryable = false;
+    let mut rejected = false;
+    let mut dropped_tokens = false;
     for (token, outcome) in outcomes {
         match outcome {
             Ok(()) => accepted = true,
             Err(FcmError::TokenNotRegistered) => {
                 // The device is gone. Drop the token so the next campaign does
                 // not pay for it again.
+                dropped_tokens = true;
                 if let Err(e) =
                     redis_store::remove_token(&state.redis_pool, &recipient, &token).await
                 {
-                    warn!(error = %e, "Failed to remove unregistered token");
+                    warn!(error = %e, key = %delivery.idempotency_key, "Failed to remove unregistered token");
                 }
             }
+            // FCM rejected the message itself. Re-sending identical content
+            // cannot succeed, so reporting this retryable would have the
+            // campaign tool re-offer it forever.
+            Err(e @ FcmError::InvalidRequest(_)) => {
+                warn!(error = %e, key = %delivery.idempotency_key, "Campaign push rejected as invalid");
+                rejected = true;
+            }
             Err(e) => {
-                warn!(error = %e, "Campaign push failed for one token");
+                warn!(error = %e, key = %delivery.idempotency_key, "Campaign push failed for one token");
                 retryable = true;
             }
         }
@@ -252,6 +262,13 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
         }
     } else if retryable {
         refuse(DeliveryStatus::RetryableFailure, "provider_error")
+    } else if rejected {
+        refuse(DeliveryStatus::PermanentFailure, "invalid_payload")
+    } else if dropped_tokens {
+        // Distinguished from "never had a device" so the campaign tool can
+        // tell a recipient who never registered from one whose last device
+        // has just been dropped.
+        refuse(DeliveryStatus::PermanentFailure, "all_tokens_unregistered")
     } else {
         refuse(DeliveryStatus::PermanentFailure, "no_device")
     }
