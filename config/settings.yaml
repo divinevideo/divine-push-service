@@ -53,3 +53,16 @@ notification:
 
 server:
   listen_addr: "0.0.0.0:8000"
+
+campaign_delivery:
+  enabled: false  # Off until the Access service token is configured
+  api_base_url: "https://engagement.admin.divine.video"
+  access_client_id: ""      # CF-Access-Client-Id, from GCP secret divine-engagement-delivery-token-id
+  access_client_secret: ""  # CF-Access-Client-Secret, from GCP secret divine-engagement-delivery-token-secret
+  poll_interval_secs: 30
+  batch_size: 100
+  dedup_ttl_secs: 604800  # 7 days
+  # Refuse to send until marketing consent and recipient-local quiet hours can
+  # actually be evaluated here. Setting this true asserts the audience is staff
+  # who opted in out of band.
+  allow_unverified_consent: false
