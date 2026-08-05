@@ -447,13 +447,43 @@ mod tests {
 
     #[test]
     fn test_result_serialises_to_the_contract_statuses() {
-        let encoded = serde_json::to_string(&DeliveryResult {
-            idempotency_key: "k".to_string(),
-            status: DeliveryStatus::RetryableFailure,
-            reason: Some("provider_error".to_string()),
+        // divine-engagement parses `status` as a closed enum over the whole
+        // results array, so one off-contract string rejects the entire batch.
+        // Every variant needs pinning, not just the one this test used to cover.
+        for (status, wire) in [
+            (DeliveryStatus::Delivered, "delivered"),
+            (DeliveryStatus::Suppressed, "suppressed"),
+            (DeliveryStatus::PermanentFailure, "permanent_failure"),
+            (DeliveryStatus::RetryableFailure, "retryable_failure"),
+        ] {
+            let encoded = serde_json::to_string(&DeliveryResult {
+                idempotency_key: "k".to_string(),
+                status,
+                reason: None,
+            })
+            .unwrap();
+            assert!(
+                encoded.contains(&format!("\"status\":\"{wire}\"")),
+                "{status:?} must serialise as {wire}, got {encoded}"
+            );
+            assert!(encoded.contains("\"idempotencyKey\":\"k\""));
+        }
+    }
+
+    #[test]
+    fn test_results_request_is_the_envelope_the_contract_expects() {
+        // This is the struct poll_once actually puts on the wire.
+        let encoded = serde_json::to_string(&ResultsRequest {
+            results: vec![DeliveryResult {
+                idempotency_key: "rev-1:abc".to_string(),
+                status: DeliveryStatus::RetryableFailure,
+                reason: Some("provider_error".to_string()),
+            }],
         })
         .unwrap();
-        assert!(encoded.contains("\"retryable_failure\""));
-        assert!(encoded.contains("\"idempotencyKey\":\"k\""));
+        assert_eq!(
+            encoded,
+            r#"{"results":[{"idempotencyKey":"rev-1:abc","status":"retryable_failure","reason":"provider_error"}]}"#
+        );
     }
 }
