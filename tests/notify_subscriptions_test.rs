@@ -728,7 +728,12 @@ async fn test_watcher_pages_walk_to_full_coverage() {
         return;
     };
 
-    let subscribers: Vec<PublicKey> = (0..3).map(|_| Keys::generate().public_key()).collect();
+    // 150, not a handful. Below Redis's `set-max-listpack-entries` (128 by
+    // default) a set is listpack-encoded and SSCAN returns every member in one
+    // reply whatever COUNT asks for, so a three-member set walks exactly one
+    // page and the test passes against a `get_notify_watchers_page` that
+    // ignores its cursor entirely.
+    let subscribers: Vec<PublicKey> = (0..150).map(|_| Keys::generate().public_key()).collect();
     let creator = Keys::generate().public_key();
     for subscriber in &subscribers {
         cleanup(&pool, &keys_for(subscriber, &[creator])).await;
@@ -747,11 +752,13 @@ async fn test_watcher_pages_walk_to_full_coverage() {
     }
 
     let mut cursor = 0;
+    let mut pages = 0;
     let mut watchers = HashSet::new();
     loop {
-        let page = redis_store::get_notify_watchers_page(&pool, &creator, cursor, 2)
+        let page = redis_store::get_notify_watchers_page(&pool, &creator, cursor, 10)
             .await
             .expect("watcher page lookup");
+        pages += 1;
         watchers.extend(page.watchers);
         if page.next_cursor == 0 {
             break;
@@ -759,6 +766,10 @@ async fn test_watcher_pages_walk_to_full_coverage() {
         cursor = page.next_cursor;
     }
 
+    assert!(
+        pages > 1,
+        "the walk must cross a page boundary to test anything, got {pages}"
+    );
     let expected: HashSet<PublicKey> = subscribers.iter().copied().collect();
     assert_eq!(watchers, expected);
 
