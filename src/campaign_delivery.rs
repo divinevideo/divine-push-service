@@ -398,15 +398,33 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_is_data_only_and_carries_the_revision() {
+    fn test_payload_is_data_only_and_carries_every_delivery_value() {
+        // Whole-map equality, not spot checks. The key-set test below pins the
+        // shape; this pins which delivery field feeds which key, so a
+        // wrong-source insert — the tap type where the tap value goes, title
+        // and body swapped — cannot ship while the key set stays right.
         let recipient = Keys::generate().public_key();
         let payload = campaign_payload(&delivery(None), &recipient);
 
         assert!(payload.notification.is_none(), "must stay data-only");
         let data = payload.data.expect("data");
-        assert_eq!(data.get("type").unwrap(), "campaign");
-        assert_eq!(data.get("campaignRevisionId").unwrap(), "rev-1");
-        assert_eq!(data.get("receiverPubkey").unwrap(), &recipient.to_hex());
+
+        let expected: HashMap<String, String> = [
+            ("type", "campaign".to_string()),
+            ("category", "engagement".to_string()),
+            ("title", "Three creators you follow posted".to_string()),
+            ("body", "See what they made this week.".to_string()),
+            ("campaignRevisionId", "rev-1".to_string()),
+            ("tapTargetType", "app_route".to_string()),
+            ("tapTargetValue", "/following/new".to_string()),
+            ("receiverPubkey", recipient.to_hex()),
+            ("receiverNpub", recipient.to_bech32().expect("npub")),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+
+        assert_eq!(data, expected);
     }
 
     #[test]
