@@ -494,6 +494,8 @@ mod tests {
                 "{status:?} must serialise as {wire}, got {encoded}"
             );
             assert!(encoded.contains("\"idempotencyKey\":\"k\""));
+            // `reason: None` must be omitted, not emitted as null.
+            assert!(!encoded.contains("reason"));
         }
     }
 
