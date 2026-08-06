@@ -498,20 +498,9 @@ mod tests {
         reached
     }
 
-    /// State whose consent gate is open, so `deliver` reaches the claim.
+    /// `state_with_sender` for the common `MockFcmSender` case.
     fn sending_state(pool: redis_store::RedisPool, sender: MockFcmSender) -> AppState {
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.campaign_delivery.allow_unverified_consent = true;
-        AppState {
-            settings,
-            redis_pool: pool,
-            fcm_client: Arc::new(FcmClient::new_with_impl(Box::new(sender))),
-            service_keys: None,
-            crypto_service: None,
-            nostr_client: Arc::new(Client::default()),
-            profile_client: Arc::new(Client::default()),
-            mention_parser_service: None,
-        }
+        state_with_sender(pool, Box::new(sender))
     }
 
     /// Redis `TTL`: -2 when the key is gone, -1 when it has no expiry.
@@ -631,7 +620,10 @@ mod tests {
     /// The owner token `ClaimUsurper` plants, standing in for a second attempt.
     const SUCCESSOR_OWNER: &str = "successor-attempt";
 
-    /// `sending_state` for a stub that is not a `MockFcmSender`.
+    /// State whose consent gate is open, built around any `FcmSend` stub.
+    ///
+    /// The one place the whole `AppState` is spelled out, so a new field is one
+    /// edit rather than one per test.
     fn state_with_sender(
         pool: redis_store::RedisPool,
         sender: Box<dyn crate::fcm_sender::FcmSend>,
@@ -1081,19 +1073,8 @@ mod tests {
             claim: claim.clone(),
             ttl_at_send: ttl_at_send.clone(),
         };
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.campaign_delivery.allow_unverified_consent = true;
-        let dedup_ttl = settings.campaign_delivery.dedup_ttl_secs as i64;
-        let state = AppState {
-            settings,
-            redis_pool: pool.clone(),
-            fcm_client: Arc::new(FcmClient::new_with_impl(Box::new(probe))),
-            service_keys: None,
-            crypto_service: None,
-            nostr_client: Arc::new(Client::default()),
-            profile_client: Arc::new(Client::default()),
-            mention_parser_service: None,
-        };
+        let state = state_with_sender(pool.clone(), Box::new(probe));
+        let dedup_ttl = state.settings.campaign_delivery.dedup_ttl_secs as i64;
 
         deliver(&state, &pending, 1_800_000_000).await;
 
