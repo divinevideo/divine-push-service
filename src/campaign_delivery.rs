@@ -198,11 +198,11 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
                 if let Err(e) =
                     redis_store::remove_token(&state.redis_pool, &recipient, &token).await
                 {
-                    warn!(error = %e, "Failed to remove unregistered token");
+                    warn!(error = %e, key = %delivery.idempotency_key, "Failed to remove unregistered token");
                 }
             }
             Err(e) => {
-                warn!(error = %e, "Campaign push failed for one token");
+                warn!(error = %e, key = %delivery.idempotency_key, "Campaign push failed for one token");
                 retryable = true;
             }
         }
