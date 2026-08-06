@@ -903,9 +903,12 @@ mod tests {
         let result = deliver(&state, &pending, 1_800_000_000).await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
 
+        // Same few seconds of slack the sibling assertion allows for the round
+        // trip: Redis rounds TTL to the nearest second, so a bare `>=` tolerates
+        // about half a second between the promote and this read.
         let ttl = claim_ttl(&pool, &claim).await;
         assert!(
-            ttl >= CLAIM_TTL_SECS as i64,
+            ttl >= CLAIM_TTL_SECS as i64 - 5,
             "a delivered claim must never be shorter than the in-flight window; TTL was {ttl}"
         );
 
