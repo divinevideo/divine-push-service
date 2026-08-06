@@ -416,14 +416,30 @@ mod tests {
     use super::*;
     use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
 
+    /// A Redis pool, or `None` when no Redis is reachable and none was asked for.
+    ///
+    /// Skipping is silent, and these tests assert the claim lifecycle, so a
+    /// skipped run reports green having checked nothing. When `REDIS_URL` is
+    /// set the operator has asked for a specific Redis, and failing to reach it
+    /// is a broken run rather than a reason to skip.
     async fn test_redis_pool() -> Option<redis_store::RedisPool> {
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-        let pool = redis_store::create_pool(&redis_url, 5).await.ok()?;
-        let mut conn = pool.get().await.ok()?;
-        let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
-        drop(conn);
-        pong.ok().map(|_| pool)
+        let explicit = std::env::var("REDIS_URL").ok();
+        let redis_url = explicit
+            .clone()
+            .unwrap_or_else(|| "redis://localhost:6379".to_string());
+        let reached = async {
+            let pool = redis_store::create_pool(&redis_url, 5).await.ok()?;
+            let mut conn = pool.get().await.ok()?;
+            let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+            drop(conn);
+            pong.ok().map(|_| pool)
+        }
+        .await;
+
+        if reached.is_none() && explicit.is_some() {
+            panic!("REDIS_URL={redis_url} was set but could not be reached; refusing to skip");
+        }
+        reached
     }
 
     /// State whose consent gate is open, so `deliver` reaches the claim.
