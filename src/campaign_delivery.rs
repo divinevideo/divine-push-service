@@ -84,6 +84,14 @@ fn dedup_key(idempotency_key: &str) -> String {
 /// decode `leaseSeconds`.
 const CLAIM_TTL_SECS: u64 = 600;
 
+/// `divine-engagement`'s `LEASE_SECONDS`, which `CLAIM_TTL_SECS` must outlive.
+///
+/// Duplicated rather than read from the wire because `PendingResponse` does not
+/// decode `leaseSeconds` yet. Tests assert the ordering so the two cannot drift
+/// apart silently.
+#[cfg(test)]
+const ENGAGEMENT_LEASE_SECS: i64 = 300;
+
 /// Drops a claim, so that whatever is re-offered gets a real second attempt.
 ///
 /// Logged rather than propagated: the caller is already returning a result for
@@ -817,9 +825,17 @@ mod tests {
         // between claim and report — the deploy-time norm here — has to expire
         // and let the re-offer through, not suppress it for seven days.
         let observed = ttl_at_send.lock().unwrap().expect("the probe must be hit");
+        // Both bounds matter. Upper: not the dedup window, or a killed
+        // process suppresses the re-offer for seven days. Lower: the claim has
+        // to outlive divine-engagement's 300s lease, or it expires mid-send and
+        // every delivery becomes double-pushable.
         assert!(
             observed <= CLAIM_TTL_SECS as i64 && observed < dedup_ttl,
             "an in-flight claim must be held for the lease window, not the dedup window; TTL was {observed}"
+        );
+        assert!(
+            observed > ENGAGEMENT_LEASE_SECS,
+            "an in-flight claim must outlive the {ENGAGEMENT_LEASE_SECS}s lease; TTL was {observed}"
         );
 
         redis_store::release_campaign_delivery(&pool, &claim)
