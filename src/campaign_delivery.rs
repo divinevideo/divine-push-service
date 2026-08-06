@@ -21,23 +21,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Deserialize)]
-pub struct TapTarget {
+struct TapTarget {
     #[serde(rename = "type")]
-    pub target_type: String,
-    pub value: String,
+    target_type: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PendingDelivery {
-    pub idempotency_key: String,
-    pub campaign_revision_id: String,
-    pub recipient_pubkey: String,
-    pub category: String,
-    pub title: String,
-    pub body: String,
-    pub tap_target: TapTarget,
-    pub expires_at: Option<String>,
+struct PendingDelivery {
+    idempotency_key: String,
+    campaign_revision_id: String,
+    recipient_pubkey: String,
+    category: String,
+    title: String,
+    body: String,
+    tap_target: TapTarget,
+    expires_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,7 +48,7 @@ struct PendingResponse {
 
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
-pub enum DeliveryStatus {
+enum DeliveryStatus {
     Delivered,
     Suppressed,
     PermanentFailure,
@@ -57,11 +57,11 @@ pub enum DeliveryStatus {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeliveryResult {
-    pub idempotency_key: String,
-    pub status: DeliveryStatus,
+struct DeliveryResult {
+    idempotency_key: String,
+    status: DeliveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,7 +143,7 @@ fn is_expired(expires_at: Option<&str>, now: i64) -> bool {
 /// Data-only, matching the social notification path, so the client keeps
 /// control of presentation. `campaignRevisionId` rather than a campaign id,
 /// because the revision is what was approved and what the copy belongs to.
-pub fn campaign_payload(delivery: &PendingDelivery, recipient: &PublicKey) -> FcmPayload {
+fn campaign_payload(delivery: &PendingDelivery, recipient: &PublicKey) -> FcmPayload {
     let mut data = HashMap::new();
     data.insert("type".to_string(), "campaign".to_string());
     data.insert("category".to_string(), delivery.category.clone());
@@ -181,7 +181,7 @@ pub fn campaign_payload(delivery: &PendingDelivery, recipient: &PublicKey) -> Fc
 /// Order matters. Consent is refused before anything is looked up, so an
 /// unconfigured deployment cannot leak the existence of a recipient by
 /// behaving differently for one who has devices.
-pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> DeliveryResult {
+async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> DeliveryResult {
     let settings = &state.settings.campaign_delivery;
 
     let refuse = |status, reason: &str| DeliveryResult {
