@@ -496,6 +496,29 @@ mod tests {
         }
     }
 
+    /// An FCM stub that drops the claim mid-send.
+    ///
+    /// Reaches the branch where the send outlived the claim, which the code
+    /// itself flags as producing a second push on the next re-offer.
+    struct ClaimDestroyer {
+        pool: redis_store::RedisPool,
+        claim: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::fcm_sender::FcmSend for ClaimDestroyer {
+        async fn send_single(
+            &self,
+            _token: &str,
+            _payload: FcmPayload,
+        ) -> std::result::Result<(), FcmError> {
+            redis_store::release_campaign_delivery(&self.pool, &self.claim)
+                .await
+                .unwrap();
+            Ok(())
+        }
+    }
+
     /// A delivery addressed to a real, registered recipient.
     async fn registered_delivery(
         pool: &redis_store::RedisPool,
@@ -811,6 +834,37 @@ mod tests {
         redis_store::release_campaign_delivery(&pool, &claim)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_send_that_outlives_its_claim_still_reports_delivered() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, _token) = registered_delivery(&pool, "outlived").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        let destroyer = ClaimDestroyer {
+            pool: pool.clone(),
+            claim: claim.clone(),
+        };
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.fcm_client = Arc::new(FcmClient::new_with_impl(Box::new(destroyer)));
+
+        // A push landed, so the outcome is Delivered whatever the claim did.
+        let result = deliver(&state, &pending, 1_800_000_000).await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+        assert_eq!(result.reason, None);
+
+        // Nothing was left to promote, so the key does not come back: a
+        // re-offer of this row would push a second time. That is the lease
+        // budget going unread, and this pins the behaviour rather than
+        // endorsing it.
+        assert_eq!(
+            claim_ttl(&pool, &claim).await,
+            -2,
+            "a claim destroyed mid-send must not be resurrected by the promote"
+        );
     }
 
     #[tokio::test]
