@@ -253,10 +253,16 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
     if accepted {
         // A push landed, so the claim becomes the durable record of it and has
         // to outlive any re-offer.
+        // Never below the in-flight window. EXPIRE sets rather than extends,
+        // and dedup_ttl_secs is operator-settable with nothing tying it to
+        // CLAIM_TTL_SECS, so a shorter value would leave a delivered push
+        // holding a shorter claim than an in-flight one. Clamped here rather
+        // than with EXPIRE's GT flag, which needs Redis 7 and this repo does
+        // not pin the deployed version.
         match redis_store::promote_campaign_delivery(
             &state.redis_pool,
             &claim,
-            settings.dedup_ttl_secs,
+            settings.dedup_ttl_secs.max(CLAIM_TTL_SECS),
         )
         .await
         {
@@ -800,6 +806,33 @@ mod tests {
         assert!(
             (ttl - dedup_ttl).abs() <= 5,
             "a delivered push must hold its claim for the {dedup_ttl}s dedup window; TTL was {ttl}"
+        );
+
+        redis_store::release_campaign_delivery(&pool, &claim)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_promotion_never_shortens_the_in_flight_claim() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, _token) = registered_delivery(&pool, "shortdedup").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        // An operator setting dedup_ttl_secs below CLAIM_TTL_SECS must not end
+        // up with a delivered push held for less time than an in-flight one.
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.settings.campaign_delivery.dedup_ttl_secs = 60;
+
+        let result = deliver(&state, &pending, 1_800_000_000).await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+
+        let ttl = claim_ttl(&pool, &claim).await;
+        assert!(
+            ttl >= CLAIM_TTL_SECS as i64,
+            "a delivered claim must never be shorter than the in-flight window; TTL was {ttl}"
         );
 
         redis_store::release_campaign_delivery(&pool, &claim)
