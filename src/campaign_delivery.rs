@@ -82,6 +82,8 @@ fn dedup_key(idempotency_key: &str) -> String {
 /// container and handles only SIGINT, so a pod termination is an ungraceful
 /// kill. Not read from the poll response yet — `PendingResponse` does not
 /// decode `leaseSeconds`.
+///
+/// TODO(#41): replace with the lease budget the delivery API returns.
 const CLAIM_TTL_SECS: u64 = 600;
 
 /// `divine-engagement`'s `LEASE_SECONDS`, which `CLAIM_TTL_SECS` must outlive.
