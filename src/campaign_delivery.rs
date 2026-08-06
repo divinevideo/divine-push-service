@@ -96,9 +96,17 @@ const ENGAGEMENT_LEASE_SECS: i64 = 300;
 
 /// Drops a claim, so that whatever is re-offered gets a real second attempt.
 ///
-/// Logged rather than propagated: the caller is already returning a result for
-/// this delivery, and the short claim TTL bounds the damage if the drop does
-/// not land.
+/// Logged rather than propagated, because the caller is already returning a
+/// result for this delivery and has nothing better to do with the error.
+///
+/// That is a genuine hole rather than a bounded one, and the claim window does
+/// not close it: a `retryable_failure` returns the row to `pending_delivery`
+/// with its lease cleared, and `divine-engagement` re-offers pending rows with
+/// no lease cutoff, so the next poll — 30 seconds later, not 600 — meets the
+/// claim this call failed to drop and settles the row `already_delivered`. The
+/// realistic instance is the `token_lookup_failed` path, where the lookup and
+/// this release share a Redis pool and fail together. Closing it needs the
+/// claim window tied to the lease budget rather than to a constant; see #41.
 async fn release_claim(state: &AppState, claim: &str, owner: &str, idempotency_key: &str) {
     match redis_store::release_campaign_delivery(&state.redis_pool, claim, owner).await {
         Ok(true) => {}
