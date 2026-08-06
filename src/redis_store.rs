@@ -187,6 +187,53 @@ pub async fn claim_campaign_delivery(pool: &RedisPool, key: &str, ttl_secs: u64)
     Ok(claimed.is_some())
 }
 
+/// Releases a campaign delivery claim so a retry can actually run.
+///
+/// The claim is taken before the send, so a claim still standing after a
+/// failure would turn the retry this service just asked for into
+/// `already_delivered` and lose the push. The claim survives only a delivery:
+/// every path that ends without one releases.
+pub async fn release_campaign_delivery(pool: &RedisPool, key: &str) -> Result<()> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    redis::cmd("DEL")
+        .arg(key)
+        .query_async::<()>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(())
+}
+
+/// Promotes a campaign delivery claim to the full deduplication window.
+///
+/// The claim is taken with a TTL that only has to outlive the lease, so that
+/// an ungraceful death mid-batch expires rather than suppressing the retry.
+/// It becomes the long-lived record of a delivered push only once FCM has
+/// accepted one.
+///
+/// Returns false if the claim was no longer there to promote, which means the
+/// send outlived the claim and a re-offer can produce a second push.
+pub async fn promote_campaign_delivery(pool: &RedisPool, key: &str, ttl_secs: u64) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    // EXPIRE answers 0 rather than failing when the key has gone.
+    let promoted: i64 = redis::cmd("EXPIRE")
+        .arg(key)
+        .arg(ttl_secs)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(promoted == 1)
+}
+
 /// Cleans up stale tokens based on their last_seen timestamp.
 pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Result<usize> {
     let mut conn = pool

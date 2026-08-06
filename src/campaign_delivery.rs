@@ -73,6 +73,28 @@ fn dedup_key(idempotency_key: &str) -> String {
     format!("campaign_delivery:{idempotency_key}")
 }
 
+/// How long a claim stands before a push has actually been accepted.
+///
+/// It only has to outlive `divine-engagement`'s lease (`leaseSeconds`, 300 at
+/// the time of writing) so that a batch this process dies in the middle of is
+/// re-offered and retried rather than suppressed as already delivered. That is
+/// the deploy-time norm rather than an edge case: the binary is PID 1 in its
+/// container and handles only SIGINT, so a pod termination is an ungraceful
+/// kill. Not read from the poll response yet — `PendingResponse` does not
+/// decode `leaseSeconds`.
+const CLAIM_TTL_SECS: u64 = 600;
+
+/// Drops a claim, so that whatever is re-offered gets a real second attempt.
+///
+/// Logged rather than propagated: the caller is already returning a result for
+/// this delivery, and the short claim TTL bounds the damage if the drop does
+/// not land.
+async fn release_claim(state: &AppState, claim: &str, idempotency_key: &str) {
+    if let Err(e) = redis_store::release_campaign_delivery(&state.redis_pool, claim).await {
+        warn!(error = %e, key = %idempotency_key, "Failed to release campaign delivery claim");
+    }
+}
+
 /// The error body, bounded for a log line.
 ///
 /// `divine-engagement` distinguishes failures its status codes do not — three
@@ -166,13 +188,14 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
     // Final idempotency lives here, not in the campaign tool. A lease can
     // expire after we accepted a message but before the result was reported,
     // so the same key will legitimately be offered again.
-    match redis_store::claim_campaign_delivery(
-        &state.redis_pool,
-        &dedup_key(&delivery.idempotency_key),
-        settings.dedup_ttl_secs,
-    )
-    .await
-    {
+    //
+    // The claim survives only a delivery. It is taken for `CLAIM_TTL_SECS` and
+    // promoted to the full dedup window once FCM has accepted a push; every
+    // path that ends without one drops it. Holding the full window across a
+    // failure would suppress the very retry this function asks for, and the
+    // row would settle `already_delivered` for a push that never landed.
+    let claim = dedup_key(&delivery.idempotency_key);
+    match redis_store::claim_campaign_delivery(&state.redis_pool, &claim, CLAIM_TTL_SECS).await {
         Ok(true) => {}
         Ok(false) => return refuse(DeliveryStatus::Suppressed, "already_delivered"),
         Err(e) => {
@@ -185,11 +208,13 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
         Ok(tokens) => tokens,
         Err(e) => {
             error!(error = %e, key = %delivery.idempotency_key, "Failed to load device tokens");
+            release_claim(state, &claim, &delivery.idempotency_key).await;
             return refuse(DeliveryStatus::RetryableFailure, "token_lookup_failed");
         }
     };
 
     if tokens.is_empty() {
+        release_claim(state, &claim, &delivery.idempotency_key).await;
         return refuse(DeliveryStatus::PermanentFailure, "no_device");
     }
 
@@ -218,14 +243,36 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
     }
 
     if accepted {
+        // A push landed, so the claim becomes the durable record of it and has
+        // to outlive any re-offer.
+        match redis_store::promote_campaign_delivery(
+            &state.redis_pool,
+            &claim,
+            settings.dedup_ttl_secs,
+        )
+        .await
+        {
+            Ok(true) => {}
+            // The send outlived the claim, so a re-offer of this key can push a
+            // second time. Both halves of that are the lease budget going
+            // unread; the claim window is only standing in for it.
+            Ok(false) => {
+                warn!(key = %delivery.idempotency_key, "Campaign delivery claim expired mid-send")
+            }
+            Err(e) => {
+                warn!(error = %e, key = %delivery.idempotency_key, "Failed to extend campaign delivery claim")
+            }
+        }
         DeliveryResult {
             idempotency_key: delivery.idempotency_key.clone(),
             status: DeliveryStatus::Delivered,
             reason: None,
         }
     } else if retryable {
+        release_claim(state, &claim, &delivery.idempotency_key).await;
         refuse(DeliveryStatus::RetryableFailure, "provider_error")
     } else {
+        release_claim(state, &claim, &delivery.idempotency_key).await;
         refuse(DeliveryStatus::PermanentFailure, "no_device")
     }
 }
@@ -359,6 +406,82 @@ pub async fn run_campaign_delivery_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
+
+    async fn test_redis_pool() -> Option<redis_store::RedisPool> {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let pool = redis_store::create_pool(&redis_url, 5).await.ok()?;
+        let mut conn = pool.get().await.ok()?;
+        let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+        drop(conn);
+        pong.ok().map(|_| pool)
+    }
+
+    /// State whose consent gate is open, so `deliver` reaches the claim.
+    fn sending_state(pool: redis_store::RedisPool, sender: MockFcmSender) -> AppState {
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.campaign_delivery.allow_unverified_consent = true;
+        AppState {
+            settings,
+            redis_pool: pool,
+            fcm_client: Arc::new(FcmClient::new_with_impl(Box::new(sender))),
+            service_keys: None,
+            crypto_service: None,
+            nostr_client: Arc::new(Client::default()),
+            profile_client: Arc::new(Client::default()),
+            mention_parser_service: None,
+        }
+    }
+
+    /// Redis `TTL`: -2 when the key is gone, -1 when it has no expiry.
+    async fn claim_ttl(pool: &redis_store::RedisPool, key: &str) -> i64 {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// An FCM stub that records the claim's TTL at the moment of the send.
+    ///
+    /// The claim is short-lived only while it is in flight, and no path leaves
+    /// it observable in that state afterwards, so it has to be read from here.
+    struct ClaimProbe {
+        pool: redis_store::RedisPool,
+        claim: String,
+        ttl_at_send: Arc<std::sync::Mutex<Option<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::fcm_sender::FcmSend for ClaimProbe {
+        async fn send_single(
+            &self,
+            _token: &str,
+            _payload: FcmPayload,
+        ) -> std::result::Result<(), FcmError> {
+            *self.ttl_at_send.lock().unwrap() = Some(claim_ttl(&self.pool, &self.claim).await);
+            Ok(())
+        }
+    }
+
+    /// A delivery addressed to a real, registered recipient.
+    async fn registered_delivery(
+        pool: &redis_store::RedisPool,
+        label: &str,
+    ) -> (PendingDelivery, String) {
+        let recipient = Keys::generate();
+        let token = format!("campaign-{label}-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(pool, &recipient.public_key(), &token)
+            .await
+            .unwrap();
+
+        let mut pending = delivery(None);
+        pending.idempotency_key = format!("rev-{label}:{}", recipient.public_key().to_hex());
+        pending.recipient_pubkey = recipient.public_key().to_hex();
+        (pending, token)
+    }
 
     fn delivery(expires_at: Option<&str>) -> PendingDelivery {
         PendingDelivery {
@@ -578,5 +701,166 @@ mod tests {
             encoded,
             r#"{"results":[{"idempotencyKey":"rev-1:abc","status":"retryable_failure","reason":"provider_error"}]}"#
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_send_releases_the_claim_so_the_re_offer_delivers() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, token) = registered_delivery(&pool, "retry").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        // Attempt one: FCM refuses, so this reports retryable_failure and
+        // divine-engagement re-offers the row once the lease expires.
+        let failing = MockFcmSender::new();
+        failing.set_error_for_token(&token, FcmError::InternalError);
+        let first = deliver(
+            &sending_state(pool.clone(), failing),
+            &pending,
+            1_800_000_000,
+        )
+        .await;
+        assert_eq!(first.status, DeliveryStatus::RetryableFailure);
+        assert_eq!(first.reason.as_deref(), Some("provider_error"));
+        assert_eq!(
+            claim_ttl(&pool, &claim).await,
+            -2,
+            "a retryable failure must leave no claim behind"
+        );
+
+        // Attempt two, the re-offer: it has to actually send. Holding the claim
+        // here is what silently loses the push and records it as delivered.
+        let working = MockFcmSender::new();
+        let second = deliver(
+            &sending_state(pool.clone(), working.clone()),
+            &pending,
+            1_800_000_000,
+        )
+        .await;
+        assert_eq!(
+            second.status,
+            DeliveryStatus::Delivered,
+            "the re-offered delivery must send, not settle already_delivered"
+        );
+        assert_eq!(
+            working.get_sent_messages().len(),
+            1,
+            "the retry must reach FCM"
+        );
+
+        redis_store::release_campaign_delivery(&pool, &claim)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_delivered_claim_outlives_the_lease_window() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, _token) = registered_delivery(&pool, "promote").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &pending,
+            1_800_000_000,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+
+        // Claimed for the lease window, promoted to the dedup window on send.
+        // Left at the lease window, a re-offer after 600s would push twice.
+        let ttl = claim_ttl(&pool, &claim).await;
+        assert!(
+            ttl > CLAIM_TTL_SECS as i64,
+            "a delivered push must hold its claim for the dedup window, not the lease window; TTL was {ttl}"
+        );
+
+        redis_store::release_campaign_delivery(&pool, &claim)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_in_flight_claim_only_outlives_the_lease() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, _token) = registered_delivery(&pool, "inflight").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        let ttl_at_send = Arc::new(std::sync::Mutex::new(None));
+        let probe = ClaimProbe {
+            pool: pool.clone(),
+            claim: claim.clone(),
+            ttl_at_send: ttl_at_send.clone(),
+        };
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.campaign_delivery.allow_unverified_consent = true;
+        let dedup_ttl = settings.campaign_delivery.dedup_ttl_secs as i64;
+        let state = AppState {
+            settings,
+            redis_pool: pool.clone(),
+            fcm_client: Arc::new(FcmClient::new_with_impl(Box::new(probe))),
+            service_keys: None,
+            crypto_service: None,
+            nostr_client: Arc::new(Client::default()),
+            profile_client: Arc::new(Client::default()),
+            mention_parser_service: None,
+        };
+
+        deliver(&state, &pending, 1_800_000_000).await;
+
+        // Claimed for the lease window, not the dedup window. A process killed
+        // between claim and report — the deploy-time norm here — has to expire
+        // and let the re-offer through, not suppress it for seven days.
+        let observed = ttl_at_send.lock().unwrap().expect("the probe must be hit");
+        assert!(
+            observed <= CLAIM_TTL_SECS as i64 && observed < dedup_ttl,
+            "an in-flight claim must be held for the lease window, not the dedup window; TTL was {observed}"
+        );
+
+        redis_store::release_campaign_delivery(&pool, &claim)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_delivered_key_offered_again_is_suppressed() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, _token) = registered_delivery(&pool, "dedup").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        let first = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &pending,
+            1_800_000_000,
+        )
+        .await;
+        assert_eq!(first.status, DeliveryStatus::Delivered);
+
+        // The point of claiming at all: a lease re-offered after a successful
+        // push must not become a second one.
+        let repeat = MockFcmSender::new();
+        let second = deliver(
+            &sending_state(pool.clone(), repeat.clone()),
+            &pending,
+            1_800_000_000,
+        )
+        .await;
+        assert_eq!(second.status, DeliveryStatus::Suppressed);
+        assert_eq!(second.reason.as_deref(), Some("already_delivered"));
+        assert!(
+            repeat.get_sent_messages().is_empty(),
+            "a re-offered delivered key must not reach FCM again"
+        );
+
+        redis_store::release_campaign_delivery(&pool, &claim)
+            .await
+            .unwrap();
     }
 }
