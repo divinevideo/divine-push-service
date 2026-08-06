@@ -479,6 +479,36 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_envelope_decodes_what_engagement_serves() {
+        // The wire body is the envelope, not a bare delivery: engagement
+        // unconditionally returns {"deliveries": [...], "leaseSeconds": 300}.
+        // Nothing decodes leaseSeconds yet, so this pins that the extra field
+        // does not break the envelope and that `deliveries` keeps its wire
+        // name — a deny_unknown_fields or rename here would fail every
+        // production poll while the bare-delivery fixtures below stayed green.
+        let json = r#"{
+            "deliveries": [{
+                "idempotencyKey": "rev-1:abc",
+                "campaignRevisionId": "rev-1",
+                "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "category": "engagement",
+                "title": "t",
+                "body": "b",
+                "tapTarget": { "type": "app_route", "value": "/x" },
+                "expiresAt": "2026-08-05T12:00:00Z"
+            }],
+            "leaseSeconds": 300
+        }"#;
+        let parsed: PendingResponse = serde_json::from_str(json).expect("decodes");
+        assert_eq!(parsed.deliveries.len(), 1);
+        assert_eq!(parsed.deliveries[0].idempotency_key, "rev-1:abc");
+        assert_eq!(
+            parsed.deliveries[0].expires_at.as_deref(),
+            Some("2026-08-05T12:00:00Z")
+        );
+    }
+
+    #[test]
     fn test_decoded_expiry_survives_serde() {
         // The expiry tests above feed `is_expired` hand-written literals and the
         // decode test only ever sees `null`, so nothing carried a real
