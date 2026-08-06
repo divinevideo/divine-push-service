@@ -467,6 +467,8 @@ mod tests {
 
         // 2026-08-05T12:00:00Z is 1785931200.
         assert!(!is_expired(parsed.expires_at.as_deref(), 1_785_931_199));
+        // The campaign expires on the instant, not after it.
+        assert!(is_expired(parsed.expires_at.as_deref(), 1_785_931_200));
         assert!(is_expired(parsed.expires_at.as_deref(), 1_785_931_201));
     }
 
