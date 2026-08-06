@@ -167,7 +167,7 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
         Ok(true) => {}
         Ok(false) => return refuse(DeliveryStatus::Suppressed, "already_delivered"),
         Err(e) => {
-            error!(error = %e, "Failed to claim campaign delivery");
+            error!(error = %e, key = %delivery.idempotency_key, "Failed to claim campaign delivery");
             return refuse(DeliveryStatus::RetryableFailure, "dedup_unavailable");
         }
     }
@@ -175,7 +175,7 @@ pub async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> 
     let tokens = match redis_store::get_tokens_for_pubkey(&state.redis_pool, &recipient).await {
         Ok(tokens) => tokens,
         Err(e) => {
-            error!(error = %e, "Failed to load device tokens");
+            error!(error = %e, key = %delivery.idempotency_key, "Failed to load device tokens");
             return refuse(DeliveryStatus::RetryableFailure, "token_lookup_failed");
         }
     };
