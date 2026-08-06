@@ -441,6 +441,7 @@ mod tests {
         let parsed: PendingDelivery = serde_json::from_str(json).expect("decodes");
         assert_eq!(parsed.idempotency_key, "rev-1:abc");
         assert_eq!(parsed.tap_target.target_type, "app_route");
+        assert!(PublicKey::from_str(&parsed.recipient_pubkey).is_ok());
         assert!(parsed.expires_at.is_none());
     }
 
