@@ -427,11 +427,18 @@ mod tests {
     /// A Redis pool, or `None` when no Redis is reachable and none was asked for.
     ///
     /// Skipping is silent, and these tests assert the claim lifecycle, so a
-    /// skipped run reports green having checked nothing. When `REDIS_URL` is
-    /// set the operator has asked for a specific Redis, and failing to reach it
-    /// is a broken run rather than a reason to skip.
+    /// skipped run reports green having checked nothing. Refuse to skip wherever
+    /// a Redis was asked for: `REDIS_URL` means an operator named one, and `CI`
+    /// means the workflow stood one up as a service container.
+    ///
+    /// `CI` is the half that covers the workflow. It supplies Redis through
+    /// `REDIS_HOST`/`REDIS_PORT`, which nothing in this codebase reads — the
+    /// coverage exists only because the hardcoded fallback below happens to
+    /// match the published port. Keying on `REDIS_URL` alone would leave
+    /// exactly the drift this guard exists to catch unguarded.
     async fn test_redis_pool() -> Option<redis_store::RedisPool> {
         let explicit = std::env::var("REDIS_URL").ok();
+        let demanded = explicit.is_some() || std::env::var("CI").is_ok();
         let redis_url = explicit
             .clone()
             .unwrap_or_else(|| "redis://localhost:6379".to_string());
@@ -444,12 +451,19 @@ mod tests {
         }
         .await;
 
-        if reached.is_none() && explicit.is_some() {
+        if reached.is_none() && demanded {
             // Named, not echoed. A Redis URL carries `[:password@]`, and this
             // is a test panic, so it lands in whatever collects the run's
             // output. `state.rs` logs the source of this variable and never its
             // value, for the same reason.
-            panic!("REDIS_URL was set but could not be reached; refusing to skip");
+            panic!(
+                "no Redis at {} and one was demanded (REDIS_URL or CI set); refusing to skip",
+                if explicit.is_some() {
+                    "REDIS_URL"
+                } else {
+                    "the default localhost:6379"
+                }
+            );
         }
         reached
     }
