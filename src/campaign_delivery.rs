@@ -770,20 +770,20 @@ mod tests {
         let (pending, _token) = registered_delivery(&pool, "promote").await;
         let claim = dedup_key(&pending.idempotency_key);
 
-        let result = deliver(
-            &sending_state(pool.clone(), MockFcmSender::new()),
-            &pending,
-            1_800_000_000,
-        )
-        .await;
+        let state = sending_state(pool.clone(), MockFcmSender::new());
+        let result = deliver(&state, &pending, 1_800_000_000).await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
 
         // Claimed for the lease window, promoted to the dedup window on send.
         // Left at the lease window, a re-offer after 600s would push twice.
+        // Pinned to the configured window, not merely "longer than the claim".
+        // Promoting to CLAIM_TTL_SECS + 1 is three orders of magnitude short of
+        // the dedup window and would otherwise pass.
+        let dedup_ttl = state.settings.campaign_delivery.dedup_ttl_secs as i64;
         let ttl = claim_ttl(&pool, &claim).await;
         assert!(
-            ttl > CLAIM_TTL_SECS as i64,
-            "a delivered push must hold its claim for the dedup window, not the lease window; TTL was {ttl}"
+            (ttl - dedup_ttl).abs() <= 5,
+            "a delivered push must hold its claim for the {dedup_ttl}s dedup window; TTL was {ttl}"
         );
 
         redis_store::release_campaign_delivery(&pool, &claim)
