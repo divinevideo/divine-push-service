@@ -445,10 +445,11 @@ mod tests {
     }
 
     #[test]
-    fn test_decoded_expiry_reaches_the_gate() {
+    fn test_decoded_expiry_survives_serde() {
         // The expiry tests above feed `is_expired` hand-written literals and the
         // decode test only ever sees `null`, so nothing carried a real
-        // `expiresAt` across serde into the gate. Without this, dropping the
+        // `expiresAt` across serde into `is_expired`. This does not reach the
+        // gate in `deliver()`, which is still uncovered. Without this, dropping the
         // field from deserialization makes every campaign never-expiring and
         // the whole suite stays green.
         let json = r#"{
