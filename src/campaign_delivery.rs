@@ -698,10 +698,13 @@ mod tests {
 
     #[test]
     fn test_payload_is_data_only_and_carries_every_delivery_value() {
-        // Whole-map equality, not spot checks. The key-set test below pins the
-        // shape; this pins which delivery field feeds which key, so a
-        // wrong-source insert — the tap type where the tap value goes, title
-        // and body swapped — cannot ship while the key set stays right.
+        // Whole-map equality, not spot checks, and not a search of the encoded
+        // form for the substring "token" — real FCM registration tokens do not
+        // contain that word, so a substring check cannot detect one. `HashMap`
+        // equality is length plus per-key value equality, so this pins the key
+        // set and which delivery field feeds each key at once: an extra key, a
+        // missing one, and a wrong-source insert (the tap type where the tap
+        // value goes, title and body swapped) all fail here.
         let recipient = Keys::generate().public_key();
         let payload = campaign_payload(&delivery(None), &recipient);
 
@@ -723,38 +726,10 @@ mod tests {
         .map(|(key, value)| (key.to_string(), value))
         .collect();
 
-        assert_eq!(data, expected);
-    }
-
-    #[test]
-    fn test_payload_carries_exactly_the_expected_keys() {
-        // Asserting the exact key set, rather than searching the encoded form
-        // for the substring "token". Real FCM registration tokens do not
-        // contain that word, so a substring check cannot detect one; this can
-        // only pass while the map is exactly these keys.
-        let recipient = Keys::generate().public_key();
-        let payload = campaign_payload(&delivery(None), &recipient);
-
-        assert!(payload.notification.is_none(), "must stay data-only");
-        let data = payload.data.expect("data");
-
-        let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
-        keys.sort_unstable();
         assert_eq!(
-            keys,
-            [
-                "body",
-                "campaignRevisionId",
-                "category",
-                "receiverNpub",
-                "receiverPubkey",
-                "tapTargetType",
-                "tapTargetValue",
-                "title",
-                "type",
-            ],
-            "campaign payload key set changed; confirm no device token or other \
-             sensitive field was introduced before updating this list"
+            data, expected,
+            "campaign payload changed; confirm no device token or other \
+             sensitive field was introduced before updating this map"
         );
     }
 
