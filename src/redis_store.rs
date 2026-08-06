@@ -161,7 +161,6 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
     }
 }
 
-/// Cleans up stale tokens based on their last_seen timestamp.
 /// Claims a campaign delivery, returning false if it was already claimed.
 ///
 /// `SET NX EX`, the same primitive `try_claim_event` uses. Final idempotency
@@ -188,6 +187,7 @@ pub async fn claim_campaign_delivery(pool: &RedisPool, key: &str, ttl_secs: u64)
     Ok(claimed.is_some())
 }
 
+/// Cleans up stale tokens based on their last_seen timestamp.
 pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Result<usize> {
     let mut conn = pool
         .get()
