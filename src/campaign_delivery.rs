@@ -73,6 +73,15 @@ fn dedup_key(idempotency_key: &str) -> String {
     format!("campaign_delivery:{idempotency_key}")
 }
 
+/// The error body, bounded for a log line.
+///
+/// `divine-engagement` distinguishes failures its status codes do not — three
+/// different causes share a 403, and a 422 names the exact results row zod
+/// rejected — so the body is the only artifact that says which one happened.
+fn body_snippet(body: &str) -> String {
+    body.chars().take(2048).collect()
+}
+
 /// Whether the campaign's own expiry has passed.
 ///
 /// An expired campaign is dropped rather than delivered late. An unparseable
@@ -240,9 +249,11 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         })?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         return Err(crate::error::ServiceError::Internal(format!(
-            "Pending delivery poll returned {}",
-            response.status()
+            "Pending delivery poll returned {status}: {}",
+            body_snippet(&body)
         )));
     }
 
@@ -275,7 +286,11 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
 
     match reported {
         Ok(response) if response.status().is_success() => {}
-        Ok(response) => warn!(status = %response.status(), "Reporting delivery results failed"),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            warn!(status = %status, body = %body_snippet(&body), "Reporting delivery results failed");
+        }
         // Not fatal. The lease expires and the work is offered again, and the
         // dedup key above stops that becoming a second push.
         Err(e) => warn!(error = %e, "Reporting delivery results failed"),
