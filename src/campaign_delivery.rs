@@ -445,7 +445,11 @@ mod tests {
         .await;
 
         if reached.is_none() && explicit.is_some() {
-            panic!("REDIS_URL={redis_url} was set but could not be reached; refusing to skip");
+            // Named, not echoed. A Redis URL carries `[:password@]`, and this
+            // is a test panic, so it lands in whatever collects the run's
+            // output. `state.rs` logs the source of this variable and never its
+            // value, for the same reason.
+            panic!("REDIS_URL was set but could not be reached; refusing to skip");
         }
         reached
     }
