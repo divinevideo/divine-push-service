@@ -10,13 +10,19 @@ use firebase_messaging_rs::{
     },
     FCMClient as FirebaseClient,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, FutureExt, StreamExt};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
 use tracing;
 
 const FCM_BATCH_CONCURRENCY: usize = 100;
+
+/// Return a log-safe prefix without splitting a multibyte character.
+pub(crate) fn token_prefix(token: &str) -> String {
+    token.chars().take(8).collect()
+}
 
 #[derive(Error, Debug, Clone)]
 pub enum FcmError {
@@ -224,14 +230,14 @@ impl FcmSend for RealFcmClient {
 
         tracing::info!(
             "Sending simplified FCM request for token prefix {}...",
-            &token[..std::cmp::min(token.len(), 8)]
+            token_prefix(token)
         );
 
         match self.client.send(&message).await {
             Ok(_response) => {
                 tracing::info!(
                     "FCM send successful for token prefix {}",
-                    &token[..std::cmp::min(token.len(), 8)]
+                    token_prefix(token)
                 );
                 Ok(())
             }
@@ -239,14 +245,14 @@ impl FcmSend for RealFcmClient {
                 // Log the raw Firebase error for debugging
                 tracing::debug!(
                     "FCM raw error for token prefix {}: {:?}",
-                    &token[..std::cmp::min(token.len(), 8)],
+                    token_prefix(token),
                     firebase_err
                 );
 
                 let custom_error = FcmError::from(firebase_err);
                 tracing::error!(
                     "FCM send failed for token prefix {}: {}",
-                    &token[..std::cmp::min(token.len(), 8)],
+                    token_prefix(token),
                     custom_error
                 );
                 Err(custom_error)
@@ -289,7 +295,29 @@ impl FcmClient {
             .map(|token| {
                 let payload = payload.clone();
                 async move {
-                    let result = self.client.send_single(&token, payload).await;
+                    // A panic here would unwind into the event-handler task,
+                    // which `main` spawns once and never supervises — so one
+                    // panicking send silently stopped ALL delivery for the life
+                    // of the process while `/health` kept returning 200.
+                    //
+                    // This is not hypothetical: `firebase-messaging-rs` reads
+                    // the `Retry-After` header on every FCM 5xx via
+                    // `HeaderName::from_static("Retry-After")`, and `http`'s
+                    // `from_static` panics on uppercase bytes. Containing it
+                    // costs one notification instead of every future one.
+                    let result = AssertUnwindSafe(self.client.send_single(&token, payload))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            tracing::error!(
+                                "FCM send panicked for token prefix {} - dropping this \
+                                 notification and continuing",
+                                token_prefix(&token)
+                            );
+                            Err(FcmError::InternalResponse(
+                                "FCM send panicked while handling the response".to_string(),
+                            ))
+                        });
                     (token, result)
                 }
             })
@@ -367,7 +395,7 @@ impl FcmSend for MockFcmSender {
             tracing::warn!(
                 "MockFcmSender: Simulating error {:?} for token prefix {}",
                 error,
-                &token[..std::cmp::min(token.len(), 8)]
+                token_prefix(token)
             );
             return Err(error.clone()); // Return the predefined error
         }
@@ -375,7 +403,7 @@ impl FcmSend for MockFcmSender {
         // Otherwise, record the message
         tracing::info!(
             "MockFcmSender: Recording send for token prefix {}...",
-            &token[..std::cmp::min(token.len(), 8)]
+            token_prefix(token)
         );
         let mut messages = self.sent_messages.lock().unwrap();
         messages.push((token.to_string(), payload));

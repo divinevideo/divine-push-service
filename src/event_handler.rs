@@ -1536,20 +1536,20 @@ async fn send_notification_to_user(
             return Err(crate::error::ServiceError::Cancelled);
         }
 
-        let truncated_token = &fcm_token[..8.min(fcm_token.len())];
+        let truncated_token = fcm_sender::token_prefix(&fcm_token);
 
         match result {
             Ok(_) => {
                 success_count += 1;
-                trace!(target_pubkey = %target_pubkey, token_prefix = truncated_token, "Successfully sent notification");
+                trace!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Successfully sent notification");
             }
             Err(fcm_sender::FcmError::TokenNotRegistered) => {
-                warn!(target_pubkey = %target_pubkey, token_prefix = truncated_token, "Token invalid/unregistered, marking for removal.");
+                warn!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Token invalid/unregistered, marking for removal.");
                 tokens_to_remove.push(fcm_token);
             }
             Err(e) => {
                 error!(
-                    target_pubkey = %target_pubkey, token_prefix = truncated_token, error = %e,
+                    target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
                     "FCM send failed for token"
                 );
             }
@@ -1620,17 +1620,17 @@ async fn send_notification_to_user(
                 info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while removing invalid tokens.");
                 return Err(crate::error::ServiceError::Cancelled);
             }
-            let truncated_token = &fcm_token_to_remove[..8.min(fcm_token_to_remove.len())];
+            let truncated_token = fcm_sender::token_prefix(&fcm_token_to_remove);
             if let Err(e) =
                 redis_store::remove_token(&state.redis_pool, target_pubkey, &fcm_token_to_remove)
                     .await
             {
                 error!(
-                    target_pubkey = %target_pubkey, token_prefix = truncated_token, error = %e,
+                    target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
                     "Failed to remove invalid token"
                 );
             } else {
-                info!(target_pubkey = %target_pubkey, token_prefix = truncated_token, "Removed invalid token");
+                info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
             }
         }
     }
