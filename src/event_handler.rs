@@ -1347,6 +1347,25 @@ fn find_comment_recipients(event: &Event) -> Vec<PublicKey> {
     recipients
 }
 
+/// What one FCM send result means for the delivery summary.
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Delivered,
+    /// Not delivered *and* the token should be pruned. It is both — counting it
+    /// only as a prune is what let a total delivery failure report zero
+    /// failures.
+    FailedAndPrune,
+    Failed,
+}
+
+fn classify_send_outcome(result: &std::result::Result<(), fcm_sender::FcmError>) -> SendOutcome {
+    match result {
+        Ok(()) => SendOutcome::Delivered,
+        Err(fcm_sender::FcmError::TokenNotRegistered) => SendOutcome::FailedAndPrune,
+        Err(_) => SendOutcome::Failed,
+    }
+}
+
 /// Send a notification to a specific user
 #[instrument(skip_all, fields(target_pubkey = %target_pubkey.to_string(), notification_type = ?notification_type))]
 async fn send_notification_to_user(
@@ -1529,6 +1548,12 @@ async fn send_notification_to_user(
     // Process results
     let mut tokens_to_remove = Vec::new();
     let mut success_count = 0;
+    // Counted separately from `tokens_to_remove`: a dead token is a *pruned*
+    // token, not the only way a send fails. Reporting only removals meant an
+    // outage where every send failed for some other reason — bad credentials,
+    // FCM 5xx, a timeout — still summarised as `failed_count=0`, which reads as
+    // "nothing went wrong" in exactly the logs an operator checks first.
+    let mut failed_count = 0;
 
     for (fcm_token, result) in results {
         if token.is_cancelled() {
@@ -1538,18 +1563,22 @@ async fn send_notification_to_user(
 
         let truncated_token = fcm_sender::token_prefix(&fcm_token);
 
-        match result {
-            Ok(_) => {
+        match classify_send_outcome(&result) {
+            SendOutcome::Delivered => {
                 success_count += 1;
                 trace!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Successfully sent notification");
             }
-            Err(fcm_sender::FcmError::TokenNotRegistered) => {
+            SendOutcome::FailedAndPrune => {
+                failed_count += 1;
                 warn!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Token invalid/unregistered, marking for removal.");
                 tokens_to_remove.push(fcm_token);
             }
-            Err(e) => {
+            SendOutcome::Failed => {
+                failed_count += 1;
                 error!(
-                    target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
+                    target_pubkey = %target_pubkey,
+                    token_prefix = %truncated_token,
+                    error = ?result.as_ref().err(),
                     "FCM send failed for token"
                 );
             }
@@ -1560,7 +1589,8 @@ async fn send_notification_to_user(
         event_id = %event_id,
         target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
         success_count,
-        failed_count = tokens_to_remove.len(),
+        failed_count,
+        pruned_count = tokens_to_remove.len(),
         "FCM notification send summary"
     );
 
@@ -2264,6 +2294,43 @@ mod tests {
             notification_type: NotificationType::NewPost,
         }]);
         assert!(!bells_only.needs_content);
+    }
+
+    /// The summary must report a failure as a failure. Counting only pruned
+    /// tokens meant a total outage — bad credentials, FCM 5xx, timeouts —
+    /// logged `failed_count=0`, which reads as "nothing went wrong" in the
+    /// first logs an operator checks. Reproduced live against a local relay.
+    #[test]
+    fn every_send_error_counts_as_a_failure_not_just_prunable_ones() {
+        use crate::fcm_sender::FcmError;
+        use std::time::Duration;
+
+        assert_eq!(classify_send_outcome(&Ok(())), SendOutcome::Delivered);
+
+        // A dead token is BOTH a failure and a prune.
+        assert_eq!(
+            classify_send_outcome(&Err(FcmError::TokenNotRegistered)),
+            SendOutcome::FailedAndPrune
+        );
+
+        // Everything else is a failure and must not prune the token.
+        for error in [
+            FcmError::Unauthorized("bad credentials".into()),
+            FcmError::InternalError,
+            FcmError::RetryableInternal(Duration::from_secs(30)),
+            FcmError::InvalidRequest("quota exceeded".into()),
+            FcmError::InternalRequest("timed out".into()),
+            FcmError::Unknown {
+                code: 418,
+                hint: None,
+            },
+        ] {
+            assert_eq!(
+                classify_send_outcome(&Err(error.clone())),
+                SendOutcome::Failed,
+                "{error:?} must count as failed and must not prune"
+            );
+        }
     }
 
     #[tokio::test]
