@@ -10,7 +10,8 @@ use firebase_messaging_rs::{
     },
     FCMClient as FirebaseClient,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, FutureExt, StreamExt};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
@@ -289,7 +290,29 @@ impl FcmClient {
             .map(|token| {
                 let payload = payload.clone();
                 async move {
-                    let result = self.client.send_single(&token, payload).await;
+                    // A panic here would unwind into the event-handler task,
+                    // which `main` spawns once and never supervises — so one
+                    // panicking send silently stopped ALL delivery for the life
+                    // of the process while `/health` kept returning 200.
+                    //
+                    // This is not hypothetical: `firebase-messaging-rs` reads
+                    // the `Retry-After` header on every FCM 5xx via
+                    // `HeaderName::from_static("Retry-After")`, and `http`'s
+                    // `from_static` panics on uppercase bytes. Containing it
+                    // costs one notification instead of every future one.
+                    let result = AssertUnwindSafe(self.client.send_single(&token, payload))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            tracing::error!(
+                                "FCM send panicked for token prefix {} - dropping this \
+                                 notification and continuing",
+                                &token[..std::cmp::min(token.len(), 8)]
+                            );
+                            Err(FcmError::InternalResponse(
+                                "FCM send panicked while handling the response".to_string(),
+                            ))
+                        });
                     (token, result)
                 }
             })
