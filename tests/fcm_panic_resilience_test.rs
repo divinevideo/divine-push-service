@@ -35,12 +35,12 @@ impl FcmSend for PanickingFcmSender {
 #[tokio::test]
 async fn a_panicking_send_is_contained_and_does_not_abort_the_batch() {
     let client = FcmClient::new_with_impl(Box::new(PanickingFcmSender {
-        panic_on: "bad-token".to_string(),
+        panic_on: "1234567é-bad".to_string(),
     }));
 
     let tokens = vec![
         "good-token-1".to_string(),
-        "bad-token".to_string(),
+        "1234567é-bad".to_string(),
         "good-token-2".to_string(),
     ];
 
@@ -49,7 +49,9 @@ async fn a_panicking_send_is_contained_and_does_not_abort_the_batch() {
 
     assert_eq!(results.len(), 3, "every token must get a result");
 
-    let bad = results.get("bad-token").expect("bad-token result missing");
+    let bad = results
+        .get("1234567é-bad")
+        .expect("panicking token result missing");
     assert!(bad.is_err(), "panicking send should surface as an error");
 
     // Crucially, the other recipients still get their notification.

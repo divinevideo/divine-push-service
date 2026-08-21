@@ -1536,20 +1536,20 @@ async fn send_notification_to_user(
             return Err(crate::error::ServiceError::Cancelled);
         }
 
-        let truncated_token = &fcm_token[..8.min(fcm_token.len())];
+        let truncated_token = fcm_sender::token_prefix(&fcm_token);
 
         match result {
             Ok(_) => {
                 success_count += 1;
-                trace!(target_pubkey = %target_pubkey, token_prefix = truncated_token, "Successfully sent notification");
+                trace!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Successfully sent notification");
             }
             Err(fcm_sender::FcmError::TokenNotRegistered) => {
-                warn!(target_pubkey = %target_pubkey, token_prefix = truncated_token, "Token invalid/unregistered, marking for removal.");
+                warn!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Token invalid/unregistered, marking for removal.");
                 tokens_to_remove.push(fcm_token);
             }
             Err(e) => {
                 error!(
-                    target_pubkey = %target_pubkey, token_prefix = truncated_token, error = %e,
+                    target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
                     "FCM send failed for token"
                 );
             }
