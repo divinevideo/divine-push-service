@@ -12,35 +12,10 @@ use nostr_sdk::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-/// What the live listener does after `notifications().recv()` returns an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvAction {
-    /// Keep listening — the error was transient.
-    Continue,
-    /// Stop the live loop — no further events can arrive.
-    Stop,
-}
-
-/// Decide whether a broadcast receive error ends the live listener.
-///
-/// `Lagged` means the subscriber fell behind a bounded broadcast channel and
-/// some notifications were dropped; the next `recv()` returns the oldest
-/// message still retained, so the listener must keep going. Treating it as
-/// fatal is what turned a moment of back-pressure into a permanent, silent
-/// outage: the loop ended, nothing restarted it, and `/health` stayed green.
-///
-/// `Closed` means every sender is gone and no further message can arrive.
-pub fn recv_action(err: &RecvError) -> RecvAction {
-    match err {
-        RecvError::Lagged(_) => RecvAction::Continue,
-        RecvError::Closed => RecvAction::Stop,
-    }
-}
 
 /// Control event kinds for push notification management
 const KIND_REGISTRATION: u16 = 3079;
@@ -423,74 +398,204 @@ impl NostrListener {
         service_pubkey: PublicKey,
         token: CancellationToken,
     ) -> Result<()> {
-        let mut notifications = self.state.nostr_client.notifications();
+        let notifications = self.state.nostr_client.notifications();
 
         info!("Processing live events...");
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => {
-                    info!("Cancellation received, shutting down");
-                    break;
-                }
+        run_live_loop(notifications, event_tx, service_pubkey, token).await;
 
-                res = notifications.recv() => {
-                    match res {
-                        Ok(notification) => {
-                            match notification {
-                                RelayPoolNotification::Event { event, .. } => {
-                                    if event.pubkey == service_pubkey {
-                                        debug!("Skipping event from service account");
-                                        continue;
+        Ok(())
+    }
+}
+
+/// Forward live relay notifications to the event handler until cancelled or
+/// until no further notification can arrive.
+///
+/// Split out of [`NostrListener::process_live_events`] so the loop can be
+/// driven directly in tests. Everything below depends only on the broadcast
+/// receiver, not on a connected relay pool, so a plain `broadcast::channel`
+/// exercises the same code the service runs.
+async fn run_live_loop(
+    mut notifications: broadcast::Receiver<RelayPoolNotification>,
+    event_tx: Sender<(Box<Event>, EventContext)>,
+    service_pubkey: PublicKey,
+    token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!("Cancellation received, shutting down");
+                break;
+            }
+
+            res = notifications.recv() => {
+                match res {
+                    Ok(notification) => {
+                        match notification {
+                            RelayPoolNotification::Event { event, .. } => {
+                                if event.pubkey == service_pubkey {
+                                    debug!("Skipping event from service account");
+                                    continue;
+                                }
+
+                                let event_id = event.id;
+                                let event_kind = event.kind;
+
+                                debug!(event_id = %event_id, kind = %event_kind, "Received live event");
+
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => {
+                                        info!("Cancelled while sending event");
+                                        break;
                                     }
-
-                                    let event_id = event.id;
-                                    let event_kind = event.kind;
-
-                                    debug!(event_id = %event_id, kind = %event_kind, "Received live event");
-
-                                    tokio::select! {
-                                        biased;
-                                        _ = token.cancelled() => {
-                                            info!("Cancelled while sending event");
+                                    send_res = event_tx.send((event, EventContext::Live)) => {
+                                        if let Err(e) = send_res {
+                                            error!("Failed to send live event: {}", e);
                                             break;
                                         }
-                                        send_res = event_tx.send((event, EventContext::Live)) => {
-                                            if let Err(e) = send_res {
-                                                error!("Failed to send live event: {}", e);
-                                                break;
-                                            }
-                                        }
                                     }
                                 }
-                                RelayPoolNotification::Message { relay_url, message } => {
-                                    debug!(%relay_url, ?message, "Received relay message");
-                                }
-                                RelayPoolNotification::Shutdown => {
-                                    info!("Received shutdown notification");
-                                    break;
-                                }
                             }
-                        }
-                        Err(e) => match recv_action(&e) {
-                            RecvAction::Continue => {
-                                warn!(
-                                    error = %e,
-                                    "Relay notification receiver lagged - dropped events, continuing"
-                                );
-                                continue;
+                            RelayPoolNotification::Message { relay_url, message } => {
+                                debug!(%relay_url, ?message, "Received relay message");
                             }
-                            RecvAction::Stop => {
-                                error!(error = %e, "Relay notification channel closed - stopping live listener");
+                            RelayPoolNotification::Shutdown => {
+                                info!("Received shutdown notification");
                                 break;
                             }
-                        },
+                        }
+                    }
+                    // `Lagged` means this subscriber fell behind a bounded
+                    // broadcast channel and some notifications were dropped;
+                    // the next `recv()` returns the oldest message still
+                    // retained, so the listener must keep going. Treating it
+                    // as fatal is what turned a moment of back-pressure into a
+                    // permanent, silent outage: the loop ended, nothing
+                    // restarted it, and `/health` stayed green.
+                    Err(RecvError::Lagged(dropped)) => {
+                        warn!(
+                            dropped,
+                            "Relay notification receiver lagged - dropped events, continuing"
+                        );
+                        continue;
+                    }
+                    // Every sender is gone; no further notification can arrive.
+                    Err(RecvError::Closed) => {
+                        error!("Relay notification channel closed - stopping live listener");
+                        break;
                     }
                 }
             }
         }
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    /// A test's patience for the loop making progress. Generous enough not to
+    /// flake on a loaded CI box, short enough to fail instead of hanging.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    fn live_event(keys: &Keys, content: &str) -> RelayPoolNotification {
+        RelayPoolNotification::Event {
+            relay_url: RelayUrl::parse("wss://relay.example").expect("valid relay url"),
+            subscription_id: SubscriptionId::new("test"),
+            event: Box::new(
+                EventBuilder::new(Kind::TextNote, content)
+                    .sign_with_keys(keys)
+                    .expect("sign test event"),
+            ),
+        }
+    }
+
+    /// Regression: a lagged receive must not end the live loop.
+    ///
+    /// Overflows the notification channel so the loop's very first `recv()`
+    /// returns `Lagged`, then asserts the notifications still retained behind
+    /// it are forwarded anyway. Before the fix the loop broke on that first
+    /// error and nothing restarted it, so every later push was lost while
+    /// `/health` kept returning 200.
+    #[tokio::test]
+    async fn a_lagged_receive_does_not_end_the_live_loop() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let keys = Keys::generate();
+
+        // Four notifications into a two-slot channel with nobody reading yet:
+        // the two oldest are evicted, so the receiver is now lagged by two.
+        for content in ["dropped-1", "dropped-2", "retained-1", "retained-2"] {
+            notify_tx.send(live_event(&keys, content)).expect("send");
+        }
+
+        let loop_handle = tokio::spawn(run_live_loop(
+            notify_rx,
+            event_tx,
+            Keys::generate().public_key(),
+            CancellationToken::new(),
+        ));
+
+        let first = timeout(PATIENCE, event_rx.recv())
+            .await
+            .expect("loop stalled after the lag")
+            .expect("loop stopped on the lag instead of continuing");
+        let second = timeout(PATIENCE, event_rx.recv())
+            .await
+            .expect("loop stalled after the first event")
+            .expect("loop stopped after one event");
+
+        assert_eq!(first.0.content, "retained-1");
+        assert_eq!(second.0.content, "retained-2");
+
+        // Dropping the last sender closes the channel, which *is* fatal - the
+        // loop must then finish rather than spin on the error forever.
+        drop(notify_tx);
+        timeout(PATIENCE, loop_handle)
+            .await
+            .expect("loop did not stop once the channel closed")
+            .expect("live loop panicked");
+    }
+
+    /// The other half of the same decision: `Closed` really is terminal, so
+    /// "keep going on any error" is not a valid way to fix the lag bug.
+    #[tokio::test]
+    async fn a_closed_channel_ends_the_live_loop() {
+        let (notify_tx, notify_rx) = broadcast::channel::<RelayPoolNotification>(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        drop(notify_tx);
+
+        timeout(
+            PATIENCE,
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("loop spun on a closed channel instead of stopping");
+    }
+
+    /// Cancellation still wins over a pending receive.
+    #[tokio::test]
+    async fn cancellation_ends_the_live_loop() {
+        let (_notify_tx, notify_rx) = broadcast::channel::<RelayPoolNotification>(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+        token.cancel();
+
+        timeout(
+            PATIENCE,
+            run_live_loop(notify_rx, event_tx, Keys::generate().public_key(), token),
+        )
+        .await
+        .expect("loop ignored cancellation");
     }
 }
