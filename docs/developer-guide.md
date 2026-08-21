@@ -172,13 +172,19 @@ GET /health
 ```json
 {
   "status": "ok",
-  "pubkey": "abc123..."
+  "pubkey": "abc123...",
+  "tasks": { "nostr_listener": true, "event_handler": true }
 }
 ```
 
 Clients use this pubkey to:
 - Set the `p` tag on Kind 3079/3080/3083 events
 - Encrypt the NIP-44 content to the service's key
+
+The same endpoint is both Kubernetes probes. It returns `503` with
+`"status": "degraded"` when the Nostr listener or the event handler has died,
+so a pod that can no longer deliver is restarted instead of staying in service.
+The `pubkey` field is present either way.
 
 ## Deduplication
 

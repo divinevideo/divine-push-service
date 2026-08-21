@@ -68,7 +68,7 @@ Each FCM message carries a stable `data` payload with routing and presentation f
 4. For each match it checks dedup and the recipient's preferences, then sends a data message to Firebase FCM.
 5. Firebase delivers the notification to the device.
 
-The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
+The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks. Those tasks are supervised: if one ends unexpectedly, the others are cancelled and the process exits non-zero, so a pod whose delivery pipeline has died is restarted instead of staying in service. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
 
 ## Getting started
 
@@ -158,7 +158,22 @@ The container is a multi-stage build on `debian:bookworm-slim` that bundles the 
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Health check. Returns `{ "status": "ok", "pubkey": "<hex>" }`; clients read `pubkey` to discover the service key for registration and encryption. |
+| `GET /health` | Health check and service-key discovery. Clients read `pubkey` to discover the service key for registration and encryption. |
+
+`/health` answers `200` while the delivery pipeline is alive:
+
+```json
+{
+  "status": "ok",
+  "pubkey": "<hex>",
+  "tasks": { "nostr_listener": true, "event_handler": true }
+}
+```
+
+If the Nostr listener or the event handler has died it answers `503` with
+`"status": "degraded"` and that task set to `false`. Both the liveness and the
+readiness probe point here, so a dead pipeline fails its probes rather than
+serving `200` behind a healthy-looking pod.
 
 ## License
 
