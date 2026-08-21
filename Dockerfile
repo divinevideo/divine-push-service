@@ -1,9 +1,6 @@
 # Stage 1: Build the application
 FROM rust:1.85.1 as builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 # Copy manifests and lock file
@@ -24,8 +21,9 @@ RUN touch src/main.rs && cargo build --release --bin divine_push_service
 # Stage 2: Create the final lean image
 FROM debian:bookworm-slim
 
-# Install runtime dependencies (use libssl3 for bookworm)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+# TLS is rustls throughout (reqwest, redis), so no OpenSSL runtime is needed.
+# ca-certificates still supplies the trust roots.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app

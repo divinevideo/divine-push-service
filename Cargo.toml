@@ -54,14 +54,13 @@ futures-util = "0.3"
 
 # --- Firebase Cloud Messaging (FCM) ---
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-firebase-messaging-rs = { git = "https://github.com/i10416/firebase-messaging-rs.git", branch = "main", features = ["fcm", "native-tls"] }
-# Downgrade tokio-util due to conflict with firebase-messaging-rs
-# TaskTracker requires >= 0.7, so we revert to SimpleTaskTracker in main.rs
-tokio-util = "0.6.10" # Remove features entirely
+gcp_auth = "0.12"
+tokio-util = "0.7"
 
 # Dev dependencies for integration tests
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` gives paused-clock tests, so timeout coverage costs no wall time.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 anyhow = "1.0"
 futures = "0.3"
 portpicker = "0.1"
@@ -73,5 +72,7 @@ url = "2.5"
 # Add nostr-relay-builder back
 nostr-relay-builder = { version = "0.44", package = "nostr-relay-builder" }
 divine_push_service = { path = "." }
+# `ServiceExt::oneshot`, for driving the health router in tests without binding a port.
+tower = { version = "0.5", features = ["util"] }
 # serial_test = "3.2.0" # Removed - tests now run in parallel with isolated Redis databases
 # testcontainers = "0.20.0" # Removed

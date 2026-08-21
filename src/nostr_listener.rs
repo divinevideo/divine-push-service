@@ -25,6 +25,12 @@ const KIND_PREFERENCES_UPDATE: u16 = 3083;
 /// NIP-51 people list carrying new-post ("bell") subscriptions.
 const KIND_NOTIFY_LIST: u16 = 30000;
 
+/// How long to wait for the initial relay connection before treating startup as
+/// failed. A listener exit now stops the process, so this must be long enough to
+/// absorb a slow handshake and short enough that a genuinely unreachable relay
+/// surfaces as a restart rather than a hang.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Build the notify-list filter for the historical rebuild.
 ///
 /// This must be a *separate* filter from the main kinds filter: an identifier
@@ -123,12 +129,27 @@ impl NostrListener {
             .nostr_client
             .add_relay(relay_url.as_str())
             .await?;
+
+        // `connect` only spawns a background connection task per relay; it does
+        // not wait for the handshake. Checking `is_connected` straight after
+        // races the connection and reports failure on a perfectly healthy relay
+        // — which, now that a listener exit takes the process down, would be a
+        // startup crash loop. Wait for the connection before judging it.
+        //
+        // Deliberately not `try_connect`: that skips the background task, so a
+        // relay that drops later would never reconnect. The production logs are
+        // full of routine reconnects, so that task must exist.
         self.state.nostr_client.connect().await;
+        self.state
+            .nostr_client
+            .wait_for_connection(RELAY_CONNECT_TIMEOUT)
+            .await;
 
         if !self.is_connected().await {
-            return Err(ServiceError::Internal(
-                "Failed to connect to Nostr relay".to_string(),
-            ));
+            return Err(ServiceError::Internal(format!(
+                "Failed to connect to Nostr relay within {:?}",
+                RELAY_CONNECT_TIMEOUT
+            )));
         }
 
         info!("Successfully connected to Nostr relay");

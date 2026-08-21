@@ -60,12 +60,14 @@ impl AppState {
             );
         }
 
-        let fcm_client = FcmClient::new(&app_config.firebase.project_id).map_err(|e| {
-            ServiceError::Internal(format!(
-                "Failed to initialize FCM client for {}: {}",
-                app_config.name, e
-            ))
-        })?;
+        let fcm_client = FcmClient::new(&app_config.firebase.project_id)
+            .await
+            .map_err(|e| {
+                ServiceError::Internal(format!(
+                    "Failed to initialize FCM client for {}: {}",
+                    app_config.name, e
+                ))
+            })?;
 
         info!(
             "Initialized FCM client for '{}' with project '{}'",

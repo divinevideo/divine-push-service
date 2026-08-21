@@ -1,13 +1,19 @@
 //! Regression test: a panicking FCM send must not abort the whole batch.
 //!
-//! `send_batch` runs on the event-handler task, which `main` spawns once and
-//! never supervises, and the resulting `JoinError` is discarded. So a single
-//! panicking send stopped ALL notification delivery for the life of the
-//! process while `/health` kept returning 200 OK.
+//! `send_batch` runs on the event-handler task. While that task was
+//! unsupervised and its `JoinError` discarded, one panicking send stopped ALL
+//! notification delivery for the life of the process while `/health` kept
+//! returning 200 OK.
 //!
-//! This is not hypothetical: `firebase-messaging-rs` reads the `Retry-After`
-//! header on every FCM 5xx via `HeaderName::from_static("Retry-After")`, and
-//! `http`'s `from_static` panics on uppercase bytes.
+//! Both halves of that outage are fixed outside this file: the panic itself
+//! came from `firebase-messaging-rs`, which read the `Retry-After` header on
+//! every FCM 5xx via `HeaderName::from_static("Retry-After")` while `http`'s
+//! `from_static` panics on uppercase bytes, and that dependency is gone; and
+//! `TaskTracker` now takes the process down when a critical task dies.
+//!
+//! What this test still guards is the layer between them: `send_batch` must
+//! contain a panic from *any* `FcmSend` implementation rather than let it
+//! unwind into the caller and take the siblings with it.
 
 use async_trait::async_trait;
 use divine_push_service::fcm_sender::{FcmClient, FcmError, FcmSend};
