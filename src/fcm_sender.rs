@@ -19,6 +19,7 @@ use tracing;
 
 const FCM_BATCH_CONCURRENCY: usize = 100;
 
+/// Return a log-safe prefix without splitting a multibyte character.
 pub(crate) fn token_prefix(token: &str) -> String {
     token.chars().take(8).collect()
 }

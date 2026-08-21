@@ -34,6 +34,12 @@ impl FcmSend for PanickingFcmSender {
 
 #[tokio::test]
 async fn a_panicking_send_is_contained_and_does_not_abort_the_batch() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
     let client = FcmClient::new_with_impl(Box::new(PanickingFcmSender {
         panic_on: "1234567é-bad".to_string(),
     }));
