@@ -9,6 +9,7 @@ use crate::{
     state::AppState,
 };
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -19,6 +20,47 @@ use tracing::{debug, error, info, warn};
 const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
+
+/// NIP-51 people list carrying new-post ("bell") subscriptions.
+const KIND_NOTIFY_LIST: u16 = 30000;
+
+/// Build the notify-list filter for the historical rebuild.
+///
+/// This must be a *separate* filter from the main kinds filter: an identifier
+/// constraint there would wrongly apply to every kind in the list. Subscribing
+/// to all of kind 30000 without the `#d` narrowing would pull every people list
+/// on the relay.
+///
+/// Deliberately unbounded by `since`. A notify list is replaceable, so one
+/// published months ago and never touched since is still current. Historical
+/// rebuild pages backward with `until` instead of trusting one relay-limited
+/// fetch to contain every current list.
+fn notify_list_history_filter(limit: usize, until: Option<Timestamp>) -> Filter {
+    let filter = Filter::new()
+        .kind(Kind::from(KIND_NOTIFY_LIST))
+        .identifier(crate::event_handler::NOTIFY_LIST_D_TAG)
+        .limit(limit);
+    match until {
+        Some(until) => filter.until(until),
+        None => filter,
+    }
+}
+
+/// Build the notify-list filter for the live subscription.
+///
+/// Unlike the historical query this is bounded in time and carries no `limit`.
+/// Per NIP-01 a filter's `limit` applies to the initial stored-event query, so
+/// reusing the history filter here makes every subscribe — including the
+/// automatic resubscribe after a relay reconnect — replay up to `limit` stored
+/// lists that the historical pass already applied. The `since` window mirrors
+/// the main live filter and covers the gap between the historical fetch and the
+/// subscription taking effect.
+fn notify_list_live_filter(since: Timestamp) -> Filter {
+    Filter::new()
+        .kind(Kind::from(KIND_NOTIFY_LIST))
+        .identifier(crate::event_handler::NOTIFY_LIST_D_TAG)
+        .since(since)
+}
 
 pub struct NostrListener {
     state: Arc<AppState>,
@@ -157,6 +199,109 @@ impl NostrListener {
             }
         }
 
+        self.process_historical_notify_lists(event_tx, service_pubkey, token)
+            .await
+    }
+
+    /// Replay notify lists from history.
+    ///
+    /// Mandatory, not an optimization: the reverse index lives only in Redis, so
+    /// without this a restart against a fresh Redis silently drops every bell
+    /// until each user happens to republish their list.
+    async fn process_historical_notify_lists(
+        &self,
+        event_tx: &Sender<(Box<Event>, EventContext)>,
+        service_pubkey: &PublicKey,
+        token: &CancellationToken,
+    ) -> Result<()> {
+        let limit = self.state.settings.service.notify_list_history_limit;
+        let mut until = None;
+        let mut seen = HashSet::new();
+        let mut total = 0usize;
+
+        info!(limit, "Querying historical notify lists...");
+
+        loop {
+            let filter = notify_list_history_filter(limit, until);
+
+            let lists = tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    info!("Cancelled before historical notify-list query");
+                    return Ok(());
+                }
+                fetch_result = self.state.nostr_client.fetch_events(filter, Duration::from_secs(60)) => {
+                    match fetch_result {
+                        Ok(lists) => lists,
+                        Err(e) => {
+                            error!("Failed to query historical notify lists: {}", e);
+                            warn!("Proceeding with partial historical notify-list replay - existing bells may not deliver until republished");
+                            break;
+                        }
+                    }
+                }
+            };
+
+            let count = lists.len();
+            if count == 0 {
+                break;
+            }
+            info!(count, total, until = ?until, "Processing historical notify-list page...");
+
+            let mut oldest = None;
+            let mut new_count = 0usize;
+            for event in lists {
+                oldest = match oldest {
+                    Some(current) if current <= event.created_at => Some(current),
+                    _ => Some(event.created_at),
+                };
+
+                if !seen.insert(event.id) {
+                    continue;
+                }
+                new_count += 1;
+                total += 1;
+
+                if event.pubkey == *service_pubkey {
+                    continue;
+                }
+
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        info!("Cancelled during historical notify-list processing");
+                        return Ok(());
+                    }
+                    send_res = event_tx.send((Box::new(event), EventContext::Historical)) => {
+                        if let Err(e) = send_res {
+                            error!("Failed to send historical notify list: {}", e);
+                            return Err(ServiceError::Internal(
+                                "Event handler channel closed".to_string()
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if count < limit {
+                break;
+            }
+
+            if new_count == 0 {
+                warn!(
+                    count,
+                    limit,
+                    until = ?until,
+                    "Historical notify-list pagination made no progress; some subscriptions may be missing"
+                );
+                break;
+            }
+
+            until = oldest;
+        }
+
+        info!(count = total, "Finished processing historical notify lists");
+
         Ok(())
     }
 
@@ -208,6 +353,35 @@ impl NostrListener {
                     }
                     Err(e) => {
                         error!("Failed to subscribe to notification kinds: {}", e);
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        // Notify lists need their own subscription: `subscribe` takes one filter
+        // per call, and the `#d` narrowing cannot be merged into the kinds
+        // filter above without wrongly constraining every other kind.
+        let notify_filter = notify_list_live_filter(since);
+
+        info!(
+            "Subscribing to notify lists (kind {KIND_NOTIFY_LIST}, d={})",
+            crate::event_handler::NOTIFY_LIST_D_TAG
+        );
+
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!("Cancelled before notify-list subscription");
+                return Ok(());
+            }
+            sub_result = self.state.nostr_client.subscribe(notify_filter, None) => {
+                match sub_result {
+                    Ok(_output) => {
+                        info!("Successfully subscribed to notify lists");
+                    }
+                    Err(e) => {
+                        error!("Failed to subscribe to notify lists: {}", e);
                         return Err(e.into());
                     }
                 }

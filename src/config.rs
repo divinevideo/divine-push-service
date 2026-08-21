@@ -41,6 +41,11 @@ pub struct NostrSettings {
     pub profile_relays: Vec<String>,
     #[serde(default = "default_profile_cache_ttl")]
     pub profile_cache_ttl_secs: u64,
+    /// Currently inert: no code reads this. The profile fetch that an operator
+    /// would reach for it to bound is hard-coded to five seconds in
+    /// `MentionParser::fetch_from_relays`. Left in place rather than removed
+    /// because deleting it would break existing config files, but do not expect
+    /// changing it to affect anything.
     #[serde(default = "default_query_timeout")]
     pub query_timeout_secs: u64,
 }
@@ -63,6 +68,32 @@ pub struct ServiceSettings {
     /// Retention for successful per-recipient video-coordinate deliveries.
     #[serde(default = "default_video_coordinate_dedup_ttl")]
     pub video_coordinate_dedup_ttl_secs: u64,
+    /// Minimum gap between new-post pushes for one (subscriber, creator) pair.
+    #[serde(default = "default_new_post_rate_limit")]
+    pub new_post_rate_limit_secs: u64,
+    /// Cap on creators honored from a single notify list.
+    ///
+    /// `replace_notify_subscriptions` applies the whole diff in one Lua script
+    /// and Redis is single-threaded, so an unbounded list would let one user
+    /// stall the instance for everyone.
+    #[serde(default = "default_notify_list_max_creators")]
+    pub notify_list_max_creators: usize,
+    /// Page size for notify lists pulled during historical replay.
+    ///
+    /// The historical notify-list query is deliberately unbounded in time, so
+    /// this is the safety valve on result size instead.
+    #[serde(default = "default_notify_list_history_limit")]
+    pub notify_list_history_limit: usize,
+    /// Watcher page size for one video event.
+    ///
+    /// New-post recipients are follower-count-shaped, not p-tag-shaped. Paging
+    /// keeps Redis reads and delivery batches bounded without dropping bell
+    /// subscribers past an arbitrary cap.
+    #[serde(default = "default_new_post_fanout_page_size")]
+    pub new_post_fanout_page_size: usize,
+    /// Maximum concurrent new-post deliveries for one watcher page.
+    #[serde(default = "default_new_post_delivery_concurrency")]
+    pub new_post_delivery_concurrency: usize,
     /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
@@ -75,6 +106,31 @@ fn default_process_window_days() -> i64 {
 
 fn default_processed_event_ttl() -> u64 {
     604800 // 7 days
+}
+
+fn default_notify_list_max_creators() -> usize {
+    // The bell is follow-gated on the client, so this is well above any
+    // legitimate list while still bounding the Lua script's work.
+    1000
+}
+
+fn default_notify_list_history_limit() -> usize {
+    5000
+}
+
+fn default_new_post_fanout_page_size() -> usize {
+    1000
+}
+
+fn default_new_post_delivery_concurrency() -> usize {
+    50
+}
+
+fn default_new_post_rate_limit() -> u64 {
+    // Vines are cheap to make. An unthrottled prolific creator trains users to
+    // disable notifications entirely, so cap new-post pushes at one per hour
+    // per creator. The in-app feed is deliberately not throttled.
+    3600
 }
 
 fn default_video_coordinate_dedup_ttl() -> u64 {
@@ -186,6 +242,7 @@ fn default_preference_kinds() -> Vec<u16> {
         7,     // Reactions/likes
         16,    // Reposts
         30023, // Long-form content
+        34236, // Videos from subscribed creators (new-post "bells")
     ]
 }
 
@@ -226,7 +283,79 @@ impl Settings {
             )
             .build()?;
 
-        s.try_deserialize()
+        let settings: Settings = s.try_deserialize()?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// Reject values that deserialize cleanly but cannot work at runtime.
+    ///
+    /// Every field here is a bound the service writes to Redis, counts against,
+    /// or uses to size bounded fan-out work, and every one of them fails
+    /// *quietly* at zero. Redis rejects an expiry of 0, but nothing downstream
+    /// treats that rejection as fatal, so the throttle simply never engages,
+    /// the cache never caches, the claim never lands. The caps and page sizes
+    /// are worse still: they are read as "nothing allowed" and take a
+    /// subscriber's bells with them. A startup error is the only place an
+    /// operator would find out.
+    ///
+    /// This is reachable without editing `settings.yaml`. The config crate
+    /// layers `NOSTR_PUSH__*` over the file, and production already sets
+    /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
+    /// reaches every field below.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let must_be_positive: [(&str, u64, &str); 8] = [
+            (
+                "nostr.profile_cache_ttl_secs",
+                self.nostr.profile_cache_ttl_secs,
+                "cache writes fail silently, so every event refetches profiles from the relays",
+            ),
+            (
+                "service.processed_event_ttl_secs",
+                self.service.processed_event_ttl_secs,
+                "the event claim errors, so no claimed event is ever processed",
+            ),
+            (
+                "service.video_coordinate_dedup_ttl_secs",
+                self.service.video_coordinate_dedup_ttl_secs,
+                "no delivery is recorded, so every video edit re-notifies",
+            ),
+            (
+                "service.new_post_rate_limit_secs",
+                self.service.new_post_rate_limit_secs,
+                "the window never opens, so new-post pushes are never throttled",
+            ),
+            (
+                "service.notify_list_max_creators",
+                self.service.notify_list_max_creators as u64,
+                "every notify list reads as empty, clearing that subscriber's bells",
+            ),
+            (
+                "service.notify_list_history_limit",
+                self.service.notify_list_history_limit as u64,
+                "the startup replay fetches nothing",
+            ),
+            (
+                "service.new_post_fanout_page_size",
+                self.service.new_post_fanout_page_size as u64,
+                "new-post fan-out never reads bell subscribers",
+            ),
+            (
+                "service.new_post_delivery_concurrency",
+                self.service.new_post_delivery_concurrency as u64,
+                "new-post fan-out cannot start delivery work",
+            ),
+        ];
+
+        for (name, value, consequence) in must_be_positive {
+            if value == 0 {
+                return Err(ConfigError::Message(format!(
+                    "{name} must be greater than zero: at 0, {consequence}"
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Get service keys for relay auth and NIP-44 encryption
@@ -289,6 +418,65 @@ mod tests {
     }
 
     #[test]
+    fn test_shipped_config_passes_validation() {
+        // `load_runtime_settings` deserializes without validating, so this is
+        // the only thing asserting the files we actually ship would boot.
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            assert!(
+                load_runtime_settings(filename).validate().is_ok(),
+                "{filename} must load"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_degenerate_zero_is_rejected_at_load() {
+        /// A field name and the setter that zeroes it.
+        type ZeroCase = (&'static str, fn(&mut Settings));
+
+        // One case per field, because a loop over the same setter would pass
+        // just as well against a `validate` that only checks the first.
+        let cases: [ZeroCase; 8] = [
+            ("nostr.profile_cache_ttl_secs", |s| {
+                s.nostr.profile_cache_ttl_secs = 0
+            }),
+            ("service.processed_event_ttl_secs", |s| {
+                s.service.processed_event_ttl_secs = 0
+            }),
+            ("service.video_coordinate_dedup_ttl_secs", |s| {
+                s.service.video_coordinate_dedup_ttl_secs = 0
+            }),
+            ("service.new_post_rate_limit_secs", |s| {
+                s.service.new_post_rate_limit_secs = 0
+            }),
+            ("service.notify_list_max_creators", |s| {
+                s.service.notify_list_max_creators = 0
+            }),
+            ("service.notify_list_history_limit", |s| {
+                s.service.notify_list_history_limit = 0
+            }),
+            ("service.new_post_fanout_page_size", |s| {
+                s.service.new_post_fanout_page_size = 0
+            }),
+            ("service.new_post_delivery_concurrency", |s| {
+                s.service.new_post_delivery_concurrency = 0
+            }),
+        ];
+
+        for (field, zero_it) in cases {
+            let mut settings = load_runtime_settings("settings.yaml");
+            zero_it(&mut settings);
+            let error = settings
+                .validate()
+                .expect_err(&format!("{field} at zero must be rejected"));
+            assert!(
+                error.to_string().contains(field),
+                "the error must name the field an operator has to fix, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_video_coordinate_dedup_ttl_is_long_lived() {
         for filename in ["settings.yaml", "settings.development.yaml"] {
             let settings = load_runtime_settings(filename);
@@ -300,6 +488,19 @@ mod tests {
                 settings.service.video_coordinate_dedup_ttl_secs
                     > settings.service.processed_event_ttl_secs,
                 "video-coordinate delivery records must outlive event-id claims"
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_post_fanout_limits_are_bounded() {
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            let settings = load_runtime_settings(filename);
+            assert!(settings.service.new_post_fanout_page_size > 0);
+            assert!(settings.service.new_post_delivery_concurrency > 0);
+            assert!(
+                settings.service.new_post_delivery_concurrency
+                    <= settings.service.new_post_fanout_page_size
             );
         }
     }

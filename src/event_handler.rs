@@ -14,7 +14,9 @@ use crate::{
     redis_store,
     state::AppState,
 };
+use futures_util::{stream, StreamExt};
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -36,8 +38,61 @@ const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
 const KIND_VIDEO: u16 = 34236;
 
+/// NIP-51 people list carrying new-post ("bell") subscriptions.
+const KIND_NOTIFY_LIST: u16 = 30000;
+
+/// Reserved `d` tag identifying a notify list among the user's kind 30000 lists.
+pub const NOTIFY_LIST_D_TAG: &str = "notify";
+
 // Replay horizon: ignore events older than this
 const REPLAY_HORIZON_DAYS: u64 = 7;
+
+/// Whether this event is a notify list, which is exempt from the replay horizon.
+///
+/// Notify lists are replaceable: a list published three months ago and never
+/// touched since is still the user's current subscription set. Aging one out
+/// would silently drop every bell on it until the user happened to republish.
+///
+/// Checks the `d` tag as well as the kind, for the same reason
+/// `handle_notify_list_update` does: the relay-side `#d` filter should already
+/// guarantee it, but a buggy or hostile relay can send any kind 30000 it likes,
+/// and the exemption should cover exactly the events it exists for.
+pub fn is_notify_list(event: &Event) -> bool {
+    event.kind.as_u16() == KIND_NOTIFY_LIST && event.tags.identifier() == Some(NOTIFY_LIST_D_TAG)
+}
+
+/// Whether the handler loop should drop this event as beyond the replay horizon.
+///
+/// Extracted from `run()` so the exemption is covered by a test. Getting this
+/// composition wrong is silent: bells set more than `REPLAY_HORIZON_DAYS` ago
+/// simply never rebuild, and nothing logs an error.
+pub fn is_beyond_replay_horizon(event: &Event) -> bool {
+    is_event_too_old(event) && !is_notify_list(event)
+}
+
+/// Whether the handler loop should claim this event before routing it.
+///
+/// The claim exists to stop two replicas sending the same push twice, and for
+/// every handler that sends a push it is the only thing standing between a
+/// duplicate and the user. Notify lists send nothing. They build persistent
+/// state through `replace_notify_subscriptions`, a single atomic Lua script that
+/// already rejects any list not strictly newer than the stored one, so
+/// concurrent replicas applying the same list are a no-op with or without the
+/// claim.
+///
+/// Meanwhile the claim is taken *before* routing and never released, so a
+/// transient Redis error inside the handler leaves it standing: the historical
+/// replay on the next restart skips the event as already-claimed, and that
+/// subscriber's bells stay dark until `processed_event_ttl_secs` expires, seven
+/// days by default. So the claim trades an outage of a user's subscriptions for
+/// deduplication the Lua script performs anyway.
+///
+/// Scoped by `is_notify_list` rather than kind alone, symmetric with
+/// `is_beyond_replay_horizon`: the idempotency argument rests on the Lua script,
+/// which only runs for `d=notify`.
+pub fn requires_event_claim(event: &Event) -> bool {
+    !is_notify_list(event)
+}
 
 /// Check if event is targeted to this service via p tag
 fn is_event_for_service(event: &Event, service_pubkey: &PublicKey) -> bool {
@@ -89,37 +144,45 @@ pub async fn run(
 
                 debug!(event_id = %event_id, kind = %event_kind, pubkey = %pubkey, context = ?context, "Event handler received event");
 
-                // Check replay horizon - ignore events that are too old
-                if is_event_too_old(&event) {
+                // Check replay horizon - ignore events that are too old.
+                // Notify lists are exempt: they are replaceable subscription
+                // state, not a timely trigger, so age says nothing about
+                // whether they are current.
+                if is_beyond_replay_horizon(&event) {
                     debug!(event_id = %event_id, created_at = %event.created_at, "Ignoring old event beyond replay horizon");
                     continue;
                 }
 
-                // Atomically claim the event to prevent duplicate processing across replicas
-                let claimed = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => {
-                        info!("Event handler cancelled while claiming event {}.", event_id);
-                        break;
-                    }
-                    claim_result = redis_store::try_claim_event(
-                        &state.redis_pool,
-                        &event_id,
-                        state.settings.service.processed_event_ttl_secs,
-                    ) => {
-                        match claim_result {
-                            Ok(claimed) => claimed,
-                            Err(e) => {
-                                error!(event_id = %event_id, error = %e, "Failed to claim event");
-                                continue;
+                // Atomically claim the event to prevent duplicate processing across
+                // replicas. Notify lists are exempt: the claim prevents nothing for
+                // them and turns a transient Redis error into days of lost
+                // subscriptions. See `requires_event_claim`.
+                if requires_event_claim(&event) {
+                    let claimed = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            info!("Event handler cancelled while claiming event {}.", event_id);
+                            break;
+                        }
+                        claim_result = redis_store::try_claim_event(
+                            &state.redis_pool,
+                            &event_id,
+                            state.settings.service.processed_event_ttl_secs,
+                        ) => {
+                            match claim_result {
+                                Ok(claimed) => claimed,
+                                Err(e) => {
+                                    error!(event_id = %event_id, error = %e, "Failed to claim event");
+                                    continue;
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
-                if !claimed {
-                    trace!(event_id = %event_id, "Skipping already claimed event");
-                    continue;
+                    if !claimed {
+                        trace!(event_id = %event_id, "Skipping already claimed event");
+                        continue;
+                    }
                 }
 
                 // Route the event based on its type
@@ -156,6 +219,15 @@ async fn route_event(
     let event_kind = event.kind;
     let event_id = event.id;
     let kind_num = event_kind.as_u16();
+
+    // Notify lists are addressed to the world, not to this service, so they are
+    // routed before the control-event block and deliberately outside its p-tag
+    // gate. They are also processed in both the historical and live paths: the
+    // reverse index must be rebuilt from history or a restart drops every
+    // subscription until each user happens to republish.
+    if kind_num == KIND_NOTIFY_LIST {
+        return handle_notify_list_update(state, event).await;
+    }
 
     // Check for push notification management events (3079/3080/3083)
     let is_control_event = kind_num == KIND_REGISTRATION
@@ -369,6 +441,102 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
     Ok(())
 }
 
+/// Extract the subscribed creators from a notify list, deduplicated.
+///
+/// Drops self-references (belling yourself is meaningless) and unparseable `p`
+/// tags, preserving the client's tag order otherwise.
+///
+/// Bounded at `max_creators`. `replace_notify_subscriptions` applies the whole
+/// diff in a single Lua script and Redis is single-threaded, so an unbounded
+/// list would let one user with an absurd number of bells stall the instance for
+/// everyone. Truncating rather than rejecting degrades gracefully: the excess
+/// bells simply do not deliver, instead of the user losing all of them. `p` tags
+/// are ordered by the client, so which ones survive is deterministic and under
+/// the client's control.
+fn collect_notify_creators(event: &Event, max_creators: usize) -> Vec<PublicKey> {
+    let mut creators: Vec<PublicKey> = Vec::new();
+
+    for tag in event.tags.iter().filter(|t| t.kind() == TagKind::p()) {
+        let Some(pubkey) = tag.content().and_then(|c| PublicKey::from_str(c).ok()) else {
+            continue;
+        };
+        if pubkey == event.pubkey {
+            continue;
+        }
+        if creators.contains(&pubkey) {
+            continue;
+        }
+        if creators.len() == max_creators {
+            warn!(
+                event_id = %event.id,
+                pubkey = %event.pubkey,
+                max_creators,
+                "Notify list exceeds the creator cap; ignoring the remainder"
+            );
+            break;
+        }
+        creators.push(pubkey);
+    }
+
+    creators
+}
+
+/// Handle a notify-list update (kind 30000, `d=notify`).
+///
+/// Rebuilds this subscriber's slice of the reverse index from the replacement
+/// list. The list is public and unencrypted by design — the service has to be
+/// able to read it — so there is no decryption step here, unlike the control
+/// events above.
+async fn handle_notify_list_update(state: &AppState, event: &Event) -> Result<()> {
+    assert!(event.kind.as_u16() == KIND_NOTIFY_LIST);
+
+    // Defense in depth. The relay-side `#d` filter should already guarantee
+    // this, but a buggy or hostile relay can send any kind 30000 it likes, and
+    // applying someone's unrelated people list as their bell list would be
+    // both wrong and destructive.
+    let d_tag = event.tags.identifier();
+    if d_tag != Some(NOTIFY_LIST_D_TAG) {
+        debug!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            d_tag = ?d_tag,
+            "Ignoring kind 30000 list without the reserved notify d tag"
+        );
+        return Ok(());
+    }
+
+    let creators = collect_notify_creators(event, state.settings.service.notify_list_max_creators);
+
+    // An empty list is legitimate: the user unbelled everyone. It must clear
+    // the index rather than be treated as malformed and skipped.
+    let applied = redis_store::replace_notify_subscriptions(
+        &state.redis_pool,
+        &event.pubkey,
+        &creators,
+        event.created_at.as_secs(),
+        &event.id,
+    )
+    .await?;
+
+    if applied {
+        info!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            creator_count = creators.len(),
+            "Applied notify list update"
+        );
+    } else {
+        debug!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            created_at = %event.created_at,
+            "Ignoring notify list update older than the applied one"
+        );
+    }
+
+    Ok(())
+}
+
 /// Handle content events that may trigger notifications
 async fn handle_content_event(
     state: &AppState,
@@ -381,10 +549,9 @@ async fn handle_content_event(
     // Determine notification type and find recipients based on event kind
     let kind_num = event_kind.as_u16();
 
-    let (notification_type, recipients) = if kind_num == 7 {
+    let targets = if kind_num == 7 {
         // Kind 7: Reaction/Like - notify the author of the liked event
-        let recipients = find_reaction_recipients(event);
-        (NotificationType::Like, recipients)
+        targets_of(NotificationType::Like, find_reaction_recipients(event))
     } else if kind_num == 1 {
         // Kind 1: Text note - could be a comment or mention
         let recipients = find_text_note_recipients(event);
@@ -395,14 +562,13 @@ async fn handle_content_event(
         } else {
             NotificationType::Mention
         };
-        (notification_type, recipients)
+        targets_of(notification_type, recipients)
     } else if kind_num == 1111 {
         // Kind 1111: NIP-22 comment (diVine publishes video comments here, not
         // as kind 1). Notify the root author (uppercase `P`, the video owner)
         // and the direct parent author (lowercase `p`). create_fcm_payload
         // attaches the authoritative root-video target from the uppercase `A`.
-        let recipients = find_comment_recipients(event);
-        (NotificationType::Comment, recipients)
+        targets_of(NotificationType::Comment, find_comment_recipients(event))
     } else if kind_num == 3 {
         // Kind 3: Contact list - notify newly followed users
         // Note: This would require tracking previous contact list state
@@ -411,50 +577,80 @@ async fn handle_content_event(
         return Ok(());
     } else if kind_num == 16 {
         // Kind 16: Repost - notify the author of the reposted event
-        let recipients = find_repost_recipients(event);
-        (NotificationType::Repost, recipients)
+        targets_of(NotificationType::Repost, find_repost_recipients(event))
     } else if kind_num == 30023 {
         // Kind 30023: Long-form content - check for mentions
-        let recipients = find_mentioned_pubkeys(event);
-        (NotificationType::Mention, recipients)
+        targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
     } else if kind_num == KIND_VIDEO {
-        video_notification(event)
+        return handle_video_content_event(state, event, token).await;
     } else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
     };
 
-    if recipients.is_empty() {
+    // Drop self-targets before anything downstream reads the list. Several of
+    // the `find_*` helpers return the author when an event `p`-tags its own
+    // sender, and the send loop used to skip those one at a time — which was
+    // free while the payload was built per recipient, but now sits after the
+    // event-scoped copy has been resolved. Filtering here keeps a self-only
+    // event from paying for a profile lookup it can never use, and makes the
+    // count and per-type breakdown logged below describe real deliveries.
+    let targets = deliverable_targets(targets, &event.pubkey);
+
+    if targets.is_empty() {
         debug!(event_id = %event_id, kind = %event_kind, "No recipients found for event");
         return Ok(());
+    }
+
+    // A single event can now yield more than one notification type, so the log
+    // carries the per-type breakdown rather than one type for the whole event.
+    // A bare count would leave the type most likely to need operational
+    // attention -- NewPost, with its fan-out and rate limiting -- invisible.
+    let mut type_counts: Vec<(&str, usize)> = Vec::new();
+    for target in &targets {
+        let name = target.notification_type.display_name();
+        match type_counts.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => type_counts.push((name, 1)),
+        }
     }
 
     info!(
         event_id = %event_id,
         kind = %event_kind,
-        notification_type = ?notification_type,
-        recipient_count = recipients.len(),
+        recipient_count = targets.len(),
+        notification_types = ?type_counts,
         "Processing notification event"
     );
 
-    // Send notifications to each recipient
-    for recipient_pubkey in recipients {
+    // The recipient-independent copy resolves at most once for the event, and
+    // only if some recipient survives the gates in `send_notification_to_user`.
+    let copy = LazyEventCopy::for_targets(&targets);
+
+    send_notifications_sequential(state, event, targets, &copy, token).await
+}
+
+async fn send_notifications_sequential(
+    state: &AppState,
+    event: &Event,
+    targets: Vec<NotificationTarget>,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+) -> Result<()> {
+    for target in targets {
         if token.is_cancelled() {
-            info!(event_id = %event_id, "Notification sending cancelled");
+            info!(event_id = %event.id, "Notification sending cancelled");
             return Err(crate::error::ServiceError::Cancelled);
         }
 
-        // Skip if recipient is the sender
-        if recipient_pubkey == event.pubkey {
-            trace!(event_id = %event_id, "Skipping notification to sender");
-            continue;
-        }
+        let recipient_pubkey = target.recipient;
 
         if let Err(e) = send_notification_to_user(
             state,
             event,
             &recipient_pubkey,
-            notification_type,
+            target.notification_type,
+            copy,
             token.clone(),
         )
         .await
@@ -463,12 +659,201 @@ async fn handle_content_event(
                 return Err(e);
             }
             error!(
-                event_id = %event_id,
+                event_id = %event.id,
                 recipient = %recipient_pubkey,
                 error = %e,
                 "Failed to send notification"
             );
         }
+    }
+
+    Ok(())
+}
+
+async fn send_notifications_bounded(
+    state: &AppState,
+    event: &Event,
+    targets: Vec<NotificationTarget>,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+    concurrency: usize,
+) -> Result<()> {
+    let mut deliveries = stream::iter(targets)
+        .map(|target| {
+            let token = token.clone();
+            async move {
+                let recipient = target.recipient;
+                (
+                    recipient,
+                    deliver_notification_target(state, event, target, copy, token).await,
+                )
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    // Drain on cancellation rather than returning at the first `Cancelled`.
+    //
+    // Returning early drops the `buffer_unordered` stream, and with it every
+    // still-running delivery, at whatever await point it had reached. Up to
+    // `concurrency - 1` of them can be sitting between the FCM send and the
+    // bookkeeping that follows it: the rate-limit window, the coordinate claim,
+    // invalid-token removal. Those pushes have already shipped, so dropping
+    // them there double-pushes on restart and leaves tokens FCM has already
+    // rejected registered — the same failure the post-send writes were made
+    // log-and-continue to avoid, arriving through the other door. Sequential
+    // delivery could strand one recipient this way; bounded delivery strands a
+    // page's worth, and silently, because a dropped future logs nothing.
+    //
+    // Draining costs little on shutdown: every in-flight delivery holds the
+    // same token and bails at its own next checkpoint, so the ones that have
+    // not sent yet return immediately. It does not close the window inside
+    // `send_notification_to_user`, which still returns `Cancelled` between the
+    // FCM send and the writes below it; that one predates this branch.
+    let mut cancelled = None;
+    while let Some((recipient, result)) = deliveries.next().await {
+        if let Err(e) = result {
+            if matches!(e, crate::error::ServiceError::Cancelled) {
+                cancelled.get_or_insert(e);
+                continue;
+            }
+            error!(
+                event_id = %event.id,
+                recipient = %recipient,
+                error = %e,
+                "Failed to send notification"
+            );
+        }
+    }
+
+    match cancelled {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+async fn deliver_notification_target(
+    state: &AppState,
+    event: &Event,
+    target: NotificationTarget,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+) -> Result<()> {
+    let recipient_pubkey = target.recipient;
+
+    // Skip if recipient is the sender
+    if recipient_pubkey == event.pubkey {
+        trace!(event_id = %event.id, "Skipping notification to sender");
+        return Ok(());
+    }
+
+    send_notification_to_user(
+        state,
+        event,
+        &recipient_pubkey,
+        target.notification_type,
+        copy,
+        token,
+    )
+    .await
+}
+
+async fn handle_video_content_event(
+    state: &AppState,
+    event: &Event,
+    token: CancellationToken,
+) -> Result<()> {
+    let mention_targets = deliverable_targets(video_mention_targets(event), &event.pubkey);
+    let mentioned: HashSet<PublicKey> = mention_targets
+        .iter()
+        .map(|target| target.recipient)
+        .collect();
+
+    // One copy for the whole event, spanning the mention pass and every watcher
+    // page. Building it per page would put the cost back on a per-page footing:
+    // `get_display_name` misses are never negatively cached, so a creator with
+    // no kind-0 metadata pays a five-second relay round-trip for each page, on
+    // the event-handler loop that every other user's notifications queue behind.
+    // `needs_content` is decided by the mention targets alone because `NewPost`
+    // does not render the event body, so no watcher page can widen it.
+    let copy = LazyEventCopy::for_targets(&mention_targets);
+
+    let mut target_count = 0usize;
+    if !mention_targets.is_empty() {
+        info!(
+            event_id = %event.id,
+            kind = %event.kind,
+            recipient_count = mention_targets.len(),
+            notification_types = ?vec![(NotificationType::Mention.display_name(), mention_targets.len())],
+            "Processing notification event"
+        );
+        send_notifications_sequential(state, event, mention_targets, &copy, token.clone()).await?;
+        target_count += mentioned.len();
+    }
+
+    let page_size = state.settings.service.new_post_fanout_page_size;
+    let concurrency = state.settings.service.new_post_delivery_concurrency;
+    let mut cursor = 0;
+    loop {
+        if token.is_cancelled() {
+            info!(event_id = %event.id, "Notification sending cancelled");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+
+        let page = match redis_store::get_notify_watchers_page(
+            &state.redis_pool,
+            &event.pubkey,
+            cursor,
+            page_size,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(e) => {
+                error!(
+                    event_id = %event.id,
+                    creator = %event.pubkey,
+                    cursor,
+                    error = %e,
+                    delivered_so_far = target_count,
+                    "Failed to read notify watcher page - abandoning the rest of the bell fan-out for this video"
+                );
+                break;
+            }
+        };
+
+        let next_cursor = page.next_cursor;
+        let new_post_targets = watcher_page_targets(page.watchers, &event.pubkey, &mentioned);
+        if !new_post_targets.is_empty() {
+            let page_target_count = new_post_targets.len();
+            info!(
+                event_id = %event.id,
+                kind = %event.kind,
+                recipient_count = page_target_count,
+                notification_types = ?vec![(NotificationType::NewPost.display_name(), page_target_count)],
+                cursor,
+                next_cursor,
+                "Processing new-post notification page"
+            );
+            send_notifications_bounded(
+                state,
+                event,
+                new_post_targets,
+                &copy,
+                token.clone(),
+                concurrency,
+            )
+            .await?;
+            target_count += page_target_count;
+        }
+
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    if target_count == 0 {
+        debug!(event_id = %event.id, kind = %event.kind, "No recipients found for event");
     }
 
     Ok(())
@@ -519,18 +904,283 @@ fn find_mentioned_pubkeys(event: &Event) -> Vec<PublicKey> {
         .collect()
 }
 
-/// Build a mention notification for a video event.
-fn video_notification(event: &Event) -> (NotificationType, Vec<PublicKey>) {
-    let recipients = find_mentioned_pubkeys(event)
+/// One notification to deliver: who gets it, and what kind it is.
+///
+/// A single event can now yield more than one notification *type* — a video both
+/// mentions someone and reaches the author's bell subscribers — so recipients
+/// carry their own type rather than sharing one for the whole event.
+#[derive(Debug, Clone, Copy)]
+struct NotificationTarget {
+    recipient: PublicKey,
+    notification_type: NotificationType,
+}
+
+/// Drop targets that are the event's own author.
+///
+/// An event that `p`-tags its own sender — a self-reaction, a self-repost —
+/// resolves to the author as a recipient, and nobody should be notified about
+/// their own activity. Kept as a pure function, like `watcher_page_targets`,
+/// so the rule is testable without an `AppState`.
+fn deliverable_targets(
+    targets: Vec<NotificationTarget>,
+    author: &PublicKey,
+) -> Vec<NotificationTarget> {
+    targets
+        .into_iter()
+        .filter(|target| target.recipient != *author)
+        .collect()
+}
+
+/// Give every recipient the same notification type.
+fn targets_of(
+    notification_type: NotificationType,
+    recipients: Vec<PublicKey>,
+) -> Vec<NotificationTarget> {
+    recipients
+        .into_iter()
+        .map(|recipient| NotificationTarget {
+            recipient,
+            notification_type,
+        })
+        .collect()
+}
+
+/// The parts of a push payload that depend on the event rather than the recipient.
+///
+/// Resolved once per event and shared across the fan-out. Both fields used to be
+/// computed inside `create_fcm_payload`, which runs per recipient, so both cost
+/// scaled with the recipient count while their inputs did not.
+///
+/// That was affordable when an event reached one to three `p`-tagged recipients.
+/// A bell reaches every watcher of the creator, and `get_display_name` is not a
+/// cheap repeat: on a profile-cache miss it does a relay `fetch_events` with a
+/// five-second timeout, and misses are never cached — only profiles that were
+/// found are written back. So a creator with no kind-0 metadata paid one relay
+/// round-trip per watcher, serially, on the single event-handler loop, delaying
+/// every other user's notifications behind it.
+struct EventScopedCopy {
+    /// Display name of the event author, or a short npub when unresolvable.
+    sender_name: String,
+    /// Event content with mentions resolved, when any target renders it.
+    ///
+    /// `None` means "not resolved" — either no target needed it or the parse
+    /// failed — and callers fall back to the raw content, as they did before.
+    formatted_content: Option<String>,
+}
+
+/// Whether this notification type renders the event's content in its body.
+///
+/// Exhaustive rather than a `matches!` so a new notification type has to state
+/// its answer here instead of silently defaulting to "no" and reaching
+/// `create_fcm_payload` without the content it needs.
+fn renders_event_content(notification_type: NotificationType) -> bool {
+    match notification_type {
+        NotificationType::Comment | NotificationType::Mention => true,
+        NotificationType::Like
+        | NotificationType::Follow
+        | NotificationType::Repost
+        | NotificationType::NewPost => false,
+    }
+}
+
+/// The event-scoped copy, resolved at most once and only if it is needed.
+///
+/// Resolving once per event rather than once per recipient is the point of the
+/// `EventScopedCopy` split. Resolving it *eagerly* is not: every gate in
+/// `send_notification_to_user` — allowlist, registered tokens, preferences,
+/// coordinate record, rate limit — can drop a recipient, and on a public relay
+/// the token gate alone drops nearly all of them, because the subscription has
+/// no `#p` narrowing and most tagged users have never registered for push.
+///
+/// An eager resolve therefore pays `get_display_name` for events that deliver
+/// nothing. That is a Redis GET plus, on a cache miss, a relay `fetch_events`
+/// bounded by the five seconds hard-coded in `MentionParser::fetch_from_relays`
+/// — not by `query_timeout_secs`, which is declared in config and read nowhere,
+/// so it is not a knob an operator can turn on this path. Misses are never
+/// written back either, so an author with no kind-0 pays it on every event
+/// forever. All of it on the single sequential handler task, ahead of every
+/// other user's notifications.
+///
+/// Deferring the resolve to the first recipient that actually reaches payload
+/// construction keeps the once-per-event property and restores the property the
+/// per-recipient version had for free: an event nobody can be pushed for costs
+/// no profile work at all.
+///
+/// What it gives up: the cell caches whatever `resolve_event_scoped_copy`
+/// returns, and that includes the short-npub fallback it returns when the
+/// profile lookup fails. On `main` the lookup sat inside `create_fcm_payload`,
+/// so one recipient's timeout did not spoil the next one's — each retried.
+/// Here the first recipient to resolve fixes the sender name for the whole
+/// fan-out, so a single timed-out lookup shows every remaining watcher a short
+/// npub instead of the creator's name.
+///
+/// That is the trade rather than an oversight. Retrying per recipient is what
+/// made one unreachable profile relay cost five seconds *per recipient*, and a
+/// bell fan-out is precisely where that multiplies. A degraded name on one
+/// event is cheaper than stalling the handler for every other user's
+/// notifications.
+struct LazyEventCopy {
+    cell: tokio::sync::OnceCell<EventScopedCopy>,
+    /// Whether any target renders the event body, decided over the whole target
+    /// list rather than the one recipient that happens to resolve it first.
+    needs_content: bool,
+}
+
+impl LazyEventCopy {
+    fn for_targets(targets: &[NotificationTarget]) -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new(),
+            needs_content: targets
+                .iter()
+                .any(|target| renders_event_content(target.notification_type)),
+        }
+    }
+
+    /// Pre-resolved copy, for tests that exercise delivery rather than copy.
+    #[cfg(test)]
+    fn resolved(copy: EventScopedCopy) -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new_with(Some(copy)),
+            needs_content: false,
+        }
+    }
+
+    async fn get(&self, state: &AppState, event: &Event) -> &EventScopedCopy {
+        self.cell
+            .get_or_init(|| resolve_event_scoped_copy(state, event, self.needs_content))
+            .await
+    }
+}
+
+/// Resolve the recipient-independent copy for an event, once.
+///
+/// The content parse is skipped entirely unless some target actually renders the
+/// body, so a pure bell fan-out does not pay for mention parsing it never uses.
+async fn resolve_event_scoped_copy(
+    state: &AppState,
+    event: &Event,
+    needs_content: bool,
+) -> EventScopedCopy {
+    let Some(mention_parser) = state.mention_parser_service.as_ref() else {
+        return EventScopedCopy {
+            sender_name: format_short_npub(&event.pubkey),
+            formatted_content: None,
+        };
+    };
+
+    let sender_name = match mention_parser
+        .get_display_name(&event.pubkey.to_hex())
+        .await
+    {
+        Ok(Some(name)) => name,
+        Ok(None) => format_short_npub(&event.pubkey),
+        Err(e) => {
+            warn!(error = %e, "Failed to get sender display name");
+            format_short_npub(&event.pubkey)
+        }
+    };
+
+    let formatted_content = if needs_content {
+        match mention_parser.format_content_for_push(&event.content).await {
+            Ok(formatted) => Some(formatted),
+            Err(e) => {
+                warn!(event_id = %event.id, error = %e, "Failed to format content for push");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    EventScopedCopy {
+        sender_name,
+        formatted_content,
+    }
+}
+
+/// User-visible copy for a new-post push.
+///
+/// The body is required by the mobile client: an empty value makes foreground
+/// handling return early without displaying a notification.
+fn new_post_copy(sender_name: &str) -> (String, String) {
+    (
+        "New vine".to_string(),
+        format!("{} posted a new vine", sender_name),
+    )
+}
+
+/// Mention targets for a video event: p-tagged users other than the author.
+fn video_mention_targets(event: &Event) -> Vec<NotificationTarget> {
+    find_mentioned_pubkeys(event)
         .into_iter()
         .filter(|recipient| *recipient != event.pubkey)
-        .collect();
+        .map(|recipient| NotificationTarget {
+            recipient,
+            notification_type: NotificationType::Mention,
+        })
+        .collect()
+}
 
-    (NotificationType::Mention, recipients)
+/// Turn one page of bell watchers into new-post targets.
+///
+/// Mention wins on overlap: someone who both watches `author` and is mentioned
+/// in the video gets exactly one push, typed `Mention`, because that is the more
+/// specific signal. The mention pass runs first and hands its recipients here as
+/// `mentioned`, so watchers it already covered are dropped rather than belled.
+///
+/// Kept separate from the Redis read so the rule is testable on its own.
+fn watcher_page_targets(
+    watchers: Vec<PublicKey>,
+    author: &PublicKey,
+    mentioned: &HashSet<PublicKey>,
+) -> Vec<NotificationTarget> {
+    watchers
+        .into_iter()
+        .filter(|watcher| watcher != author)
+        .filter(|watcher| !mentioned.contains(watcher))
+        .map(|recipient| NotificationTarget {
+            recipient,
+            notification_type: NotificationType::NewPost,
+        })
+        .collect()
 }
 
 /// Build the coordinate-and-recipient key used to deduplicate video edits.
-fn video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<String> {
+///
+/// Scoped by notification type as well as coordinate, because the two are
+/// orthogonal: an edit does not change which *kind* of notification a recipient
+/// is owed, so keying on type keeps the stable-across-edits property while
+/// stopping one type from consuming another's record.
+///
+/// Without the type, a watcher who got a NewPost push for a video and was then
+/// `p`-tagged in an edit of that same video had the mention suppressed for
+/// `video_coordinate_dedup_ttl_secs` — a year by default. Belling a creator
+/// quietly cost you mention notifications from them. `watcher_page_targets`
+/// already makes mention win over bell within a single event; this extends the
+/// same rule across edits, where the two pushes carry genuinely different
+/// information ("X posted a vine" versus "X mentioned you").
+fn video_recipient_claim_key(
+    event: &Event,
+    recipient: &PublicKey,
+    notification_type: NotificationType,
+) -> Option<String> {
+    let d_tag = event.tags.identifier()?;
+    Some(format!(
+        "{}:{}:{}:{d_tag}:{}",
+        event.kind.as_u16(),
+        notification_type.display_name(),
+        event.pubkey.to_hex(),
+        recipient.to_hex()
+    ))
+}
+
+/// Legacy video-coordinate key written before the claim was scoped by type.
+///
+/// Those keys live for `video_coordinate_dedup_ttl_secs`, one year by default,
+/// so a deploy must keep reading them for one full TTL cycle. A legacy record
+/// came from a video mention, which also satisfies a bell for the same
+/// coordinate; see `satisfied_video_claims`.
+fn legacy_video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<String> {
     let d_tag = event.tags.identifier()?;
     Some(format!(
         "{}:{}:{d_tag}:{}",
@@ -538,6 +1188,134 @@ fn video_recipient_claim_key(event: &Event, recipient: &PublicKey) -> Option<Str
         event.pubkey.to_hex(),
         recipient.to_hex()
     ))
+}
+
+/// The video-coordinate records a delivered push satisfies.
+///
+/// Type-scoping the claim key made the two directions independent, but they are
+/// not: a mention push names the video, so it necessarily tells the recipient
+/// that video exists — which is the entire content of a bell. Delivering one
+/// therefore satisfies the bell's record too. The converse does not hold, since
+/// "X posted a vine" says nothing about being mentioned, and that asymmetry is
+/// why the key carries the type at all.
+///
+/// This is `watcher_page_targets`'s "mention wins on overlap" rule extended
+/// across edits. Without it, a watcher who was `p`-tagged in the original and
+/// dropped from an edit resolves to a bare `NewPost` target on the edit and is
+/// told "posted a new vine" about a video they were already pushed about.
+///
+/// The guarantee is per-replica, not global. An event and its edit carry
+/// different ids, so `try_claim_event` does not serialise them, and production
+/// runs two replicas: two handlers reaching the coordinate check in the same
+/// moment both read it absent and both send. What makes it hold on one replica
+/// is that `run` awaits `route_event` inline, so the original's record is
+/// written before the edit is read. Closing the cross-replica case means
+/// `SET NX EX` on the claim, which costs the same thing the rate-limit comment
+/// in `send_notification_to_user` declines to pay: a failed send would burn the
+/// record and that recipient would never get the push at all.
+///
+/// Pure, so the rule is testable without Redis.
+fn satisfied_video_claims(notification_type: NotificationType) -> Vec<NotificationType> {
+    match notification_type {
+        NotificationType::Mention => vec![NotificationType::Mention, NotificationType::NewPost],
+        other => vec![other],
+    }
+}
+
+async fn has_video_claim(
+    state: &AppState,
+    event: &Event,
+    target_pubkey: &PublicKey,
+    notification_type: NotificationType,
+    token: &CancellationToken,
+) -> Result<bool> {
+    let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, notification_type) else {
+        warn!(
+            event_id = %event.id,
+            target_pubkey = %target_pubkey,
+            "Skipping video notification without an addressable d-tag"
+        );
+        return Ok(true);
+    };
+    let redis_key = format!("dedup:{claim_key}");
+    let already_notified = tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event.id, target_pubkey = %target_pubkey, "Cancelled while checking video recipient delivery.");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+        lookup_result = redis_store::get_cached_string(&state.redis_pool, &redis_key) => {
+            lookup_result?.is_some()
+        }
+    };
+    if already_notified {
+        return Ok(true);
+    }
+
+    let Some(legacy_claim_key) = legacy_video_recipient_claim_key(event, target_pubkey) else {
+        return Ok(false);
+    };
+    let legacy_redis_key = format!("dedup:{legacy_claim_key}");
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event.id, target_pubkey = %target_pubkey, "Cancelled while checking legacy video recipient delivery.");
+            Err(crate::error::ServiceError::Cancelled)
+        }
+        lookup_result = redis_store::get_cached_string(&state.redis_pool, &legacy_redis_key) => {
+            Ok(lookup_result?.is_some())
+        }
+    }
+}
+
+/// Record the video-coordinate claims a decision about `target_pubkey` settles.
+///
+/// Infallible on purpose. Every caller reaches this after the delivery decision
+/// is final — the push has shipped, or the rate limit has deliberately dropped
+/// it — so a failed write here is bookkeeping loss, not a reason to abandon the
+/// work that follows. `a10a02b`'s `return` in the old inline loop skipped
+/// invalid-token removal for the same reason `726bd1e` had to make it a
+/// `break`; returning `()` keeps that class of bug from coming back through a
+/// `?` at a call site.
+async fn record_video_claims(
+    state: &AppState,
+    event: &Event,
+    target_pubkey: &PublicKey,
+    notification_type: NotificationType,
+    log_message: &'static str,
+) {
+    if event.kind.as_u16() != KIND_VIDEO {
+        return;
+    }
+
+    for satisfied in satisfied_video_claims(notification_type) {
+        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey, satisfied) else {
+            warn!(
+                event_id = %event.id,
+                target_pubkey = %target_pubkey,
+                "Video notification lacked an addressable d-tag"
+            );
+            return;
+        };
+        let redis_key = format!("dedup:{claim_key}");
+        if let Err(e) = redis_store::set_cached_string(
+            &state.redis_pool,
+            &redis_key,
+            "1",
+            state.settings.service.video_coordinate_dedup_ttl_secs,
+        )
+        .await
+        {
+            error!(
+                event_id = %event.id,
+                target_pubkey = %target_pubkey,
+                claim = %redis_key,
+                error = %e,
+                message = log_message,
+                "Failed to record a video-coordinate claim"
+            );
+        }
+    }
 }
 
 /// Find recipients for a NIP-22 comment event (kind 1111).
@@ -576,6 +1354,7 @@ async fn send_notification_to_user(
     event: &Event,
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
+    copy: &LazyEventCopy,
     token: CancellationToken,
 ) -> Result<()> {
     let event_id = event.id;
@@ -621,43 +1400,88 @@ async fn send_notification_to_user(
     )
     .await?;
 
-    if !notification_type.is_enabled(&prefs) {
-        info!(
+    let mut delivery_type = notification_type;
+    if !delivery_type.is_enabled(&prefs) {
+        let can_fall_back_to_bell = if event.kind.as_u16() == KIND_VIDEO
+            && delivery_type == NotificationType::Mention
+            && NotificationType::NewPost.is_enabled(&prefs)
+        {
+            match redis_store::is_notify_watcher(&state.redis_pool, &event.pubkey, target_pubkey)
+                .await
+            {
+                Ok(is_watcher) => is_watcher,
+                Err(e) => {
+                    error!(
+                        event_id = %event_id,
+                        target_pubkey = %target_pubkey,
+                        creator = %event.pubkey,
+                        error = %e,
+                        "Failed to check bell fallback for muted video mention"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if can_fall_back_to_bell {
+            delivery_type = NotificationType::NewPost;
+            info!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
+                "Video mention disabled but bell enabled for watcher - delivering new-post notification"
+            );
+        } else {
+            info!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
+                notification_type = ?delivery_type,
+                "Notification type disabled by user preferences - skipping"
+            );
+            return Ok(());
+        }
+    }
+
+    if event.kind.as_u16() == KIND_VIDEO
+        && has_video_claim(state, event, target_pubkey, delivery_type, &token).await?
+    {
+        trace!(
             event_id = %event_id,
-            target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
-            notification_type = ?notification_type,
-            "Notification type disabled by user preferences - skipping"
+            target_pubkey = %target_pubkey,
+            "Skipping video recipient already notified for this coordinate"
         );
         return Ok(());
     }
 
-    if event.kind.as_u16() == KIND_VIDEO {
-        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
-            warn!(
-                event_id = %event_id,
-                target_pubkey = %target_pubkey,
-                "Skipping video notification without an addressable d-tag"
-            );
-            return Ok(());
-        };
-        let redis_key = format!("dedup:{claim_key}");
-        let already_notified = tokio::select! {
+    if delivery_type == NotificationType::NewPost {
+        let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
+        let within_window = tokio::select! {
             biased;
             _ = token.cancelled() => {
-                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while checking video recipient delivery.");
+                info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while checking the new-post rate limit.");
                 return Err(crate::error::ServiceError::Cancelled);
             }
-            lookup_result = redis_store::get_cached_string(&state.redis_pool, &redis_key) => {
+            lookup_result = redis_store::get_cached_string(&state.redis_pool, &rate_key) => {
                 lookup_result?.is_some()
             }
         };
 
-        if already_notified {
-            trace!(
+        if within_window {
+            info!(
                 event_id = %event_id,
                 target_pubkey = %target_pubkey,
-                "Skipping video recipient already notified for this coordinate"
+                creator = %event.pubkey,
+                "Skipping new-post notification inside the per-creator rate-limit window"
             );
+            record_video_claims(
+                state,
+                event,
+                target_pubkey,
+                delivery_type,
+                "Failed to record a rate-limited video-coordinate claim; an edit may re-notify",
+            )
+            .await;
             return Ok(());
         }
     }
@@ -669,8 +1493,19 @@ async fn send_notification_to_user(
         "Found FCM tokens for recipient"
     );
 
+    // Every gate that could drop this recipient is behind us, so this delivery
+    // is the one that pays for the event's copy — once, for all recipients.
+    let copy = tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while resolving the event copy.");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+        resolved = copy.get(state, event) => resolved
+    };
+
     // Create FCM payload
-    let payload = create_fcm_payload(event, target_pubkey, notification_type, state).await?;
+    let payload = create_fcm_payload(event, target_pubkey, delivery_type, copy);
 
     // Send to all tokens
     info!(
@@ -729,23 +1564,52 @@ async fn send_notification_to_user(
         "FCM notification send summary"
     );
 
-    if event.kind.as_u16() == KIND_VIDEO && success_count > 0 {
-        let Some(claim_key) = video_recipient_claim_key(event, target_pubkey) else {
-            warn!(
+    // Open the rate-limit window only on a delivered push.
+    //
+    // This is check-then-set-on-success rather than an atomic `SET NX EX`, both
+    // to mirror the video-coordinate dedup above and — more importantly — so a
+    // failed FCM send does not burn the user's hour-long window. The tradeoff is
+    // that two replicas handling different videos from the same creator in the
+    // same instant can both pass the check and double-send. That race is rare,
+    // bounded, and low-harm; silently eating an hour of notifications on an FCM
+    // blip is worse. Do not "fix" this into `SET NX EX`.
+    if delivery_type == NotificationType::NewPost && success_count > 0 {
+        let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
+        // Log and continue rather than `?`. Everything from here down is
+        // bookkeeping about a push that has already shipped, so propagating
+        // reports a delivered notification as failed and, worse, skips the
+        // bookkeeping below it: the coordinate claim that stops a NIP-33 edit
+        // re-notifying, and invalid-token removal.
+        if let Err(e) = redis_store::set_cached_string(
+            &state.redis_pool,
+            &rate_key,
+            "1",
+            state.settings.service.new_post_rate_limit_secs,
+        )
+        .await
+        {
+            error!(
                 event_id = %event_id,
                 target_pubkey = %target_pubkey,
-                "Successful video notification lacked an addressable d-tag"
+                error = %e,
+                "Failed to open the new-post rate-limit window after a delivered push"
             );
-            return Ok(());
-        };
-        let redis_key = format!("dedup:{claim_key}");
-        redis_store::set_cached_string(
-            &state.redis_pool,
-            &redis_key,
-            "1",
-            state.settings.service.video_coordinate_dedup_ttl_secs,
+        }
+    }
+
+    if success_count > 0 {
+        // Same reasoning as the rate-limit write above, and it matters more
+        // here: `satisfied_video_claims` can yield two records, and `?` on
+        // the first left the second unwritten. That is exactly the
+        // half-written state the type-scoped claim exists to prevent.
+        record_video_claims(
+            state,
+            event,
+            target_pubkey,
+            delivery_type,
+            "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify",
         )
-        .await?;
+        .await;
     }
 
     // Remove invalid tokens
@@ -775,29 +1639,27 @@ async fn send_notification_to_user(
 }
 
 /// Create FCM payload for a notification
-async fn create_fcm_payload(
+///
+/// Takes the event-scoped copy rather than resolving it, so the relay and Redis
+/// work behind `sender_name` and `formatted_content` happens once per event
+/// instead of once per recipient. That leaves this function free of I/O, which
+/// is also what makes it directly testable.
+fn create_fcm_payload(
     event: &Event,
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
-    state: &AppState,
-) -> Result<FcmPayload> {
+    copy: &EventScopedCopy,
+) -> FcmPayload {
     let mut data = std::collections::HashMap::new();
 
-    // Get sender name using mention parser service
-    let sender_name = if let Some(ref mention_parser) = state.mention_parser_service {
-        match mention_parser
-            .get_display_name(&event.pubkey.to_hex())
-            .await
-        {
-            Ok(Some(name)) => name,
-            Ok(None) => format_short_npub(&event.pubkey),
-            Err(e) => {
-                warn!(error = %e, "Failed to get sender display name");
-                format_short_npub(&event.pubkey)
-            }
-        }
-    } else {
-        format_short_npub(&event.pubkey)
+    let sender_name = copy.sender_name.clone();
+
+    // Falls back to the raw content when the parse was skipped or failed, which
+    // is what the per-recipient parse did on error.
+    let formatted_content = || {
+        copy.formatted_content
+            .clone()
+            .unwrap_or_else(|| event.content.clone())
     };
 
     // Generate title and body based on notification type
@@ -809,19 +1671,10 @@ async fn create_fcm_payload(
         }
         NotificationType::Comment => {
             let title = "New comment".to_string();
-            // Format content with mention parser if available
-            let formatted_content = if let Some(ref mention_parser) = state.mention_parser_service {
-                match mention_parser.format_content_for_push(&event.content).await {
-                    Ok(formatted) => formatted,
-                    Err(_) => event.content.clone(),
-                }
-            } else {
-                event.content.clone()
-            };
             let body = format!(
                 "{}: {}",
                 sender_name,
-                truncate_string(&formatted_content, 150)
+                truncate_string(&formatted_content(), 150)
             );
             (title, body)
         }
@@ -832,19 +1685,10 @@ async fn create_fcm_payload(
         }
         NotificationType::Mention => {
             let title = "You were mentioned".to_string();
-            // Format content with mention parser if available
-            let formatted_content = if let Some(ref mention_parser) = state.mention_parser_service {
-                match mention_parser.format_content_for_push(&event.content).await {
-                    Ok(formatted) => formatted,
-                    Err(_) => event.content.clone(),
-                }
-            } else {
-                event.content.clone()
-            };
             let body = format!(
                 "{}: {}",
                 sender_name,
-                truncate_string(&formatted_content, 150)
+                truncate_string(&formatted_content(), 150)
             );
             (title, body)
         }
@@ -852,6 +1696,11 @@ async fn create_fcm_payload(
             let title = "New repost".to_string();
             let body = format!("{} reposted your post", sender_name);
             (title, body)
+        }
+        NotificationType::NewPost => {
+            // Provisional copy. divine-mobile/brand-guidelines/TONE_OF_VOICE.md
+            // governs user-facing strings; confirm before release.
+            new_post_copy(&sender_name)
         }
     };
 
@@ -882,13 +1731,13 @@ async fn create_fcm_payload(
     // guess the target's owner.
     insert_trigger_reference_fields(&mut data, event);
 
-    Ok(FcmPayload {
+    FcmPayload {
         notification: None, // Data-only message for better client control
         data: Some(data),
         android: None,
         webpush: None,
         apns: None,
-    })
+    }
 }
 
 /// Authoritative addressable target extracted from an event's `A`/`a` tag.
@@ -1054,6 +1903,20 @@ mod tests {
         }
     }
 
+    /// Event-scoped copy for tests that exercise delivery rather than copy.
+    fn test_copy() -> LazyEventCopy {
+        LazyEventCopy::resolved(EventScopedCopy {
+            sender_name: "tester".to_string(),
+            formatted_content: None,
+        })
+    }
+
+    fn test_event_id(seed: u64) -> EventId {
+        let mut bytes = [0u8; 32];
+        bytes[24..].copy_from_slice(&seed.to_be_bytes());
+        EventId::from_slice(&bytes).expect("32 bytes is a valid event id")
+    }
+
     #[test]
     fn test_is_event_too_old() {
         // Create a recent event
@@ -1199,11 +2062,14 @@ mod tests {
             .sign_with_keys(&sender)
             .unwrap();
 
-        let (notification_type, recipients) = video_notification(&event);
+        let targets = video_mention_targets(&event);
 
-        assert_eq!(notification_type, NotificationType::Mention);
-        assert_eq!(notification_type.display_name(), "mention");
-        assert_eq!(recipients.len(), 2);
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .all(|t| t.notification_type == NotificationType::Mention));
+        assert_eq!(NotificationType::Mention.display_name(), "mention");
+        let recipients: Vec<PublicKey> = targets.iter().map(|t| t.recipient).collect();
         assert!(recipients.contains(&mentioned1.public_key()));
         assert!(recipients.contains(&mentioned2.public_key()));
     }
@@ -1217,9 +2083,626 @@ mod tests {
             .sign_with_keys(&sender)
             .unwrap();
 
-        let (_, recipients) = video_notification(&event);
+        assert!(video_mention_targets(&event).is_empty());
+    }
 
-        assert!(recipients.is_empty());
+    /// Build a `d=notify` list event tagging `creators`.
+    fn notify_list_event(author: &Keys, creators: &[PublicKey]) -> Event {
+        let mut builder =
+            EventBuilder::new(Kind::from(30000), "").tag(Tag::identifier(NOTIFY_LIST_D_TAG));
+        for creator in creators {
+            builder = builder.tag(Tag::public_key(*creator));
+        }
+        builder.sign_with_keys(author).unwrap()
+    }
+
+    #[test]
+    fn test_collect_notify_creators_reads_p_tags_in_order() {
+        let author = Keys::generate();
+        let first = Keys::generate().public_key();
+        let second = Keys::generate().public_key();
+
+        let event = notify_list_event(&author, &[first, second]);
+
+        assert_eq!(collect_notify_creators(&event, 1000), vec![first, second]);
+    }
+
+    #[test]
+    fn test_collect_notify_creators_deduplicates() {
+        let author = Keys::generate();
+        let creator = Keys::generate().public_key();
+
+        let event = notify_list_event(&author, &[creator, creator, creator]);
+
+        assert_eq!(collect_notify_creators(&event, 1000), vec![creator]);
+    }
+
+    #[test]
+    fn test_collect_notify_creators_drops_self_reference() {
+        let author = Keys::generate();
+        let other = Keys::generate().public_key();
+
+        let event = notify_list_event(&author, &[author.public_key(), other]);
+
+        assert_eq!(
+            collect_notify_creators(&event, 1000),
+            vec![other],
+            "belling yourself is meaningless"
+        );
+    }
+
+    #[test]
+    fn test_collect_notify_creators_handles_empty_list() {
+        let author = Keys::generate();
+
+        let event = notify_list_event(&author, &[]);
+
+        assert!(
+            collect_notify_creators(&event, 1000).is_empty(),
+            "an empty list is legitimate, not malformed"
+        );
+    }
+
+    #[test]
+    fn test_collect_notify_creators_truncates_at_the_cap() {
+        let author = Keys::generate();
+        let creators: Vec<PublicKey> = (0..5).map(|_| Keys::generate().public_key()).collect();
+
+        let event = notify_list_event(&author, &creators);
+        let collected = collect_notify_creators(&event, 3);
+
+        // Redis is single-threaded and the diff runs in one Lua script, so an
+        // unbounded list would let one user stall the instance.
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected, creators[..3].to_vec(), "tag order is preserved");
+    }
+
+    #[test]
+    fn test_collect_notify_creators_counts_unique_against_the_cap() {
+        let author = Keys::generate();
+        let a = Keys::generate().public_key();
+        let b = Keys::generate().public_key();
+
+        // Duplicates must not consume cap budget, or a list padded with repeats
+        // would starve the real entries behind it.
+        let event = notify_list_event(&author, &[a, a, a, b]);
+
+        assert_eq!(collect_notify_creators(&event, 2), vec![a, b]);
+    }
+
+    #[test]
+    fn test_new_post_copy_has_required_non_empty_body() {
+        let (title, body) = new_post_copy("Alice");
+
+        assert_eq!(title, "New vine");
+        assert_eq!(body, "Alice posted a new vine");
+        assert!(
+            !body.trim().is_empty(),
+            "mobile silently drops foreground pushes without a body"
+        );
+    }
+
+    #[test]
+    fn test_deliverable_targets_drops_the_author() {
+        let author = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+
+        // A self-reaction p-tags its own sender, so the author arrives as a
+        // recipient. Dropping them here rather than mid-loop keeps a self-only
+        // event from resolving an event-scoped copy it cannot use.
+        let targets = deliverable_targets(
+            vec![
+                NotificationTarget {
+                    recipient: author,
+                    notification_type: NotificationType::Like,
+                },
+                NotificationTarget {
+                    recipient: other,
+                    notification_type: NotificationType::Like,
+                },
+            ],
+            &author,
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, other);
+    }
+
+    #[test]
+    fn test_deliverable_targets_empties_a_self_only_event() {
+        let author = Keys::generate().public_key();
+
+        let targets = deliverable_targets(
+            vec![NotificationTarget {
+                recipient: author,
+                notification_type: NotificationType::Repost,
+            }],
+            &author,
+        );
+
+        assert!(
+            targets.is_empty(),
+            "a self-only event must resolve to nothing deliverable"
+        );
+    }
+
+    #[test]
+    fn test_only_body_rendering_types_need_the_event_content() {
+        // The content parse is skipped when no target renders the body, so this
+        // has to stay in step with the arms of `create_fcm_payload` that call
+        // `formatted_content()`. A type added to one and not the other silently
+        // downgrades that push to raw, unparsed content.
+        assert!(renders_event_content(NotificationType::Comment));
+        assert!(renders_event_content(NotificationType::Mention));
+
+        assert!(!renders_event_content(NotificationType::Like));
+        assert!(!renders_event_content(NotificationType::Follow));
+        assert!(!renders_event_content(NotificationType::Repost));
+        assert!(!renders_event_content(NotificationType::NewPost));
+    }
+
+    #[test]
+    fn test_needs_content_is_decided_over_the_whole_target_list() {
+        // The copy resolves on whichever recipient clears the gates first, which
+        // need not be one that renders the body. Deciding `needs_content` from
+        // the full list keeps that ordering from silently downgrading a mention
+        // to raw, unparsed content.
+        let bell_first = LazyEventCopy::for_targets(&[
+            NotificationTarget {
+                recipient: Keys::generate().public_key(),
+                notification_type: NotificationType::NewPost,
+            },
+            NotificationTarget {
+                recipient: Keys::generate().public_key(),
+                notification_type: NotificationType::Mention,
+            },
+        ]);
+        assert!(bell_first.needs_content);
+
+        let bells_only = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient: Keys::generate().public_key(),
+            notification_type: NotificationType::NewPost,
+        }]);
+        assert!(!bells_only.needs_content);
+    }
+
+    #[tokio::test]
+    async fn test_a_recipient_without_tokens_never_resolves_the_event_copy() {
+        // The regression this guards is a throughput one, but the observable
+        // fact is binary: did the event pay for its copy at all? With no mention
+        // parser configured the resolve is free, so this asserts *whether* it
+        // happened, not what it cost. In production it costs a Redis GET and,
+        // on a cache miss, a relay round trip that is never negatively cached.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        let event = EventBuilder::text_note("hello")
+            .tag(Tag::public_key(recipient))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient,
+            notification_type: NotificationType::Mention,
+        }]);
+        send_notification_to_user(
+            &state,
+            &event,
+            &recipient,
+            NotificationType::Mention,
+            &copy,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            copy.cell.get().is_none(),
+            "an event with no deliverable recipient must not resolve its copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_delivered_push_resolves_the_event_copy() {
+        // The other half of the pair: deferring must not skip the resolve for a
+        // recipient that does get a push.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let fcm_token = format!("lazy-copy-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("hello")
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient: recipient.public_key(),
+            notification_type: NotificationType::Mention,
+        }]);
+        send_notification_to_user(
+            &state,
+            &event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            &copy,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+        assert_eq!(
+            copy.cell.get().map(|c| c.sender_name.as_str()),
+            Some(format_short_npub(&author.public_key()).as_str()),
+            "a delivered push resolves the copy the payload is built from"
+        );
+
+        redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_payload_uses_the_event_scoped_sender_name() {
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("hoisted-sender"))
+            .sign_with_keys(&author)
+            .unwrap();
+        let copy = EventScopedCopy {
+            sender_name: "Alice".to_string(),
+            formatted_content: None,
+        };
+
+        let payload = create_fcm_payload(&event, &recipient, NotificationType::NewPost, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        // The name resolved once for the event reaches the per-recipient push.
+        assert_eq!(data.get("senderName"), Some(&"Alice".to_string()));
+        assert_eq!(data.get("title"), Some(&"New vine".to_string()));
+        assert_eq!(
+            data.get("body"),
+            Some(&"Alice posted a new vine".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mention_body_prefers_the_resolved_content() {
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::text_note("hey nostr:npub1raw")
+            .sign_with_keys(&author)
+            .unwrap();
+        let copy = EventScopedCopy {
+            sender_name: "Alice".to_string(),
+            formatted_content: Some("hey @bob".to_string()),
+        };
+
+        let payload = create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(data.get("body"), Some(&"Alice: hey @bob".to_string()));
+    }
+
+    #[test]
+    fn test_mention_body_falls_back_to_raw_content() {
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::text_note("hey nostr:npub1raw")
+            .sign_with_keys(&author)
+            .unwrap();
+        // `None` is what a skipped or failed parse leaves behind. Before the
+        // hoist the per-recipient parse fell back to the raw content on error;
+        // that behaviour has to survive the move.
+        let copy = EventScopedCopy {
+            sender_name: "Alice".to_string(),
+            formatted_content: None,
+        };
+
+        let payload = create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(
+            data.get("body"),
+            Some(&"Alice: hey nostr:npub1raw".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_real_watcher_page_failure_still_delivers_mentions() {
+        // This drives a genuine watcher-page failure through the real video
+        // delivery path by leaving a string where the watcher set belongs, so
+        // SSCAN fails with WRONGTYPE. Mentions came from the event's own tags
+        // and must still be delivered.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let mentioned = Keys::generate().public_key();
+        let fcm_token = format!("mention_token_{}", EventId::all_zeros().to_hex());
+        redis_store::add_or_update_token(&pool, &mentioned, &fcm_token)
+            .await
+            .expect("register token");
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("wrongtype-vid"))
+            .tag(Tag::public_key(mentioned))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let watchers_key = format!("notify_watchers:{}", author.public_key().to_hex());
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&watchers_key)
+            .arg("not-a-set")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        // Without this the test could pass vacuously, by the lookup succeeding
+        // and simply finding no watchers.
+        let lookup_failed =
+            redis_store::get_notify_watchers_page(&pool, &author.public_key(), 0, 1000)
+                .await
+                .is_err();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        handle_video_content_event(&state, &event, CancellationToken::new())
+            .await
+            .expect("video handling degrades to mentions");
+
+        let _: () = redis::cmd("DEL")
+            .arg(&watchers_key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &mentioned, &fcm_token)
+            .await
+            .expect("cleanup token");
+
+        assert!(lookup_failed, "the seeded key must make the lookup fail");
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the mention survives the failed watcher page lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cancelled_bell_page_reports_cancellation() {
+        // Deleting the `Cancelled` arm from `send_notifications_bounded` left
+        // the suite green, so shutdown on the bell path was propagating by
+        // nobody's assertion. The page must report cancellation upward rather
+        // than returning Ok and letting the walk advance to the next cursor.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("cancelled-page-vid"))
+            .sign_with_keys(&author)
+            .unwrap();
+        let targets: Vec<NotificationTarget> = (0..3)
+            .map(|_| NotificationTarget {
+                recipient: Keys::generate().public_key(),
+                notification_type: NotificationType::NewPost,
+            })
+            .collect();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = send_notifications_bounded(
+            &state,
+            &event,
+            targets,
+            &LazyEventCopy::for_targets(&[]),
+            token,
+            4,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::error::ServiceError::Cancelled)),
+            "a cancelled page must not report success"
+        );
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "nothing ships after cancellation"
+        );
+    }
+
+    #[test]
+    fn test_a_watcher_page_types_every_watcher_as_new_post() {
+        let author = Keys::generate().public_key();
+        let watcher = Keys::generate().public_key();
+
+        let targets = watcher_page_targets(vec![watcher], &author, &HashSet::new());
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, watcher);
+        assert_eq!(targets[0].notification_type, NotificationType::NewPost);
+    }
+
+    #[test]
+    fn test_a_watcher_page_drops_an_author_watching_themselves() {
+        let author = Keys::generate().public_key();
+
+        let targets = watcher_page_targets(vec![author], &author, &HashSet::new());
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_a_mentioned_watcher_is_not_also_belled() {
+        // Mention wins on overlap, which is what README and the developer guide
+        // promise. The rule moved onto the page path with the fan-out rewrite
+        // and arrived there without a test: without one,
+        // deleting the `mentioned` filter leaves the whole suite green while
+        // every mentioned watcher gets two pushes for one video.
+        let author = Keys::generate().public_key();
+        let both = Keys::generate().public_key();
+        let mentioned = HashSet::from([both]);
+
+        let targets = watcher_page_targets(vec![both], &author, &mentioned);
+
+        assert!(
+            targets.is_empty(),
+            "the mention already covers this recipient, so no bell is owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_fan_out_reaches_watchers_past_the_first_page() {
+        // The paging loop is the point of the fan-out bound, and nothing failed
+        // when it was broken: stopping after page one, or never advancing the
+        // cursor, left the suite green. It needs a creator whose watcher set is
+        // big enough for Redis to page at all. Below Redis's
+        // `set-max-listpack-entries` (128 by default) a set is listpack-encoded
+        // and SSCAN returns every member in one reply whatever COUNT says, so a
+        // handful of watchers cannot exercise a second page.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        const WATCHERS: usize = 150;
+        const PAGE_SIZE: usize = 10;
+
+        let author = Keys::generate();
+        let creator = author.public_key();
+        let watchers: Vec<Keys> = (0..WATCHERS).map(|_| Keys::generate()).collect();
+
+        for (idx, watcher) in watchers.iter().enumerate() {
+            redis_store::add_or_update_token(
+                &pool,
+                &watcher.public_key(),
+                &format!("fanout_token_{}", idx),
+            )
+            .await
+            .expect("register token");
+            redis_store::replace_notify_subscriptions(
+                &pool,
+                &watcher.public_key(),
+                &[creator],
+                1_000 + idx as u64,
+                &EventId::all_zeros(),
+            )
+            .await
+            .expect("bell the creator");
+        }
+
+        // Without this the assertion below could be met by one oversized page.
+        let first_page = redis_store::get_notify_watchers_page(&pool, &creator, 0, PAGE_SIZE)
+            .await
+            .expect("first watcher page");
+        assert_ne!(
+            first_page.next_cursor, 0,
+            "the seeded set must be large enough for Redis to page"
+        );
+
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.new_post_fanout_page_size = PAGE_SIZE;
+        settings.service.new_post_delivery_concurrency = 4;
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
+            .tag(Tag::identifier("paged-fanout-vid"))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let result = handle_video_content_event(&state, &event, CancellationToken::new()).await;
+
+        for (idx, watcher) in watchers.iter().enumerate() {
+            let _ = redis_store::remove_token(
+                &pool,
+                &watcher.public_key(),
+                &format!("fanout_token_{}", idx),
+            )
+            .await;
+            // The coordinate claim carries a one-year TTL, so it has to go with
+            // the rest or every run leaves 150 keys behind for a year.
+            let claim_key =
+                video_recipient_claim_key(&event, &watcher.public_key(), NotificationType::NewPost)
+                    .expect("the test event has a d-tag");
+            let mut conn = pool.get().await.unwrap();
+            let _: () = redis::cmd("DEL")
+                .arg(format!("notify_subs:{}", watcher.public_key().to_hex()))
+                .arg(format!("notify_subs_ts:{}", watcher.public_key().to_hex()))
+                .arg(redis_store::build_notify_rate_key(
+                    &watcher.public_key(),
+                    &creator,
+                ))
+                .arg(format!("dedup:{claim_key}"))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("notify_watchers:{}", creator.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        result.expect("the fan-out completes");
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            WATCHERS,
+            "every watcher is notified, not just the ones on the first page"
+        );
+    }
+
+    #[test]
+    fn test_a_watcher_page_keeps_the_watchers_who_were_not_mentioned() {
+        // Partial overlap: the mention pass already covers `mentioned`, so the
+        // page owes a bell to `watcher` and nothing to them.
+        let author = Keys::generate().public_key();
+        let mentioned = Keys::generate().public_key();
+        let watcher = Keys::generate().public_key();
+
+        let targets = watcher_page_targets(
+            vec![mentioned, watcher],
+            &author,
+            &HashSet::from([mentioned]),
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, watcher);
+        assert_eq!(targets[0].notification_type, NotificationType::NewPost);
     }
 
     #[test]
@@ -1240,21 +2723,61 @@ mod tests {
 
         assert_ne!(first_event.id, edited_event.id);
         assert_eq!(
-            video_recipient_claim_key(&first_event, &recipient.public_key()),
-            video_recipient_claim_key(&edited_event, &recipient.public_key())
+            video_recipient_claim_key(
+                &first_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            ),
+            video_recipient_claim_key(
+                &edited_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            )
         );
         assert_eq!(
-            video_recipient_claim_key(&first_event, &recipient.public_key()),
+            video_recipient_claim_key(
+                &first_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            ),
             Some(format!(
-                "34236:{}:video:d-tag:{}",
+                "34236:mention:{}:video:d-tag:{}",
                 owner.public_key().to_hex(),
                 recipient.public_key().to_hex()
             ))
         );
         assert_ne!(
-            video_recipient_claim_key(&edited_event, &recipient.public_key()),
-            video_recipient_claim_key(&edited_event, &added_recipient.public_key()),
+            video_recipient_claim_key(
+                &edited_event,
+                &recipient.public_key(),
+                NotificationType::Mention
+            ),
+            video_recipient_claim_key(
+                &edited_event,
+                &added_recipient.public_key(),
+                NotificationType::Mention
+            ),
             "a newly added recipient must have an independent delivery record"
+        );
+    }
+
+    #[test]
+    fn test_video_recipient_claim_key_separates_notification_types() {
+        let owner = Keys::generate();
+        let recipient = Keys::generate();
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("video:d-tag"))
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+
+        // A bell and a mention for the same coordinate are different pushes
+        // carrying different information, so one must not consume the other's
+        // record for the coordinate TTL — a year by default.
+        assert_ne!(
+            video_recipient_claim_key(&event, &recipient.public_key(), NotificationType::NewPost),
+            video_recipient_claim_key(&event, &recipient.public_key(), NotificationType::Mention),
+            "a bell must not suppress a later mention on the same video"
         );
     }
 
@@ -1282,7 +2805,12 @@ mod tests {
             .tag(Tag::public_key(recipient.public_key()))
             .sign_with_keys(&owner)
             .unwrap();
-        let claim_key = video_recipient_claim_key(&first_event, &recipient.public_key()).unwrap();
+        let claim_key = video_recipient_claim_key(
+            &first_event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+        )
+        .unwrap();
         let redis_key = format!("dedup:{claim_key}");
 
         send_notification_to_user(
@@ -1290,6 +2818,7 @@ mod tests {
             &first_event,
             &recipient.public_key(),
             NotificationType::Mention,
+            &test_copy(),
             CancellationToken::new(),
         )
         .await
@@ -1314,6 +2843,7 @@ mod tests {
             &successful_edit,
             &recipient.public_key(),
             NotificationType::Mention,
+            &test_copy(),
             CancellationToken::new(),
         )
         .await
@@ -1338,6 +2868,7 @@ mod tests {
             &later_edit,
             &recipient.public_key(),
             NotificationType::Mention,
+            &test_copy(),
             CancellationToken::new(),
         )
         .await
@@ -1358,6 +2889,742 @@ mod tests {
             .query_async::<()>(&mut *conn)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_a_mention_satisfies_the_bell_record_but_not_the_reverse() {
+        // The asymmetry is the whole point: a mention names the video, so it
+        // covers the bell, but a bell says nothing about being mentioned.
+        assert_eq!(
+            satisfied_video_claims(NotificationType::Mention),
+            vec![NotificationType::Mention, NotificationType::NewPost]
+        );
+        assert_eq!(
+            satisfied_video_claims(NotificationType::NewPost),
+            vec![NotificationType::NewPost]
+        );
+        assert_eq!(
+            satisfied_video_claims(NotificationType::Comment),
+            vec![NotificationType::Comment]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_mention_suppresses_a_later_bell_on_the_same_video() {
+        // The other direction of the same rule. `watcher_page_targets` already
+        // says mention wins over bell on overlap; that has to hold across edits
+        // too. A watcher who was `p`-tagged in the original and dropped from the
+        // edit resolves to a bare NewPost target on the edit, and without the
+        // mention's record standing in for it they are told "posted a new vine"
+        // about a video they were already pushed about.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("mention-then-bell-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        // The watcher is `p`-tagged on the original, so mention wins and the
+        // bell is never delivered for this coordinate.
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("mention-then-bell"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the mention delivers"
+        );
+
+        // The creator edits the video and drops the `p` tag. The watcher is now
+        // only a bell target for the same coordinate.
+        let edit_dropping_mention = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("mention-then-bell"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &edit_dropping_mention,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "an edit must not re-announce an already-pushed video as a new post"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let bell_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let mention_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{bell_key}"))
+            .arg(format!("dedup:{mention_key}"))
+            .arg(redis_store::build_notify_rate_key(
+                &watcher.public_key(),
+                &owner.public_key(),
+            ))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_legacy_video_claim_suppresses_type_scoped_delivery() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("legacy-claim-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("legacy-claim"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let legacy_key = legacy_video_recipient_claim_key(&event, &watcher.public_key()).unwrap();
+        redis_store::set_cached_string(&pool, &format!("dedup:{legacy_key}"), "1", 3600)
+            .await
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "a one-year legacy coordinate record must survive the key-format rollout"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{legacy_key}"))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_muted_video_mention_falls_back_to_enabled_bell_for_watcher() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("mention-fallback-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        preferences::set_user_preferences(
+            &pool,
+            &watcher.public_key().to_hex(),
+            &UserPreferences { kinds: vec![34236] },
+        )
+        .await
+        .unwrap();
+        redis_store::replace_notify_subscriptions(
+            &pool,
+            &watcher.public_key(),
+            &[owner.public_key()],
+            1000,
+            &test_event_id(1000),
+        )
+        .await
+        .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "mentioned watcher")
+            .tag(Tag::identifier("mention-fallback"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let sent = mock_sender.get_sent_messages();
+        assert_eq!(sent.len(), 1);
+        let payload_type = sent[0].1.data.as_ref().and_then(|data| data.get("type"));
+        assert_eq!(
+            payload_type,
+            Some(&"newPost".to_string()),
+            "the muted mention should deliver the bell the watcher enabled"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        preferences::delete_user_preferences(&pool, &watcher.public_key().to_hex())
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let bell_key =
+            video_recipient_claim_key(&event, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{bell_key}"))
+            .arg(redis_store::build_notify_rate_key(
+                &watcher.public_key(),
+                &owner.public_key(),
+            ))
+            .arg(format!("notify_subs:{}", watcher.public_key().to_hex()))
+            .arg(format!("notify_subs_ts:{}", watcher.public_key().to_hex()))
+            .arg(format!("notify_watchers:{}", owner.public_key().to_hex()))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_rate_limited_bell_records_the_video_coordinate() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("rate-limited-claim-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let rate_key =
+            redis_store::build_notify_rate_key(&watcher.public_key(), &owner.public_key());
+        redis_store::set_cached_string(&pool, &rate_key, "1", 3600)
+            .await
+            .unwrap();
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let event = EventBuilder::new(Kind::from(KIND_VIDEO), "inside the window")
+            .tag(Tag::identifier("rate-limited-claim"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &event,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let claim_key =
+            video_recipient_claim_key(&event, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "the rate-limited video itself is suppressed"
+        );
+        assert!(
+            record.is_some(),
+            "a suppressed new-post push must still mark the coordinate"
+        );
+
+        let edit = EventBuilder::new(Kind::from(KIND_VIDEO), "later edit")
+            .tag(Tag::identifier("rate-limited-claim"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&rate_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &edit,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "a later edit of the suppressed video must stay quiet"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{claim_key}"))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_bookkeeping_failure_does_not_skip_the_video_claim() {
+        // The post-send writes are bookkeeping: the push has already shipped, so
+        // one of them failing must not take the others down with it. The
+        // coordinate record is what stops a NIP-33 edit re-notifying, so losing
+        // it because an unrelated write errored costs the user a duplicate push.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("bookkeeping-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        // `SETEX key 0 v` is a Redis error, so the rate-limit write fails while
+        // the send itself succeeds. Reachable in production via
+        // `NOSTR_PUSH__SERVICE__NEW_POST_RATE_LIMIT_SECS=0`, which nothing
+        // validates at load.
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.new_post_rate_limit_secs = 0;
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("bookkeeping-vid"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let result = send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let claim_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("dedup:{claim_key}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the push was delivered"
+        );
+        assert!(
+            record.is_some(),
+            "a delivered video push must record its coordinate, or the next edit re-notifies"
+        );
+        assert!(result.is_ok(), "a delivered push must not report failure");
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_claim_write_is_not_reported_as_a_delivery_failure() {
+        // Same class as the test above, one write further down: the claim loop.
+        // A delivered push that returns `Err` is not just cosmetic. The caller
+        // logs it as a failed notification, and the remaining post-send work,
+        // including invalid-token removal, is skipped.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("claim-write-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let mut settings = crate::config::Settings::new().unwrap();
+        // Makes the coordinate `SETEX` error while the send still succeeds.
+        settings.service.video_coordinate_dedup_ttl_secs = 0;
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("claim-write-vid"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let result = send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Without this the test could pass vacuously, by the claim write
+        // quietly succeeding and there being nothing to survive.
+        let claim_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the push was delivered"
+        );
+        assert!(
+            record.is_none(),
+            "the claim write must actually have failed, or this test proves nothing"
+        );
+        assert!(
+            result.is_ok(),
+            "a bookkeeping write failing is not a delivery failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_claim_write_still_removes_the_invalid_token() {
+        // The consequence the test above only implies. Invalid-token removal
+        // runs after the claim writes, so a `?` on them strands a token FCM has
+        // already rejected: every later push to this user pays for a delivery
+        // that cannot land, and nothing retries the removal.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        // Two tokens: one has to succeed, or `success_count` stays 0 and the
+        // claim write this test needs to fail never runs at all.
+        let live_token = format!("live-{}", watcher.public_key().to_hex());
+        let stale_token = format!("stale-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &live_token)
+            .await
+            .unwrap();
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &stale_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(&stale_token, FcmError::TokenNotRegistered);
+        let mut settings = crate::config::Settings::new().unwrap();
+        // Makes both coordinate `SETEX` calls error while the send succeeds.
+        settings.service.video_coordinate_dedup_ttl_secs = 0;
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("stale-token-vid"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        let result = send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let claim_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let record = redis_store::get_cached_string(&pool, &format!("dedup:{claim_key}"))
+            .await
+            .unwrap();
+        let remaining = redis_store::get_tokens_for_pubkey(&pool, &watcher.public_key())
+            .await
+            .unwrap();
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &live_token)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &watcher.public_key(), &stale_token)
+            .await
+            .unwrap();
+
+        assert!(
+            record.is_none(),
+            "the claim write must actually have failed, or this test proves nothing"
+        );
+        assert!(
+            result.is_ok(),
+            "a bookkeeping failure is not a send failure"
+        );
+        assert!(
+            !remaining.contains(&stale_token),
+            "a token FCM reported as unregistered must be removed even when the claim write failed"
+        );
+        assert!(
+            remaining.contains(&live_token),
+            "the token that delivered must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_bell_does_not_suppress_a_later_mention_on_the_same_video() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("bell-then-mention-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        // The bell fires first: the watcher is not `p`-tagged on the original.
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "first version")
+            .tag(Tag::identifier("bell-then-mention"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the bell delivers"
+        );
+
+        // The creator then edits the video and `p`-tags the watcher. That is a
+        // different notification carrying different information, so it must not
+        // be eaten by the bell's record for the same coordinate.
+        let edit_adding_mention = EventBuilder::new(Kind::from(KIND_VIDEO), "edited version")
+            .tag(Tag::identifier("bell-then-mention"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &edit_adding_mention,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            2,
+            "a delivered bell must not suppress a later mention on the same video"
+        );
+
+        // The per-type record still works within its own type: a second edit
+        // does not re-notify the mention.
+        let further_edit = EventBuilder::new(Kind::from(KIND_VIDEO), "second edit")
+            .tag(Tag::identifier("bell-then-mention"))
+            .tag(Tag::public_key(watcher.public_key()))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &further_edit,
+            &watcher.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            2,
+            "the mention's own record still suppresses a repeat edit"
+        );
+
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+        let bell_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::NewPost)
+                .unwrap();
+        let mention_key =
+            video_recipient_claim_key(&published, &watcher.public_key(), NotificationType::Mention)
+                .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{bell_key}"))
+            .arg(format!("dedup:{mention_key}"))
+            .arg(redis_store::build_notify_rate_key(
+                &watcher.public_key(),
+                &owner.public_key(),
+            ))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_send_does_not_burn_the_rate_limit_window() {
+        // Check-then-set-on-success is a deliberate choice over `SET NX EX`, and
+        // this is the behaviour it was chosen for: an FCM blip must not cost the
+        // watcher an hour of bells. The comment above the write says so and asks
+        // that it not be "fixed" later, which is precisely why it needs a test
+        // rather than a comment.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate();
+        let watcher = Keys::generate();
+        let fcm_token = format!("failed-send-{}", watcher.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        // Transient, not `TokenNotRegistered`: the token stays registered so the
+        // next attempt can still succeed, which is the case the window protects.
+        mock_sender.set_error_for_token(&fcm_token, FcmError::InternalError);
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let published = EventBuilder::new(Kind::from(KIND_VIDEO), "a new vine")
+            .tag(Tag::identifier("failed-send"))
+            .sign_with_keys(&owner)
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &published,
+            &watcher.public_key(),
+            NotificationType::NewPost,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let rate_key =
+            redis_store::build_notify_rate_key(&watcher.public_key(), &owner.public_key());
+        let marker = redis_store::get_cached_string(&pool, &rate_key)
+            .await
+            .unwrap();
+
+        // Cleanup before the assertions, so a failure does not leave a
+        // registered token behind in the developer's Redis.
+        redis_store::remove_token(&pool, &watcher.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "the send was supposed to fail"
+        );
+        assert!(
+            marker.is_none(),
+            "a bell nobody received must not consume the watcher's hour"
+        );
     }
 
     #[test]

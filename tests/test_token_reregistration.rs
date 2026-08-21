@@ -14,6 +14,19 @@ async fn test_token_reregistration_by_different_pubkey() {
             return;
         }
     };
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(_) => {
+            println!("Skipping test: Redis not available");
+            return;
+        }
+    };
+    let ping_result: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+    if ping_result.is_err() {
+        println!("Skipping test: Redis not available");
+        return;
+    }
+    drop(conn);
 
     // Create test data
     let token = "test_fcm_token_12345";

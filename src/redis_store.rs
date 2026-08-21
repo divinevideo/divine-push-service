@@ -12,6 +12,7 @@ use bb8_redis::bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use nostr_sdk::{EventId, PublicKey, Timestamp};
 use redis::{RedisResult, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 
 // Type alias for the connection pool
@@ -275,6 +276,321 @@ pub async fn try_claim_event(
 
     // SET NX returns "OK" if the key was set, None if it already existed
     Ok(result.is_some())
+}
+
+// =============================================================================
+// Notify Subscriptions ("bells")
+// =============================================================================
+
+/// Forward index: creators this subscriber has belled.
+fn build_notify_subs_key(subscriber: &PublicKey) -> String {
+    format!("notify_subs:{}", subscriber.to_hex())
+}
+
+/// `created_at:event_id` of the last applied notify-list event for this
+/// subscriber. The id is carried so a `created_at` tie can resolve the way
+/// NIP-01 resolves it, by lowest event id.
+fn build_notify_subs_ts_key(subscriber: &PublicKey) -> String {
+    format!("notify_subs_ts:{}", subscriber.to_hex())
+}
+
+/// Prefix of the reverse index. Kept as a prefix (not a built key) because the
+/// Lua script below composes watcher keys from it.
+const NOTIFY_WATCHERS_PREFIX: &str = "notify_watchers:";
+
+/// Reverse index: subscribers watching this creator. The hot read path.
+fn build_notify_watchers_key(creator: &PublicKey) -> String {
+    format!("{}{}", NOTIFY_WATCHERS_PREFIX, creator.to_hex())
+}
+
+/// Rate-limit window marker for one (subscriber, creator) pair.
+pub fn build_notify_rate_key(subscriber: &PublicKey, creator: &PublicKey) -> String {
+    format!("notify_rate:{}:{}", subscriber.to_hex(), creator.to_hex())
+}
+
+/// Diff-and-apply a replacement notify list atomically.
+///
+/// `notify_subs` and `notify_watchers` are two views of the same relation and
+/// must move together, so the whole diff runs in one Lua script rather than a
+/// read-then-write from the caller.
+///
+/// The script re-checks the stored `created_at` internally: a relay can deliver
+/// an older replacement after a newer one, and an advisory check in the caller
+/// would still race. Returns `false` when the incoming event was rejected as
+/// stale or duplicate, `true` when it was applied.
+///
+/// Ties on `created_at` resolve the way NIP-01 resolves them: "in case of
+/// replaceable events with the same timestamp, the event with the lowest id
+/// (first in lexical order) should be retained". Resolving by arrival order
+/// instead would let this service and the relay hold permanently different
+/// lists — a rebuild from relay history would then disagree with what we served
+/// live. Note the direction: an incoming event with an *equal* timestamp wins
+/// only when its id sorts *below* the stored one, which reads backwards from
+/// "newer wins". An exact replay (same timestamp, same id) is allowed through
+/// as an idempotent repair path for startup rebuilds.
+///
+/// `notify_subs_ts` therefore stores `created_at:event_id`. A bare integer left
+/// by an earlier build is read as a timestamp with no known id, which can only
+/// make the guard more conservative: ties against it are rejected, exactly as
+/// they were before.
+///
+/// The atomicity is load-bearing because production runs more than one replica.
+/// `try_claim_event` only prevents two replicas handling the *same* event; two
+/// different list events from one subscriber can still land concurrently, and a
+/// read-then-write would let the older one win. A single replica needs none of
+/// this — its handler loop is sequential.
+///
+/// Atomic is not transactional, though: Redis runs the script without
+/// interleaving anything else, but a script that dies partway through keeps the
+/// writes it already made. So the write order holds one invariant at every
+/// intermediate step — every `notify_watchers:{creator}` naming this subscriber
+/// has `creator` in `notify_subs:{subscriber}`. Removals clear the reverse
+/// index before the forward one and additions write the forward index first,
+/// which leaves a half-applied script with `notify_subs` a *superset* of the
+/// true relation. The next list reconciles that, because removals are computed
+/// from it.
+///
+/// The opposite skew does not recover, which is why the forward set is diffed
+/// rather than `DEL`d and rebuilt. `notify_subs` is the only record of which
+/// `notify_watchers:*` keys hold this subscriber, so once it is short, the
+/// missing creators are unreachable: `previous` comes back without them, their
+/// `SREM` is never issued, and the subscriber keeps getting pushes for a
+/// creator they unbelled. Republishing the list they actually hold does not
+/// help — only re-belling that exact creator and unbelling again would, which
+/// is not something a user would think to do.
+///
+/// `creators` must already be bounded by the caller
+/// (`notify_list_max_creators`): the script runs as one blocking unit and Redis
+/// is single-threaded, so an unbounded list stalls the instance for every user.
+///
+/// Not Redis Cluster safe: the script writes `notify_watchers:*` keys that are
+/// not declared in `KEYS`, because the set of creators is only known from the
+/// event body. This deployment uses single-instance Redis (see
+/// `docker-compose.yml`); moving to Cluster requires resharding this into one
+/// call per creator slot or a hash-tagged key layout.
+pub async fn replace_notify_subscriptions(
+    pool: &RedisPool,
+    subscriber: &PublicKey,
+    creators: &[PublicKey],
+    created_at: u64,
+    event_id: &EventId,
+) -> Result<bool> {
+    const REPLACE_SCRIPT: &str = r#"
+        local incoming_at = tonumber(ARGV[1])
+        local incoming_id = ARGV[4]
+
+        local stored = redis.call('GET', KEYS[2])
+        if stored then
+          -- `created_at:event_id`, or a bare integer written by an earlier
+          -- build. An unparseable value is treated as absent rather than
+          -- wedging the subscriber's list forever.
+          local stored_at, stored_id = string.match(stored, '^(%d+):(%x+)$')
+          if stored_at then
+            stored_at = tonumber(stored_at)
+          else
+            stored_at = tonumber(stored)
+            stored_id = nil
+          end
+
+          if stored_at then
+            if stored_at > incoming_at then
+              return 0
+            end
+            if stored_at == incoming_at then
+              -- NIP-01 retains the lowest id on a tie, so the incoming event
+              -- has to sort below the stored one, or be the exact same event
+              -- replayed during a rebuild. With no stored id there is nothing
+              -- to compare, so the tie stays rejected.
+              if not stored_id or incoming_id > stored_id then
+                return 0
+              end
+            end
+          end
+        end
+
+        local prefix = ARGV[2]
+        local subscriber = ARGV[3]
+
+        local incoming = {}
+        for i = 5, #ARGV do
+          incoming[ARGV[i]] = true
+        end
+
+        -- Drop the subscriber from creators no longer on the list, reverse
+        -- index first. Applying the difference rather than replacing the
+        -- forward set wholesale is what keeps a half-applied script
+        -- recoverable; see the ordering note in the function doc. An empty
+        -- incoming list is legitimate (the user unbelled everyone) and Redis
+        -- drops the key once its last member is removed.
+        local previous = redis.call('SMEMBERS', KEYS[1])
+        for _, creator in ipairs(previous) do
+          if not incoming[creator] then
+            redis.call('SREM', prefix .. creator, subscriber)
+            redis.call('SREM', KEYS[1], creator)
+          end
+        end
+
+        -- Add the new ones, forward index first, for the same reason. Both
+        -- writes are unconditional, and the second one is why: re-asserting the
+        -- reverse entry for a creator already on the forward set is exactly
+        -- what lets an exact replay repair a `notify_watchers:*` that Redis
+        -- lost while `notify_subs:*` survived. Skipping either write when the
+        -- creator "is already applied" would take that repair away, and the
+        -- forward `SADD` it would save is a no-op on a member anyway.
+        for i = 5, #ARGV do
+          redis.call('SADD', KEYS[1], ARGV[i])
+          redis.call('SADD', prefix .. ARGV[i], subscriber)
+        end
+
+        -- ARGV[1] verbatim rather than `incoming_at`, so the stored timestamp
+        -- is the caller's decimal string and never Lua's float formatting.
+        redis.call('SET', KEYS[2], ARGV[1] .. ':' .. incoming_id)
+        return 1
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let script = redis::Script::new(REPLACE_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(build_notify_subs_key(subscriber))
+        .key(build_notify_subs_ts_key(subscriber))
+        .arg(created_at)
+        .arg(NOTIFY_WATCHERS_PREFIX)
+        .arg(subscriber.to_hex())
+        .arg(event_id.to_hex());
+    for creator in creators {
+        invocation.arg(creator.to_hex());
+    }
+
+    let applied: i64 = invocation
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(applied == 1)
+}
+
+/// Read every subscriber watching `creator` in one `SMEMBERS`.
+///
+/// **Not the fan-out read.** Delivery pages with `get_notify_watchers_page`,
+/// and the bell fallback asks `is_notify_watcher`; this is the unbounded read
+/// both of those exist to keep off the hot path, and it has no caller in `src/`.
+/// It survives as the whole-set assertion helper the notify-list tests are
+/// written against. Do not reintroduce it into delivery.
+///
+/// Unparseable members are skipped with a warning rather than failing the whole
+/// lookup, so one corrupt entry cannot block delivery to everyone else.
+pub async fn get_notify_watchers(pool: &RedisPool, creator: &PublicKey) -> Result<Vec<PublicKey>> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let members: Vec<String> = redis::cmd("SMEMBERS")
+        .arg(build_notify_watchers_key(creator))
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    let mut watchers = Vec::with_capacity(members.len());
+    for member in members {
+        match PublicKey::from_hex(&member) {
+            Ok(pubkey) => watchers.push(pubkey),
+            Err(e) => tracing::warn!(
+                creator = %creator.to_hex(),
+                member = %member,
+                error = %e,
+                "Skipping unparseable notify watcher"
+            ),
+        }
+    }
+
+    Ok(watchers)
+}
+
+/// One page of subscribers watching a creator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyWatcherPage {
+    pub watchers: Vec<PublicKey>,
+    pub next_cursor: u64,
+}
+
+/// Read one SSCAN page of subscribers watching `creator`.
+///
+/// The video fan-out path loops over pages so each Redis read and delivery
+/// batch stays bounded without dropping subscribers beyond a permanent cap.
+/// Unparseable members are skipped with a warning rather than failing the page.
+pub async fn get_notify_watchers_page(
+    pool: &RedisPool,
+    creator: &PublicKey,
+    cursor: u64,
+    count: usize,
+) -> Result<NotifyWatcherPage> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let (next_cursor, members): (u64, Vec<String>) = redis::cmd("SSCAN")
+        .arg(build_notify_watchers_key(creator))
+        .arg(cursor)
+        .arg("COUNT")
+        .arg(count)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    let mut seen = HashSet::with_capacity(members.len());
+    let mut watchers = Vec::with_capacity(members.len());
+    for member in members {
+        match PublicKey::from_hex(&member) {
+            Ok(pubkey) => {
+                if seen.insert(pubkey) {
+                    watchers.push(pubkey);
+                }
+            }
+            Err(e) => tracing::warn!(
+                creator = %creator.to_hex(),
+                member = %member,
+                error = %e,
+                "Skipping unparseable notify watcher"
+            ),
+        }
+    }
+
+    Ok(NotifyWatcherPage {
+        watchers,
+        next_cursor,
+    })
+}
+
+/// Test whether `subscriber` watches `creator`.
+///
+/// The membership question on its own. The bell fallback in
+/// `send_notification_to_user` asks it per muted-mention recipient, and it is
+/// the whole answer it needs, so it must not pay `get_notify_watchers`'s
+/// transfer-and-parse of a creator's entire watcher set. `SISMEMBER` answers
+/// in the server. Fan-out reads use `get_notify_watchers_page`.
+pub async fn is_notify_watcher(
+    pool: &RedisPool,
+    creator: &PublicKey,
+    subscriber: &PublicKey,
+) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    redis::cmd("SISMEMBER")
+        .arg(build_notify_watchers_key(creator))
+        .arg(subscriber.to_hex())
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)
 }
 
 // =============================================================================

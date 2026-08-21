@@ -26,6 +26,11 @@ Avoid always-on connections (battery), deliver timely alerts, and enable secure 
 
 All event content fields MUST contain NIP-44 ciphertext strings. The decrypted payload structure is defined below.
 
+A service MAY additionally read a public NIP-51 list to support per-author
+subscriptions; see [Author subscriptions](#author-subscriptions-kind-30000).
+That list is deliberately **not** encrypted, because the service must be able to
+read it. It is not one of the control kinds above and carries no ciphertext.
+
 ### Registration (kind 3079)
 
 ```json
@@ -96,11 +101,62 @@ The decrypted content is a JSON object with a `kinds` array listing the event ki
 
 An empty `kinds` array disables all notifications. Services SHOULD define sensible defaults for users who have not sent a preferences event.
 
+### Author subscriptions (kind 30000)
+
+Every trigger described so far is *someone acted on your content*, resolved from
+`p` tags on the trigger event. A service MAY also support the inverse — notify a
+user when an author they subscribed to publishes — by reading a NIP-51 people
+list with a reserved `d` identifier:
+
+```json
+{
+  "kind": 30000,
+  "tags": [
+    ["d", "notify"],
+    ["title", "Notify"],
+    ["p", "<author-pubkey-hex>"],
+    ["p", "<author-pubkey-hex>"]
+  ],
+  "content": ""
+}
+```
+
+Requirements:
+
+- The list is a parameterised replaceable event: the tuple (pubkey, `30000`,
+  `notify`) identifies it, and each publish REPLACES the previous set. Clients
+  MUST publish the complete list on every change, never a delta.
+- `content` MUST be empty. Encrypting it would make the list unreadable to the
+  service and defeat the mechanism.
+- `p` tags MUST carry full-length hex pubkeys.
+- An empty `p` set is **valid** and means "no subscriptions". Services MUST treat
+  it as a clearing update, not as a malformed event.
+- Services MUST ignore kind 30000 events whose `d` tag is not exactly `notify`.
+- Services MUST NOT age these events out on a replay horizon. A list published
+  long ago and never edited is still current.
+- Services SHOULD guard against out-of-order delivery by tracking the last
+  applied list and rejecting anything older; relays may deliver a stale
+  replacement after a newer one.
+- Services MUST resolve a `created_at` tie the way NIP-01 resolves it, by
+  retaining the event with the lowest id. Resolving by arrival order instead
+  makes the service's state diverge permanently from the relay's, so a rebuild
+  from relay history answers differently than what was served live. Tracking the
+  last applied `created_at` alone is not enough for this; the id has to be kept
+  alongside it.
+
+Because the list is public, **who a user subscribes to is public**. Clients
+SHOULD surface that rather than implying the subscription is private.
+
+Notifications generated this way SHOULD be rate-limited per (subscriber, author);
+a prolific author otherwise trains users into disabling notifications entirely.
+
 ## Notification Triggers
 
 Services define which events trigger notifications. A typical single-app service watches for specific event kinds (reactions, replies, follows, mentions, reposts) and notifies users who are tagged or referenced.
 
-Services MAY support additional trigger logic beyond kind matching.
+Services MAY support additional trigger logic beyond kind matching, including
+recipient sets that come from subscriber-published state rather than from tags
+on the trigger event (see [Author subscriptions](#author-subscriptions-kind-30000)).
 
 ## Implementation Requirements
 

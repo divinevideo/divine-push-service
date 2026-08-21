@@ -65,11 +65,19 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - **3079**: Register push token (encrypted)
 - **3080**: Deregister push token (encrypted)
 - **3083**: Update notification preferences
+- **30000**: NIP-51 people list; `d=notify` carries new-post ("bell") subscriptions (public, unencrypted)
 
 ### Redis Keys
-- `divine:token:{pubkey}` - User's FCM token
-- `divine:preferences:{pubkey}` - User's notification preferences (JSON)
-- `divine:dedup:{pubkey}:{event_id}` - Deduplication with TTL
+- `user_tokens:{pubkey}` - Set of FCM tokens registered for a pubkey
+- `token_to_pubkey` - Hash mapping a token back to its owner
+- `stale_tokens` - Sorted set of token timestamps, for cleanup
+- `user_preferences:{pubkey}` - User's notification preferences (JSON)
+- `dedup:{event_id}` - Per-event processing claim with TTL. Notify lists are exempt: they are idempotent by `created_at`, so the claim prevents nothing and a failed handler would otherwise strand the list for the TTL
+- `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` - Per-recipient video delivery, so a NIP-33 edit does not re-notify. Scoped by notification type so a bell does not suppress a later mention on the same video. The scoping is one-directional: a delivered mention also writes the `newPost` record, because naming the video already tells the recipient it exists
+- `notify_subs:{subscriber}` - Creators this user has belled
+- `notify_subs_ts:{subscriber}` - `created_at:event_id` of the last applied notify list (out-of-order guard). The id resolves a `created_at` tie by NIP-01's lowest-id rule; a bare integer from an earlier build still reads as a timestamp with no known id
+- `notify_watchers:{creator}` - Subscribers watching this creator (hot read path)
+- `notify_rate:{subscriber}:{creator}` - New-post rate-limit window marker
 
 ### Notification Types
 | Type | Kind | Description |
@@ -79,6 +87,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 | Follow | 3 | New followers |
 | Mention | 1 | Notes mentioning user |
 | Repost | 16 | Reposts of user's notes |
+| NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
 
 ## Unblocking Workflow
 

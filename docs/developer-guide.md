@@ -37,6 +37,7 @@ sequenceDiagram
 | 3079 | Client → Relay → Service | Register FCM push token (NIP-44 encrypted) |
 | 3080 | Client → Relay → Service | Deregister push token (NIP-44 encrypted) |
 | 3083 | Client → Relay → Service | Update notification preferences (optional) |
+| 30000 | Client → Relay → Service | NIP-51 people list; `d=notify` carries new-post ("bell") subscriptions. Public and unencrypted, and addressed to the world rather than `p`-tagged to the service |
 
 See [NIP-XX Push Notifications](nip-xx-push-notifications.md) for the full protocol specification.
 
@@ -53,8 +54,9 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
+| NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
 
-> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, and reposts are the types actually delivered today.
+> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, reposts, and new posts are the types actually delivered today.
 
 > **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
 
@@ -103,7 +105,7 @@ When the triggering event is not addressable and carries no addressable referenc
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `like`, `comment`, `follow`, `mention`, or `repost` (lowercase) |
+| `type` | string | `like`, `comment`, `follow`, `mention`, `repost`, or `newPost`. Match the exact string: the first five are lowercase, `newPost` is camelCase |
 | `eventId` | hex | The Nostr event that triggered the notification (the like/comment/repost/follow event itself); stable id for dedup and a routing fallback |
 | `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes follows and otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
@@ -180,7 +182,9 @@ Clients use this pubkey to:
 
 ## Deduplication
 
-The service uses atomic Redis `SET NX EX` per-event keys to prevent duplicate notifications across multiple replicas. Each event is claimed exactly once with a 7-day TTL.
+The service uses atomic Redis `SET NX EX` per-event keys to prevent duplicate notifications across multiple replicas. Each event that sends a push is claimed exactly once with a 7-day TTL.
+
+Notify lists (kind 30000, `d=notify`) are the exception: they send no push, and claiming them would strand a subscriber's bells for the TTL if the handler failed. See [Ingestion](#ingestion) for why the claim buys nothing there.
 
 ## User Preferences
 
@@ -190,7 +194,192 @@ Users can optionally send a Kind 3083 event to control which notification types 
 { "kinds": [1, 3, 7, 16] }
 ```
 
-This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), follows (3), reactions (7), reposts (16), and long-form content (30023).
+This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), follows (3), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236).
+
+## New-post subscriptions ("bells")
+
+Every other notification type is triggered by someone acting on the recipient's
+content, so recipients are read off the trigger event's `p` tags. New-post
+notifications invert that: the recipient subscribed to a creator's output, and
+the trigger event says nothing about who wants it.
+
+### Source of truth
+
+The subscription list is a public NIP-51 people list published by the client,
+identified by a reserved `d` tag:
+
+```json
+{
+  "kind": 30000,
+  "tags": [
+    ["d", "notify"],
+    ["title", "Notify"],
+    ["p", "<creator-pubkey-hex>"]
+  ]
+}
+```
+
+It is replaceable and unencrypted — the service has to be able to read it, so
+there is no decryption step, unlike the kind 3079/3080/3083 control events. Any
+kind 30000 arriving without exactly `d=notify` is ignored.
+
+### Ingestion
+
+`handle_notify_list_update` is routed **before** the control-event block and
+deliberately outside its `p`-tag gate: these events are addressed to the world,
+not to this service.
+
+Two properties are load-bearing:
+
+- **Notify lists are exempt from the replay horizon.** A list published three
+  months ago and never touched since is still the user's current subscription
+  set, so `is_notify_list` carves it out of the `is_event_too_old` check. The
+  historical query is likewise unbounded by `since` and pages backward with
+  `until`, using `notify_list_history_limit` as the per-page size valve.
+  Without historical replay, a restart against a fresh Redis silently drops
+  every bell until each user republishes.
+- **Notify lists are exempt from the event claim.** `run()` claims every other
+  event before routing it, so two replicas cannot send the same push twice.
+  Notify lists send nothing, and `replace_notify_subscriptions` already rejects
+  any list not strictly newer than the stored one, so the claim prevents nothing
+  here. It does cost something: the claim is taken before routing and never
+  released, so a transient Redis error inside the handler leaves it standing and
+  the replay on the next restart skips the event as already-claimed. That
+  subscriber's bells stay dark for the full `processed_event_ttl_secs`.
+  `requires_event_claim` scopes the exemption with `is_notify_list`, the same
+  kind-plus-`d`-tag check the horizon exemption uses.
+- **An empty `p` list is legitimate**, not malformed. It means the user unbelled
+  everyone, and it must clear the forward set and remove them from every reverse
+  index.
+
+`replace_notify_subscriptions` applies the diff in a single Lua script keyed on
+the subscriber, because `notify_subs` and `notify_watchers` are two views of one
+relation and must move together. The script re-checks the stored `created_at`
+internally — a relay can deliver an older replacement after a newer one, and an
+advisory check in the caller would still race.
+
+The write order inside the script is deliberate. Redis runs a script without
+interleaving anything else, but it does not roll one back, so a script that dies
+partway keeps what it already wrote. Removals therefore clear the reverse index
+before the forward one and additions write the forward index first, which keeps
+`notify_subs` a *superset* of the true relation at every intermediate step. That
+matters because `notify_subs` is the only record of which `notify_watchers:*`
+keys name a subscriber, and removals are computed from it: a superset is
+reconciled by the next list, while a forward index that is missing entries the
+reverse index still holds cannot be repaired by anything the user can publish.
+Do not "simplify" the diff back into a `DEL` and rebuild.
+
+This covers the script failing on its own. It does not cover the index being
+lost some other way, and the startup replay covers that in one direction only.
+A *total* loss rebuilds: `notify_subs_ts` goes with everything else, so every
+replayed list passes the guard and re-applies. A lost *reverse* index rebuilds
+as well, even with `notify_subs_ts` intact, because an exact-id replay is
+applied rather than rejected (see the tie-break note below) and re-asserts every
+`notify_watchers:*` entry the list implies.
+
+The mirror case is the one the replay cannot repair: if `notify_subs` is lost
+while the reverse index survives, the removal loop has nothing to diff against,
+so watcher entries for creators the subscriber has since unbelled stay behind
+and keep delivering. Republishing does not clear them — a new list only adds —
+which is the same asymmetry the write ordering above exists to avoid creating.
+Removing those `notify_watchers:*` entries directly is the only lever.
+
+Ties on `created_at` resolve by NIP-01's rule, retaining the lowest event id.
+The protocol requires clients to publish the complete list on every change, so
+belling two creators in quick succession produces two full-list publishes that
+can share a second; resolving those by arrival order would leave this service
+holding a different list than the relay does, permanently. Watch the direction
+when reading the script: an equal-timestamp event is applied when its id sorts
+*below* the stored one, which reads backwards from "newer wins". An exact replay
+is also applied as an idempotent repair path, so startup replay can reassert
+`notify_watchers:*` entries if Redis lost the reverse index while the timestamp
+guard survived.
+
+Because the script runs as one blocking unit and Redis is single-threaded, the
+creator list is bounded by `notify_list_max_creators` before it reaches Redis —
+otherwise one user with an absurd number of bells stalls the instance for
+everyone. Excess creators are dropped with a warning rather than the whole list
+being rejected, so the user keeps the bells that fit instead of losing all of
+them.
+
+Atomicity here is not theoretical: production runs more than one replica, and the
+event-level claim (`try_claim_event`) only stops two replicas processing *the same*
+event — it does nothing about two different list events from the same subscriber
+landing concurrently. Within a single replica the handler loop is sequential, so
+this is purely a cross-replica concern.
+
+The script writes `notify_watchers:*` keys that are not declared in `KEYS`, so it
+is **not Redis Cluster safe**. This deployment uses single-instance Redis; moving
+to Cluster requires resharding into one call per creator slot or a hash-tagged
+key layout.
+
+### Delivery
+
+On each incoming kind 34236, the handler sends the video's mention targets first,
+then walks `notify_watchers:{author}` with paged `SSCAN` reads and bounded
+delivery for each page.
+
+**Mention wins on overlap.** A user who both watches the creator and is mentioned
+in the video gets one push, typed `mention`, because that is the more specific
+signal.
+
+The rule also holds across edits, which takes an extra step because the
+per-recipient coordinate record is scoped by notification type. A delivered
+mention writes the `newPost` record as well as its own: naming the video already
+tells the recipient it exists, which is the whole content of a bell. A delivered
+bell writes only its own, since "X posted a vine" says nothing about being
+mentioned. Without the one-directional carry, a watcher who was `p`-tagged in
+the original and dropped from an edit would be told "posted a new vine" about a
+video they were already pushed about.
+
+Delivery is capped at one push per (subscriber, creator) per
+`new_post_rate_limit_secs`. The window is opened only on a *delivered* push
+(check-then-set-on-success, mirroring the video-coordinate dedup) so a failed FCM
+send does not burn the user's hour. The cost is that two replicas handling
+different videos from the same creator in the same instant can both pass the
+check and double-send — rare, bounded, and preferable to silently eating an hour
+of notifications on an FCM blip.
+
+When the rate limit suppresses a new-post push, the video-coordinate record is
+still written. That video has been intentionally dropped for that watcher, and a
+later NIP-33 edit should not re-announce it as a fresh post.
+
+New-post fan-out is paged by `new_post_fanout_page_size` and each page is
+delivered with at most `new_post_delivery_concurrency` concurrent recipient
+sends. This is separate from the notify-list write cap: one user's list cannot
+stall Redis on write, and one popular creator's audience cannot turn a single
+video into one unbounded Redis read or unbounded sequential delivery loop. The
+page size is not a recipient cap; the handler continues until Redis returns
+cursor 0.
+
+The rate limit is push-only. The in-app feed shows every post from belled
+creators, so a user who receives one push for a six-post burst opens the app and
+sees all six. That is intended.
+
+### Subscription retention on deregistration
+
+Nothing removes a subscriber. `notify_subs:*`, `notify_subs_ts:*` and
+`notify_watchers:*` carry no TTL, `handle_deregistration` does not touch them,
+and the cleanup service does not sweep them. A user who deregisters their push
+token leaves their bell subscriptions in place indefinitely.
+
+This is accepted for now, not overlooked:
+
+- It is not a data-exposure question. The bell list is a kind 30000 `d=notify`
+  event and deliberately unencrypted, so it is already public on relays; the
+  reverse index holds nothing the relay does not.
+- It sends nothing. A deregistered user has no tokens, so
+  `send_notification_to_user` returns before any push.
+- The real cost is wasted fan-out iteration: those pubkeys stay in
+  `notify_watchers:{creator}` and are read, paged and gated on every video from
+  a creator they will never hear from.
+
+The obvious fix has a trap, which is why it is not a one-line addition to
+`handle_deregistration`. Deleting the subscriptions on deregistration means they
+do not come back when the same user re-registers, because the historical
+notify-list replay that would rebuild them runs only at startup. Deregistration
+cleanup therefore belongs with rebuild-on-registration, and both are tracked in
+the fan-out follow-up rather than done by halves here.
 
 ## Redis Keys
 
@@ -199,6 +388,10 @@ This is a list of event kinds the user wants notifications for. If no preference
 | `user_tokens:{pubkey}` | Set | FCM tokens registered for a pubkey |
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
-| `dedup:{event_id}` | String | Deduplication lock with TTL |
-| `dedup:34236:{owner}:{d-tag}:{recipient}` | String | Successful per-recipient video delivery, retained for the configured coordinate TTL (one year by default) |
-| `divine:preferences:{pubkey}` | String | JSON notification preferences |
+| `dedup:{event_id}` | String | Per-event processing claim with TTL. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
+| `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Per-recipient video delivery decision, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered or rate-limited bell writes its own |
+| `user_preferences:{pubkey}` | String | JSON notification preferences |
+| `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
+| `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. Exact-id replays apply idempotently for repair. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |
+| `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path walks this set with paged `SSCAN` reads. |
+| `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |
