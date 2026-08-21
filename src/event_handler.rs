@@ -1575,10 +1575,17 @@ async fn send_notification_to_user(
             }
             SendOutcome::Failed => {
                 failed_count += 1;
+                // Display, not Debug: `?result.as_ref().err()` renders
+                // `Some(Unauthorized("..."))`, wrapping the one thing an
+                // operator reads this line for in two layers of noise.
+                let reason = result
+                    .as_ref()
+                    .err()
+                    .map_or_else(String::new, ToString::to_string);
                 error!(
                     target_pubkey = %target_pubkey,
                     token_prefix = %truncated_token,
-                    error = ?result.as_ref().err(),
+                    error = %reason,
                     "FCM send failed for token"
                 );
             }
