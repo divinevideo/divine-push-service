@@ -12,9 +12,35 @@ use nostr_sdk::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// What the live listener does after `notifications().recv()` returns an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvAction {
+    /// Keep listening — the error was transient.
+    Continue,
+    /// Stop the live loop — no further events can arrive.
+    Stop,
+}
+
+/// Decide whether a broadcast receive error ends the live listener.
+///
+/// `Lagged` means the subscriber fell behind a bounded broadcast channel and
+/// some notifications were dropped; the next `recv()` returns the oldest
+/// message still retained, so the listener must keep going. Treating it as
+/// fatal is what turned a moment of back-pressure into a permanent, silent
+/// outage: the loop ended, nothing restarted it, and `/health` stayed green.
+///
+/// `Closed` means every sender is gone and no further message can arrive.
+pub fn recv_action(err: &RecvError) -> RecvAction {
+    match err {
+        RecvError::Lagged(_) => RecvAction::Continue,
+        RecvError::Closed => RecvAction::Stop,
+    }
+}
 
 /// Control event kinds for push notification management
 const KIND_REGISTRATION: u16 = 3079;
@@ -447,10 +473,19 @@ impl NostrListener {
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Error receiving notification: {}", e);
-                            break;
-                        }
+                        Err(e) => match recv_action(&e) {
+                            RecvAction::Continue => {
+                                warn!(
+                                    error = %e,
+                                    "Relay notification receiver lagged - dropped events, continuing"
+                                );
+                                continue;
+                            }
+                            RecvAction::Stop => {
+                                error!(error = %e, "Relay notification channel closed - stopping live listener");
+                                break;
+                            }
+                        },
                     }
                 }
             }
