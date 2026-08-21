@@ -4,7 +4,6 @@
 //! Listens to Nostr events and sends FCM notifications.
 
 use std::sync::Arc;
-use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -18,6 +17,38 @@ use divine_push_service::server::run_server;
 use divine_push_service::state;
 
 use nostr_sdk::prelude::Event;
+
+/// Resolves when the process is asked to stop.
+///
+/// `ctrl_c` alone covers SIGINT, which is what a local run sends. Kubernetes
+/// stops a pod with SIGTERM, and an unhandled SIGTERM terminates the process
+/// outright — so the shutdown path below it, and the non-zero exit it reports
+/// after a task died, would never run in the one place they exist for.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT"),
+                    _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                }
+                return;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to install the SIGTERM handler: {}. Falling back to SIGINT only.",
+                    e
+                );
+            }
+        }
+    }
+
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("Received SIGINT");
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for shutdown signal
     tokio::select! {
-        _ = signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             tracing::info!("Received shutdown signal");
         }
         _ = token_cancelled.cancelled() => {
