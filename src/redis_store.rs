@@ -944,6 +944,14 @@ mod tests {
         retry_fanout_job(&pool, first_job, retry_job, 0)
             .await
             .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let queued: usize = redis::cmd("ZCARD")
+            .arg(NEW_POST_FANOUT_JOBS_ZSET)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(queued, 1, "retry must remove the previous leased member");
         assert_eq!(
             claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
             Some(retry_job),

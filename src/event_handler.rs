@@ -994,15 +994,24 @@ async fn schedule_fanout_retry(
     job: &NewPostFanoutJob,
     minimum_delay_secs: u64,
 ) -> Result<()> {
-    let mut retry = job.clone();
-    retry.attempt = retry.attempt.saturating_add(1);
-    let delay = fanout_retry_delay(
+    let (retry, delay) = next_fanout_retry(
+        job,
         state.settings.service.new_post_fanout_retry_secs,
-        retry.attempt,
         minimum_delay_secs,
     );
     let retry_json = serde_json::to_string(&retry)?;
     redis_store::retry_fanout_job(&state.redis_pool, current_job, &retry_json, delay).await
+}
+
+fn next_fanout_retry(
+    job: &NewPostFanoutJob,
+    base_delay_secs: u64,
+    minimum_delay_secs: u64,
+) -> (NewPostFanoutJob, u64) {
+    let mut retry = job.clone();
+    retry.attempt = retry.attempt.saturating_add(1);
+    let delay = fanout_retry_delay(base_delay_secs, retry.attempt, minimum_delay_secs);
+    (retry, delay)
 }
 
 fn fanout_retry_delay(base_secs: u64, attempt: u16, minimum_delay_secs: u64) -> u64 {
@@ -2970,6 +2979,11 @@ mod tests {
                     &creator,
                 ))
                 .arg(format!("dedup:{claim_key}"))
+                .arg(format!(
+                    "dedup:{}:{}",
+                    event.id.to_hex(),
+                    watcher.public_key().to_hex()
+                ))
                 .query_async(&mut *conn)
                 .await
                 .unwrap();
@@ -2977,6 +2991,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         let _: () = redis::cmd("DEL")
             .arg(format!("notify_watchers:{}", creator.to_hex()))
+            .arg("new_post_fanout_jobs")
+            .arg(format!("fanout:enqueued:{}", event.id.to_hex()))
             .query_async(&mut *conn)
             .await
             .unwrap();
@@ -3181,6 +3197,29 @@ mod tests {
         assert_eq!(fanout_retry_delay(5, u16::MAX, 0), 300);
         assert_eq!(fanout_retry_delay(5, 1, 120), 120);
         assert_eq!(fanout_retry_delay(5, 1, 3_600), 300);
+    }
+
+    #[test]
+    fn durable_fanout_retry_persists_each_attempt() {
+        let initial = NewPostFanoutJob {
+            event_json: "{}".to_string(),
+            cursor: 17,
+            sender_name: Some("Alice".to_string()),
+            attempt: 0,
+            expires_at: 1_000,
+        };
+
+        let (first, first_delay) = next_fanout_retry(&initial, 5, 0);
+        let persisted = serde_json::to_string(&first).unwrap();
+        let restored: NewPostFanoutJob = serde_json::from_str(&persisted).unwrap();
+        let (second, second_delay) = next_fanout_retry(&restored, 5, 0);
+
+        assert_eq!(first.attempt, 1);
+        assert_eq!(first_delay, 5);
+        assert_eq!(second.attempt, 2);
+        assert_eq!(second_delay, 10);
+        assert_eq!(second.cursor, initial.cursor);
+        assert_eq!(second.expires_at, initial.expires_at);
     }
 
     #[test]
