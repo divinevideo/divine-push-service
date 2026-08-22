@@ -338,6 +338,23 @@ fn build_apns_config(payload: &FcmPayload) -> Option<serde_json::Value> {
     }))
 }
 
+/// Builds the `android` block for user-visible FCM messages.
+///
+/// High priority may wake a device from Doze, so reserve it for payloads that
+/// contain notification copy and will produce a visible notification.
+fn build_android_config(payload: &FcmPayload) -> Option<serde_json::Value> {
+    let notification_has_alert = payload
+        .notification
+        .as_ref()
+        .is_some_and(|notification| notification.title.is_some() || notification.body.is_some());
+    let data_has_alert = payload
+        .data
+        .as_ref()
+        .is_some_and(|data| data.contains_key("title") || data.contains_key("body"));
+
+    (notification_has_alert || data_has_alert).then(|| serde_json::json!({ "priority": "high" }))
+}
+
 fn json_object_from_data(
     data: impl Iterator<Item = (String, String)>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -380,6 +397,7 @@ impl RealFcmClient {
     ) -> std::result::Result<(), FcmError> {
         let prefix = token_prefix(token);
         let apns = build_apns_config(&payload);
+        let android = build_android_config(&payload);
 
         let mut message = serde_json::Map::new();
         message.insert(
@@ -407,10 +425,9 @@ impl RealFcmClient {
         if let Some(apns) = apns {
             message.insert("apns".to_string(), apns);
         }
-        message.insert(
-            "android".to_string(),
-            serde_json::json!({ "priority": "high" }),
-        );
+        if let Some(android) = android {
+            message.insert("android".to_string(), android);
+        }
 
         let access_token =
             self.token_provider.token(&[FCM_SCOPE]).await.map_err(|e| {
@@ -1118,6 +1135,65 @@ mod tests {
         assert!(body["message"]["apns"]["payload"]["aps"]
             .get("content-available")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn send_single_does_not_use_high_priority_for_silent_data() {
+        let (client, captured) =
+            stub_fcm(200, &[], r#"{"name":"projects/test-project/messages/1"}"#).await;
+        let payload = FcmPayload {
+            notification: None,
+            data: Some(std::collections::HashMap::from([(
+                "eventId".to_string(),
+                "abc123".to_string(),
+            )])),
+            android: None,
+            webpush: None,
+            apns: None,
+        };
+
+        client
+            .send_single("device-token-1", payload)
+            .await
+            .expect("send should succeed");
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let (body, _) = &requests[0];
+
+        assert!(body["message"].get("android").is_none());
+        assert_eq!(
+            body["message"]["apns"]["headers"]["apns-push-type"],
+            "background"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_single_preserves_notification_payload() {
+        let (client, captured) =
+            stub_fcm(200, &[], r#"{"name":"projects/test-project/messages/1"}"#).await;
+        let payload = FcmPayload {
+            notification: Some(FcmNotification {
+                title: Some("New like".to_string()),
+                body: Some("Alice liked your post".to_string()),
+            }),
+            data: None,
+            android: None,
+            webpush: None,
+            apns: None,
+        };
+
+        client
+            .send_single("device-token-1", payload)
+            .await
+            .expect("send should succeed");
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let (body, _) = &requests[0];
+
+        assert_eq!(body["message"]["notification"]["title"], "New like");
+        assert_eq!(body["message"]["android"]["priority"], "high");
     }
 
     /// The exact production failure: FCM returns 503 with a `Retry-After`
