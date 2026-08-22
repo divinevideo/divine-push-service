@@ -52,9 +52,7 @@ pub async fn run_cleanup_service(state: Arc<AppState>, token: CancellationToken)
                            match cleanup_result {
                                 Ok(cleaned_count) => {
                                     if cleaned_count > 0 {
-                                        crate::metrics::tokens_pruned("stale", cleaned_count as u64);
-                                    }
-                                    if cleaned_count > 0 {
+                                        record_stale_tokens_pruned(cleaned_count);
                                         info!(count = cleaned_count, "Cleaned up stale tokens.");
                                     } else {
                                         info!("No stale tokens found to cleanup.");
@@ -71,4 +69,29 @@ pub async fn run_cleanup_service(state: Arc<AppState>, token: CancellationToken)
     }
     info!("Cleanup service shut down.");
     Ok(())
+}
+
+fn record_stale_tokens_pruned(count: usize) {
+    crate::metrics::tokens_pruned("stale", count as u64);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    #[test]
+    fn stale_cleanup_records_the_confirmed_redis_count() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || record_stale_tokens_pruned(3));
+
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"push_tokens_pruned_total{reason="stale"} 3"#),
+            "{rendered}"
+        );
+    }
 }

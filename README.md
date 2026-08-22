@@ -182,18 +182,26 @@ The metrics endpoint exposes:
 | Metric | Type | Description |
 |--------|------|-------------|
 | `push_events_received_total` | Counter | Events received from the Nostr relay. |
-| `push_events_processed_total` | Counter | Events whose handler completed. |
+| `push_events_processed_total` | Counter | Events whose routing attempt completed, including attempts that ended in an error. |
 | `push_fcm_sends_attempted_total` | Counter | FCM sends attempted per device token. |
 | `push_fcm_sends_succeeded_total` | Counter | Successful FCM sends per device token. |
 | `push_fcm_sends_failed_total{reason}` | Counter | Failed FCM sends by bounded failure reason. |
 | `push_tokens_pruned_total{reason}` | Counter | Tokens removed as `invalid` or `stale`. |
-| `push_last_event_processed_timestamp_seconds` | Gauge | Unix timestamp of the last completed event handler call. Initialized at startup to give a new instance one alert window. |
+| `push_last_event_processed_timestamp_seconds` | Gauge | Unix timestamp of the last completed event routing attempt. Initialized at startup to give a new instance one alert window. |
 
 The delivery deadman is based on the last-processed gauge:
 
 ```promql
 time() - max(push_last_event_processed_timestamp_seconds) > 900
 ```
+
+This deadman detects a pipeline that stops completing event-routing attempts. It
+does not claim that an attempt delivered a push: use
+`push_fcm_sends_succeeded_total` and `push_fcm_sends_failed_total{reason}` to
+alert on FCM rejecting every delivery. Use the deadman alongside task-health and
+restart alerting; the startup timestamp avoids a premature deadman alert while a
+new instance waits for its first event, while task-health alerting covers a
+crash-looping instance that repeatedly resets that startup grace.
 
 ## License
 

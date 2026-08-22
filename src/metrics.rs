@@ -24,7 +24,7 @@ pub fn init() -> PrometheusHandle {
     );
     metrics::describe_counter!(
         EVENTS_PROCESSED_TOTAL,
-        "Nostr events processed by the handler"
+        "Nostr events whose handler routing attempt completed"
     );
     metrics::describe_counter!(
         FCM_SENDS_ATTEMPTED_TOTAL,
@@ -44,7 +44,7 @@ pub fn init() -> PrometheusHandle {
     );
     metrics::describe_gauge!(
         LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS,
-        "Unix timestamp of the last event whose handler completed"
+        "Unix timestamp of the last completed event routing attempt"
     );
 
     // Give a newly started instance one deadman window to receive an event.

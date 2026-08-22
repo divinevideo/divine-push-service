@@ -1663,12 +1663,13 @@ async fn send_notification_to_user(
             match redis_store::remove_token(&state.redis_pool, target_pubkey, &fcm_token_to_remove)
                 .await
             {
-                Ok(true) => {
-                    crate::metrics::tokens_pruned("invalid", 1);
-                    info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
-                }
-                Ok(false) => {
-                    debug!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Invalid token was already removed");
+                Ok(removed) => {
+                    record_invalid_token_pruned(removed);
+                    if removed {
+                        info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
+                    } else {
+                        debug!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Invalid token was already removed");
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -1681,6 +1682,12 @@ async fn send_notification_to_user(
     }
 
     Ok(())
+}
+
+fn record_invalid_token_pruned(removed: bool) {
+    if removed {
+        crate::metrics::tokens_pruned("invalid", 1);
+    }
 }
 
 /// Create FCM payload for a notification
@@ -1920,6 +1927,24 @@ mod tests {
     use super::*;
     use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
     use nostr_sdk::prelude::{Keys, SecretKey};
+
+    #[test]
+    fn invalid_pruning_records_confirmed_removal() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            record_invalid_token_pruned(true);
+            record_invalid_token_pruned(false);
+        });
+
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"push_tokens_pruned_total{reason="invalid"} 1"#),
+            "{rendered}"
+        );
+    }
 
     async fn test_redis_pool() -> Option<redis_store::RedisPool> {
         let redis_url =
