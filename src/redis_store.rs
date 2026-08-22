@@ -432,8 +432,8 @@ pub async fn complete_fanout_job(
     Ok(())
 }
 
-/// Makes a leased fan-out job available again after a bounded delay.
-pub async fn retry_fanout_job(pool: &RedisPool, job: &str, delay_secs: u64) -> Result<()> {
+/// Makes the same leased fan-out job available again after a bounded delay.
+pub async fn rescore_fanout_job(pool: &RedisPool, job: &str, delay_secs: u64) -> Result<()> {
     let available_at = unix_time_millis()?.saturating_add(delay_secs.saturating_mul(1000));
     let mut conn = pool
         .get()
@@ -447,6 +447,34 @@ pub async fn retry_fanout_job(pool: &RedisPool, job: &str, delay_secs: u64) -> R
         .query_async::<()>(&mut *conn)
         .await
         .map_err(ServiceError::Redis)
+}
+
+/// Atomically replaces a failed page with its next retry attempt.
+pub async fn retry_fanout_job(
+    pool: &RedisPool,
+    current_job: &str,
+    retry_job: &str,
+    delay_secs: u64,
+) -> Result<()> {
+    const RETRY_SCRIPT: &str = r#"
+        redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        return 1
+    "#;
+    let available_at = unix_time_millis()?.saturating_add(delay_secs.saturating_mul(1000));
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    redis::Script::new(RETRY_SCRIPT)
+        .key(NEW_POST_FANOUT_JOBS_ZSET)
+        .arg(current_job)
+        .arg(retry_job)
+        .arg(available_at)
+        .invoke_async::<i64>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(())
 }
 
 // =============================================================================
@@ -904,6 +932,12 @@ mod tests {
             claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
             Some(first_job),
             "a crashed worker's page becomes available after its lease"
+        );
+        rescore_fanout_job(&pool, first_job, 0).await.unwrap();
+        assert_eq!(
+            claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
+            Some(first_job),
+            "graceful shutdown can release a page without waiting for lease expiry"
         );
 
         complete_fanout_job(&pool, first_job, Some(next_job))

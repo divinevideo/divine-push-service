@@ -783,6 +783,10 @@ async fn handle_video_content_event(
         event_json: serde_json::to_string(event)?,
         cursor: 0,
         sender_name: copy.cell.get().map(|resolved| resolved.sender_name.clone()),
+        attempt: 0,
+        expires_at: Timestamp::now()
+            .as_secs()
+            .saturating_add(state.settings.service.processed_event_ttl_secs),
     };
     let job_json = serde_json::to_string(&job)?;
     let enqueued = redis_store::enqueue_initial_fanout_job(
@@ -802,6 +806,8 @@ struct NewPostFanoutJob {
     event_json: String,
     cursor: u64,
     sender_name: Option<String>,
+    attempt: u16,
+    expires_at: u64,
 }
 
 /// Runs durable cursor-paged new-post fan-out outside the event-handler loop.
@@ -825,7 +831,27 @@ pub async fn run_new_post_fanout(state: Arc<AppState>, token: CancellationToken)
 
         match job {
             Ok(Some(job_json)) => {
-                process_fanout_job(&state, &job_json, token.clone()).await?;
+                if let Err(e) = process_fanout_job(&state, &job_json, token.clone()).await {
+                    if matches!(e, crate::error::ServiceError::Cancelled) {
+                        if let Err(retry_error) =
+                            redis_store::rescore_fanout_job(&state.redis_pool, &job_json, 0).await
+                        {
+                            error!(error = %retry_error, "Failed to release cancelled fan-out page lease; lease expiry will recover it");
+                        }
+                        break;
+                    }
+
+                    error!(error = %e, "Durable fan-out page processing failed; preserving the leased page");
+                    if let Err(retry_error) = redis_store::rescore_fanout_job(
+                        &state.redis_pool,
+                        &job_json,
+                        state.settings.service.new_post_fanout_retry_secs,
+                    )
+                    .await
+                    {
+                        error!(error = %retry_error, "Failed to reschedule fan-out page after processing error; lease expiry will recover it");
+                    }
+                }
             }
             Ok(None) => {
                 tokio::select! {
@@ -876,6 +902,12 @@ async fn process_fanout_job(
         }
     };
 
+    if Timestamp::now().as_secs() >= job.expires_at {
+        warn!(event_id = %event.id, cursor = job.cursor, attempts = job.attempt, "Discarding expired durable fan-out page");
+        redis_store::complete_fanout_job(&state.redis_pool, job_json, None).await?;
+        return Ok(());
+    }
+
     let page = match redis_store::get_notify_watchers_page(
         &state.redis_pool,
         &event.pubkey,
@@ -887,12 +919,7 @@ async fn process_fanout_job(
         Ok(page) => page,
         Err(e) => {
             error!(event_id = %event.id, cursor = job.cursor, error = %e, "Failed to read durable watcher page; scheduling retry");
-            redis_store::retry_fanout_job(
-                &state.redis_pool,
-                job_json,
-                state.settings.service.new_post_fanout_retry_secs,
-            )
-            .await?;
+            schedule_fanout_retry(state, job_json, &job, 0).await?;
             return Ok(());
         }
     };
@@ -931,14 +958,12 @@ async fn process_fanout_job(
             if matches!(e, crate::error::ServiceError::Cancelled) {
                 return Err(e);
             }
-            let retry_secs = match &e {
-                crate::error::ServiceError::RetryableDelivery(delay) => delay
-                    .as_secs()
-                    .max(state.settings.service.new_post_fanout_retry_secs),
-                _ => state.settings.service.new_post_fanout_retry_secs,
+            let provider_delay = match &e {
+                crate::error::ServiceError::RetryableDelivery(delay) => delay.as_secs(),
+                _ => 0,
             };
             error!(event_id = %event.id, cursor = job.cursor, error = %e, "Durable watcher page was incomplete; scheduling retry");
-            redis_store::retry_fanout_job(&state.redis_pool, job_json, retry_secs).await?;
+            schedule_fanout_retry(state, job_json, &job, provider_delay).await?;
             return Ok(());
         }
     }
@@ -952,10 +977,34 @@ async fn process_fanout_job(
             sender_name: job
                 .sender_name
                 .or_else(|| copy.cell.get().map(|resolved| resolved.sender_name.clone())),
+            attempt: 0,
+            expires_at: job.expires_at,
         };
         Some(serde_json::to_string(&next)?)
     };
     redis_store::complete_fanout_job(&state.redis_pool, job_json, next_job.as_deref()).await
+}
+
+async fn schedule_fanout_retry(
+    state: &AppState,
+    current_job: &str,
+    job: &NewPostFanoutJob,
+    minimum_delay_secs: u64,
+) -> Result<()> {
+    const MAX_RETRY_DELAY_SECS: u64 = 300;
+
+    let mut retry = job.clone();
+    retry.attempt = retry.attempt.saturating_add(1);
+    let exponent = u32::from(retry.attempt.saturating_sub(1).min(6));
+    let backoff = state
+        .settings
+        .service
+        .new_post_fanout_retry_secs
+        .saturating_mul(1u64 << exponent)
+        .min(MAX_RETRY_DELAY_SECS);
+    let delay = backoff.max(minimum_delay_secs.min(MAX_RETRY_DELAY_SECS));
+    let retry_json = serde_json::to_string(&retry)?;
+    redis_store::retry_fanout_job(&state.redis_pool, current_job, &retry_json, delay).await
 }
 
 /// Find recipients for a reaction event (kind 7)
@@ -2049,6 +2098,12 @@ mod tests {
     use super::*;
     use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
     use nostr_sdk::prelude::{Keys, SecretKey};
+    use std::sync::OnceLock;
+
+    fn fanout_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
     async fn test_redis_pool() -> Option<redis_store::RedisPool> {
         let redis_url =
@@ -2648,6 +2703,7 @@ mod tests {
         let Some(pool) = test_redis_pool().await else {
             return;
         };
+        let _fanout_guard = fanout_test_lock().lock().await;
         let author = Keys::generate();
         let mentioned = Keys::generate().public_key();
         let fcm_token = format!("mention_token_{}", EventId::all_zeros().to_hex());
@@ -2690,6 +2746,10 @@ mod tests {
             event_json: serde_json::to_string(&event).unwrap(),
             cursor: 0,
             sender_name: Some(format_short_npub(&author.public_key())),
+            attempt: 0,
+            expires_at: Timestamp::now()
+                .as_secs()
+                .saturating_add(state.settings.service.processed_event_ttl_secs),
         };
         redis_store::complete_fanout_job(&pool, &serde_json::to_string(&queued_job).unwrap(), None)
             .await
@@ -2814,6 +2874,7 @@ mod tests {
         let Some(pool) = test_redis_pool().await else {
             return;
         };
+        let _fanout_guard = fanout_test_lock().lock().await;
         const WATCHERS: usize = 150;
         const PAGE_SIZE: usize = 10;
 

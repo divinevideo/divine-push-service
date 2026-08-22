@@ -360,9 +360,12 @@ page sized by `new_post_fanout_page_size`, and delivers with at most
 `new_post_delivery_concurrency` concurrent recipient sends. Completing the page
 atomically removes it and queues the next cursor. A crashed worker's page is
 eligible again after `new_post_fanout_lease_secs`; recoverable failures use
-`new_post_fanout_retry_secs`. Successful per-recipient claims make these
-at-least-once page retries safe. The page size is not a recipient cap; jobs
-continue until Redis returns cursor 0.
+exponential backoff from `new_post_fanout_retry_secs` up to five minutes. Jobs
+expire after the processed-event TTL instead of retrying and occupying Redis
+forever. Graceful shutdown releases the active page immediately; a crash relies
+on lease expiry. Successful per-recipient claims make these at-least-once page
+retries safe. The page size is not a recipient cap; jobs continue until Redis
+returns cursor 0.
 
 The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and
