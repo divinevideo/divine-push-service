@@ -52,6 +52,9 @@ pub async fn run_cleanup_service(state: Arc<AppState>, token: CancellationToken)
                            match cleanup_result {
                                 Ok(cleaned_count) => {
                                     if cleaned_count > 0 {
+                                        crate::metrics::tokens_pruned("stale", cleaned_count as u64);
+                                    }
+                                    if cleaned_count > 0 {
                                         info!(count = cleaned_count, "Cleaned up stale tokens.");
                                     } else {
                                         info!("No stale tokens found to cleanup.");

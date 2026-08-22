@@ -90,6 +90,23 @@ pub enum FcmError {
     Unknown { code: u16, hint: Option<String> },
 }
 
+impl FcmError {
+    /// Stable, bounded reason used by the FCM failure metric.
+    pub fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::Initialization(_) => "initialization",
+            Self::InternalRequest(_) => "internal_request",
+            Self::InternalResponse(_) => "internal_response",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::TokenNotRegistered => "token_not_registered",
+            Self::RetryableInternal(_) => "retryable_internal",
+            Self::InternalError => "internal_error",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+}
+
 /// The `errorCode` FCM returns in `error.details[]` for a token the device has
 /// discarded. This is the signal that a stored token should be pruned.
 const FCM_ERROR_CODE_UNREGISTERED: &str = "UNREGISTERED";
@@ -483,6 +500,7 @@ impl FcmClient {
             .map(|token| {
                 let payload = payload.clone();
                 async move {
+                    crate::metrics::fcm_send_attempted();
                     // Defence in depth, retained from #42. The specific panic it
                     // was written for is gone — `firebase-messaging-rs` read the
                     // `Retry-After` header via `HeaderName::from_static`, which
@@ -503,6 +521,10 @@ impl FcmClient {
                                 "FCM send panicked while handling the response".to_string(),
                             ))
                         });
+                    match &result {
+                        Ok(()) => crate::metrics::fcm_send_succeeded(),
+                        Err(error) => crate::metrics::fcm_send_failed(error.metric_reason()),
+                    }
                     (token, result)
                 }
             })
@@ -637,6 +659,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_fcm_sender_batch_send() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         // Ensure FcmPayload derives PartialEq and Clone
         let mock_sender = MockFcmSender::new(); // Create instance directly
                                                 // Pass a boxed clone to the client
@@ -673,6 +698,21 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "token1");
         assert_eq!(sent[0].1, payload);
+
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("push_fcm_sends_attempted_total 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("push_fcm_sends_succeeded_total 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_fcm_sends_failed_total{reason="token_not_registered"} 1"#),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

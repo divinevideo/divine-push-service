@@ -8,6 +8,7 @@ pub mod error;
 pub mod event_handler;
 pub mod fcm_sender;
 pub mod health;
+pub mod metrics;
 pub mod models;
 pub mod nostr_listener;
 pub mod preferences;

@@ -190,6 +190,8 @@ impl NostrListener {
                         info!(count = historical_events.len(), "Processing historical control events...");
 
                         for event in historical_events {
+                            crate::metrics::event_received();
+
                             if event.pubkey == *service_pubkey {
                                 continue;
                             }
@@ -273,6 +275,8 @@ impl NostrListener {
             let mut oldest = None;
             let mut new_count = 0usize;
             for event in lists {
+                crate::metrics::event_received();
+
                 oldest = match oldest {
                     Some(current) if current <= event.created_at => Some(current),
                     _ => Some(event.created_at),
@@ -455,6 +459,8 @@ async fn run_live_loop(
                     Ok(notification) => {
                         match notification {
                             RelayPoolNotification::Event { event, .. } => {
+                                crate::metrics::event_received();
+
                                 if event.pubkey == service_pubkey {
                                     debug!("Skipping event from service account");
                                     continue;

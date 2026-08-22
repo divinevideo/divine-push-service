@@ -197,6 +197,8 @@ pub async fn run(
                     }
                 }
 
+                crate::metrics::event_processed();
+
                 if token.is_cancelled() {
                     info!(event_id = %event_id, "Event handler cancellation detected after processing event.");
                     break;
@@ -1658,16 +1660,22 @@ async fn send_notification_to_user(
                 return Err(crate::error::ServiceError::Cancelled);
             }
             let truncated_token = fcm_sender::token_prefix(&fcm_token_to_remove);
-            if let Err(e) =
-                redis_store::remove_token(&state.redis_pool, target_pubkey, &fcm_token_to_remove)
-                    .await
+            match redis_store::remove_token(&state.redis_pool, target_pubkey, &fcm_token_to_remove)
+                .await
             {
-                error!(
-                    target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
-                    "Failed to remove invalid token"
-                );
-            } else {
-                info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
+                Ok(true) => {
+                    crate::metrics::tokens_pruned("invalid", 1);
+                    info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
+                }
+                Ok(false) => {
+                    debug!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Invalid token was already removed");
+                }
+                Err(e) => {
+                    error!(
+                        target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
+                        "Failed to remove invalid token"
+                    );
+                }
             }
         }
     }
