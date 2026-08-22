@@ -84,7 +84,6 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 |------|------|-------------|
 | Like | 7 | Reactions to user's notes |
 | Comment | 1 | Replies to user's notes |
-| Follow | 3 | New followers |
 | Mention | 1 | Notes mentioning user |
 | Repost | 16 | Reposts of user's notes |
 | NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |

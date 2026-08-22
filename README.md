@@ -41,7 +41,7 @@ The service subscribes to trigger events on its relay and notifies the tagged re
 
 New-post notifications are the one type not anchored to a `p` tag on the trigger event. Recipients come from the subscriber's own NIP-51 list (kind 30000, `d=notify`), so the service resolves them from a Redis reverse index rather than from the video. They are rate-limited to one push per (subscriber, creator) per hour, and fan-out is paged and delivered with bounded concurrency so one popular creator cannot force one unbounded Redis read or sequential delivery loop. The in-app feed is not throttled. See [the protocol doc](docs/nip-xx-push-notifications.md) for the list shape.
 
-Divine video comments are NIP-22 `kind:1111` and notify both the root video author and the direct parent author (deduplicated when they coincide). Follows (kind 3) are defined in the protocol and subscribed to, but new-follow notifications are **not currently emitted** — that requires diffing contact-list state, which is not yet implemented.
+Divine video comments are NIP-22 `kind:1111` and notify both the root video author and the direct parent author (deduplicated when they coincide). Follow notifications are not handled by this service, so it does not subscribe to kind 3 contact lists.
 
 Each FCM message carries a stable `data` payload with routing and presentation fields. Routing to the correct video uses the authoritative addressable coordinate from the triggering event, never a coordinate synthesized from the recipient's pubkey. The full payload contract is documented in the [developer guide](docs/developer-guide.md#fcm-payload-format).
 

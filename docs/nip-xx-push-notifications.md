@@ -89,14 +89,14 @@ Clients MAY send a preferences event to control which notification types they re
     ["p", "<push-service-pubkey>"],
     ["app", "<app-id>"]
   ],
-  "content": nip44_encrypt({"kinds": [1, 3, 7, 16]}),
+  "content": nip44_encrypt({"kinds": [1, 7, 16]}),
   "sig": "<signature>"
 }
 ```
 
 The decrypted content is a JSON object with a `kinds` array listing the event kinds the user wants notifications for:
 ```json
-{ "kinds": [1, 3, 7, 16] }
+{ "kinds": [1, 7, 16] }
 ```
 
 An empty `kinds` array disables all notifications. Services SHOULD define sensible defaults for users who have not sent a preferences event.
@@ -152,7 +152,7 @@ a prolific author otherwise trains users into disabling notifications entirely.
 
 ## Notification Triggers
 
-Services define which events trigger notifications. A typical single-app service watches for specific event kinds (reactions, replies, follows, mentions, reposts) and notifies users who are tagged or referenced.
+Services define which events trigger notifications. A typical single-app service watches for specific event kinds (reactions, replies, mentions, reposts) and notifies users who are tagged or referenced.
 
 Services MAY support additional trigger logic beyond kind matching, including
 recipient sets that come from subscriber-published state rather than from tags
