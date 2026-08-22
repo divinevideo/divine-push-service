@@ -842,6 +842,9 @@ pub async fn run_new_post_fanout(state: Arc<AppState>, token: CancellationToken)
                     }
 
                     error!(error = %e, "Durable fan-out page processing failed; preserving the leased page");
+                    // Keep the same member here: this path means the atomic
+                    // attempt swap itself may have failed, so constructing a
+                    // second swap only repeats the operation we cannot trust.
                     if let Err(retry_error) = redis_store::rescore_fanout_job(
                         &state.redis_pool,
                         &job_json,
@@ -902,7 +905,7 @@ async fn process_fanout_job(
         }
     };
 
-    if Timestamp::now().as_secs() >= job.expires_at {
+    if fanout_job_expired(&job, Timestamp::now().as_secs()) {
         warn!(event_id = %event.id, cursor = job.cursor, attempts = job.attempt, "Discarding expired durable fan-out page");
         redis_store::complete_fanout_job(&state.redis_pool, job_json, None).await?;
         return Ok(());
@@ -991,20 +994,28 @@ async fn schedule_fanout_retry(
     job: &NewPostFanoutJob,
     minimum_delay_secs: u64,
 ) -> Result<()> {
-    const MAX_RETRY_DELAY_SECS: u64 = 300;
-
     let mut retry = job.clone();
     retry.attempt = retry.attempt.saturating_add(1);
-    let exponent = u32::from(retry.attempt.saturating_sub(1).min(6));
-    let backoff = state
-        .settings
-        .service
-        .new_post_fanout_retry_secs
-        .saturating_mul(1u64 << exponent)
-        .min(MAX_RETRY_DELAY_SECS);
-    let delay = backoff.max(minimum_delay_secs.min(MAX_RETRY_DELAY_SECS));
+    let delay = fanout_retry_delay(
+        state.settings.service.new_post_fanout_retry_secs,
+        retry.attempt,
+        minimum_delay_secs,
+    );
     let retry_json = serde_json::to_string(&retry)?;
     redis_store::retry_fanout_job(&state.redis_pool, current_job, &retry_json, delay).await
+}
+
+fn fanout_retry_delay(base_secs: u64, attempt: u16, minimum_delay_secs: u64) -> u64 {
+    const MAX_RETRY_DELAY_SECS: u64 = 300;
+    let exponent = u32::from(attempt.saturating_sub(1).min(6));
+    base_secs
+        .saturating_mul(1u64 << exponent)
+        .min(MAX_RETRY_DELAY_SECS)
+        .max(minimum_delay_secs.min(MAX_RETRY_DELAY_SECS))
+}
+
+fn fanout_job_expired(job: &NewPostFanoutJob, now: u64) -> bool {
+    now >= job.expires_at
 }
 
 /// Find recipients for a reaction event (kind 7)
@@ -2742,21 +2753,10 @@ mod tests {
             .await
             .expect("video handling degrades to mentions");
 
-        let queued_job = NewPostFanoutJob {
-            event_json: serde_json::to_string(&event).unwrap(),
-            cursor: 0,
-            sender_name: Some(format_short_npub(&author.public_key())),
-            attempt: 0,
-            expires_at: Timestamp::now()
-                .as_secs()
-                .saturating_add(state.settings.service.processed_event_ttl_secs),
-        };
-        redis_store::complete_fanout_job(&pool, &serde_json::to_string(&queued_job).unwrap(), None)
-            .await
-            .unwrap();
-
         let _: () = redis::cmd("DEL")
             .arg(&watchers_key)
+            .arg("new_post_fanout_jobs")
+            .arg(format!("fanout:enqueued:{}", event.id.to_hex()))
             .query_async(&mut *conn)
             .await
             .unwrap();
@@ -3171,6 +3171,31 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].recipient, watcher);
         assert_eq!(targets[0].notification_type, NotificationType::NewPost);
+    }
+
+    #[test]
+    fn durable_fanout_retry_backoff_is_bounded() {
+        assert_eq!(fanout_retry_delay(5, 1, 0), 5);
+        assert_eq!(fanout_retry_delay(5, 2, 0), 10);
+        assert_eq!(fanout_retry_delay(5, 7, 0), 300);
+        assert_eq!(fanout_retry_delay(5, u16::MAX, 0), 300);
+        assert_eq!(fanout_retry_delay(5, 1, 120), 120);
+        assert_eq!(fanout_retry_delay(5, 1, 3_600), 300);
+    }
+
+    #[test]
+    fn durable_fanout_job_expires_at_its_deadline() {
+        let job = NewPostFanoutJob {
+            event_json: "{}".to_string(),
+            cursor: 0,
+            sender_name: None,
+            attempt: 9,
+            expires_at: 100,
+        };
+
+        assert!(!fanout_job_expired(&job, 99));
+        assert!(fanout_job_expired(&job, 100));
+        assert!(fanout_job_expired(&job, 101));
     }
 
     #[test]

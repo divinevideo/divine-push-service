@@ -940,7 +940,17 @@ mod tests {
             "graceful shutdown can release a page without waiting for lease expiry"
         );
 
-        complete_fanout_job(&pool, first_job, Some(next_job))
+        let retry_job = r#"{"event":"first","cursor":0,"attempt":1}"#;
+        retry_fanout_job(&pool, first_job, retry_job, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
+            Some(retry_job),
+            "retry atomically replaces the leased member with its persisted attempt"
+        );
+
+        complete_fanout_job(&pool, retry_job, Some(next_job))
             .await
             .unwrap();
         assert_eq!(
