@@ -94,6 +94,15 @@ pub struct ServiceSettings {
     /// Maximum concurrent new-post deliveries for one watcher page.
     #[serde(default = "default_new_post_delivery_concurrency")]
     pub new_post_delivery_concurrency: usize,
+    /// Lease held while one worker processes a durable new-post page.
+    #[serde(default = "default_new_post_fanout_lease")]
+    pub new_post_fanout_lease_secs: u64,
+    /// Delay before retrying a durable new-post page after a recoverable failure.
+    #[serde(default = "default_new_post_fanout_retry")]
+    pub new_post_fanout_retry_secs: u64,
+    /// Idle poll interval for the durable new-post worker.
+    #[serde(default = "default_new_post_fanout_poll")]
+    pub new_post_fanout_poll_millis: u64,
     /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
@@ -124,6 +133,18 @@ fn default_new_post_fanout_page_size() -> usize {
 
 fn default_new_post_delivery_concurrency() -> usize {
     50
+}
+
+fn default_new_post_fanout_lease() -> u64 {
+    3600
+}
+
+fn default_new_post_fanout_retry() -> u64 {
+    5
+}
+
+fn default_new_post_fanout_poll() -> u64 {
+    250
 }
 
 fn default_new_post_rate_limit() -> u64 {
@@ -304,7 +325,7 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 8] = [
+        let must_be_positive: [(&str, u64, &str); 11] = [
             (
                 "nostr.profile_cache_ttl_secs",
                 self.nostr.profile_cache_ttl_secs,
@@ -344,6 +365,21 @@ impl Settings {
                 "service.new_post_delivery_concurrency",
                 self.service.new_post_delivery_concurrency as u64,
                 "new-post fan-out cannot start delivery work",
+            ),
+            (
+                "service.new_post_fanout_lease_secs",
+                self.service.new_post_fanout_lease_secs,
+                "durable fan-out jobs can be claimed concurrently",
+            ),
+            (
+                "service.new_post_fanout_retry_secs",
+                self.service.new_post_fanout_retry_secs,
+                "recoverable fan-out failures retry in a tight loop",
+            ),
+            (
+                "service.new_post_fanout_poll_millis",
+                self.service.new_post_fanout_poll_millis,
+                "an idle worker spins continuously against Redis",
             ),
         ];
 
@@ -436,7 +472,7 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 8] = [
+        let cases: [ZeroCase; 11] = [
             ("nostr.profile_cache_ttl_secs", |s| {
                 s.nostr.profile_cache_ttl_secs = 0
             }),
@@ -460,6 +496,15 @@ mod tests {
             }),
             ("service.new_post_delivery_concurrency", |s| {
                 s.service.new_post_delivery_concurrency = 0
+            }),
+            ("service.new_post_fanout_lease_secs", |s| {
+                s.service.new_post_fanout_lease_secs = 0
+            }),
+            ("service.new_post_fanout_retry_secs", |s| {
+                s.service.new_post_fanout_retry_secs = 0
+            }),
+            ("service.new_post_fanout_poll_millis", |s| {
+                s.service.new_post_fanout_poll_millis = 0
             }),
         ];
 
@@ -498,6 +543,9 @@ mod tests {
             let settings = load_runtime_settings(filename);
             assert!(settings.service.new_post_fanout_page_size > 0);
             assert!(settings.service.new_post_delivery_concurrency > 0);
+            assert!(settings.service.new_post_fanout_lease_secs > 0);
+            assert!(settings.service.new_post_fanout_retry_secs > 0);
+            assert!(settings.service.new_post_fanout_poll_millis > 0);
             assert!(
                 settings.service.new_post_delivery_concurrency
                     <= settings.service.new_post_fanout_page_size

@@ -16,9 +16,11 @@ use crate::{
 };
 use futures_util::{stream, StreamExt};
 use nostr_sdk::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -72,26 +74,16 @@ pub fn is_beyond_replay_horizon(event: &Event) -> bool {
 
 /// Whether the handler loop should claim this event before routing it.
 ///
-/// The claim exists to stop two replicas sending the same push twice, and for
-/// every handler that sends a push it is the only thing standing between a
-/// duplicate and the user. Notify lists send nothing. They build persistent
-/// state through `replace_notify_subscriptions`, a single atomic Lua script that
-/// already rejects any list not strictly newer than the stored one, so
-/// concurrent replicas applying the same list are a no-op with or without the
-/// claim.
-///
-/// Meanwhile the claim is taken *before* routing and never released, so a
-/// transient Redis error inside the handler leaves it standing: the historical
-/// replay on the next restart skips the event as already-claimed, and that
-/// subscriber's bells stay dark until `processed_event_ttl_secs` expires, seven
-/// days by default. So the claim trades an outage of a user's subscriptions for
-/// deduplication the Lua script performs anyway.
-///
-/// Scoped by `is_notify_list` rather than kind alone, symmetric with
-/// `is_beyond_replay_horizon`: the idempotency argument rests on the Lua script,
-/// which only runs for `d=notify`.
+/// Control events mutate one event-scoped record and retain the coarse claim.
+/// Content delivery instead claims `(event_id, recipient)` immediately before
+/// FCM, so a failed or interrupted recipient cannot consume every recipient
+/// behind it. Notify lists remain idempotent through their atomic replacement
+/// script, and unrelated event kinds do no work here.
 pub fn requires_event_claim(event: &Event) -> bool {
-    !is_notify_list(event)
+    matches!(
+        event.kind.as_u16(),
+        KIND_REGISTRATION | KIND_DEREGISTRATION | KIND_PREFERENCES_UPDATE
+    )
 }
 
 /// Check if event is targeted to this service via p tag
@@ -637,6 +629,7 @@ async fn send_notifications_sequential(
     copy: &LazyEventCopy,
     token: CancellationToken,
 ) -> Result<()> {
+    let mut first_error = None;
     for target in targets {
         if token.is_cancelled() {
             info!(event_id = %event.id, "Notification sending cancelled");
@@ -664,10 +657,14 @@ async fn send_notifications_sequential(
                 error = %e,
                 "Failed to send notification"
             );
+            first_error.get_or_insert(e);
         }
     }
 
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn send_notifications_bounded(
@@ -709,11 +706,11 @@ async fn send_notifications_bounded(
     // not sent yet return immediately. It does not close the window inside
     // `send_notification_to_user`, which still returns `Cancelled` between the
     // FCM send and the writes below it; that one predates this branch.
-    let mut cancelled = None;
+    let mut first_error = None;
     while let Some((recipient, result)) = deliveries.next().await {
         if let Err(e) = result {
             if matches!(e, crate::error::ServiceError::Cancelled) {
-                cancelled.get_or_insert(e);
+                first_error.get_or_insert(e);
                 continue;
             }
             error!(
@@ -722,10 +719,11 @@ async fn send_notifications_bounded(
                 error = %e,
                 "Failed to send notification"
             );
+            first_error.get_or_insert(e);
         }
     }
 
-    match cancelled {
+    match first_error {
         Some(e) => Err(e),
         None => Ok(()),
     }
@@ -763,22 +761,12 @@ async fn handle_video_content_event(
     token: CancellationToken,
 ) -> Result<()> {
     let mention_targets = deliverable_targets(video_mention_targets(event), &event.pubkey);
-    let mentioned: HashSet<PublicKey> = mention_targets
-        .iter()
-        .map(|target| target.recipient)
-        .collect();
-
-    // One copy for the whole event, spanning the mention pass and every watcher
-    // page. Building it per page would put the cost back on a per-page footing:
-    // `get_display_name` misses are never negatively cached, so a creator with
-    // no kind-0 metadata pays a five-second relay round-trip for each page, on
-    // the event-handler loop that every other user's notifications queue behind.
-    // `needs_content` is decided by the mention targets alone because `NewPost`
-    // does not render the event body, so no watcher page can widen it.
+    // Mentions remain inline and small. The resolved sender name, when mentions
+    // needed it, is carried into the durable watcher job so later pages do not
+    // repeat profile lookup work.
     let copy = LazyEventCopy::for_targets(&mention_targets);
 
-    let mut target_count = 0usize;
-    if !mention_targets.is_empty() {
+    let mention_result = if !mention_targets.is_empty() {
         info!(
             event_id = %event.id,
             kind = %event.kind,
@@ -786,77 +774,188 @@ async fn handle_video_content_event(
             notification_types = ?vec![(NotificationType::Mention.display_name(), mention_targets.len())],
             "Processing notification event"
         );
-        send_notifications_sequential(state, event, mention_targets, &copy, token.clone()).await?;
-        target_count += mentioned.len();
-    }
+        send_notifications_sequential(state, event, mention_targets, &copy, token.clone()).await
+    } else {
+        Ok(())
+    };
 
-    let page_size = state.settings.service.new_post_fanout_page_size;
-    let concurrency = state.settings.service.new_post_delivery_concurrency;
-    let mut cursor = 0;
+    let job = NewPostFanoutJob {
+        event_json: serde_json::to_string(event)?,
+        cursor: 0,
+        sender_name: copy.cell.get().map(|resolved| resolved.sender_name.clone()),
+    };
+    let job_json = serde_json::to_string(&job)?;
+    let enqueued = redis_store::enqueue_initial_fanout_job(
+        &state.redis_pool,
+        &event.id,
+        &job_json,
+        state.settings.service.processed_event_ttl_secs,
+    )
+    .await?;
+    debug!(event_id = %event.id, enqueued, "Queued durable new-post fan-out");
+
+    mention_result
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NewPostFanoutJob {
+    event_json: String,
+    cursor: u64,
+    sender_name: Option<String>,
+}
+
+/// Runs durable cursor-paged new-post fan-out outside the event-handler loop.
+pub async fn run_new_post_fanout(state: Arc<AppState>, token: CancellationToken) -> Result<()> {
+    info!("Starting durable new-post fan-out worker...");
+    let poll_interval = Duration::from_millis(state.settings.service.new_post_fanout_poll_millis);
+
     loop {
         if token.is_cancelled() {
-            info!(event_id = %event.id, "Notification sending cancelled");
-            return Err(crate::error::ServiceError::Cancelled);
+            break;
         }
 
-        let page = match redis_store::get_notify_watchers_page(
-            &state.redis_pool,
-            &event.pubkey,
-            cursor,
-            page_size,
+        let job = tokio::select! {
+            biased;
+            _ = token.cancelled() => break,
+            result = redis_store::claim_fanout_job(
+                &state.redis_pool,
+                state.settings.service.new_post_fanout_lease_secs,
+            ) => result,
+        };
+
+        match job {
+            Ok(Some(job_json)) => {
+                process_fanout_job(&state, &job_json, token.clone()).await?;
+            }
+            Ok(None) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to claim durable new-post fan-out job");
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            }
+        }
+    }
+
+    info!("Durable new-post fan-out worker shut down.");
+    Ok(())
+}
+
+async fn process_fanout_job(
+    state: &AppState,
+    job_json: &str,
+    token: CancellationToken,
+) -> Result<()> {
+    let job: NewPostFanoutJob = match serde_json::from_str(job_json) {
+        Ok(job) => job,
+        Err(e) => {
+            error!(error = %e, "Discarding malformed durable new-post fan-out job");
+            redis_store::complete_fanout_job(&state.redis_pool, job_json, None).await?;
+            return Ok(());
+        }
+    };
+    let event: Event = match serde_json::from_str::<Event>(&job.event_json) {
+        Ok(event) if event.kind.as_u16() == KIND_VIDEO => event,
+        Ok(event) => {
+            error!(event_id = %event.id, kind = %event.kind, "Discarding non-video fan-out job");
+            redis_store::complete_fanout_job(&state.redis_pool, job_json, None).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            error!(error = %e, "Discarding fan-out job with malformed event");
+            redis_store::complete_fanout_job(&state.redis_pool, job_json, None).await?;
+            return Ok(());
+        }
+    };
+
+    let page = match redis_store::get_notify_watchers_page(
+        &state.redis_pool,
+        &event.pubkey,
+        job.cursor,
+        state.settings.service.new_post_fanout_page_size,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            error!(event_id = %event.id, cursor = job.cursor, error = %e, "Failed to read durable watcher page; scheduling retry");
+            redis_store::retry_fanout_job(
+                &state.redis_pool,
+                job_json,
+                state.settings.service.new_post_fanout_retry_secs,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mentioned: HashSet<PublicKey> = video_mention_targets(&event)
+        .into_iter()
+        .map(|target| target.recipient)
+        .collect();
+    let targets = watcher_page_targets(page.watchers, &event.pubkey, &mentioned);
+    let copy = match &job.sender_name {
+        Some(sender_name) => LazyEventCopy::resolved(EventScopedCopy {
+            sender_name: sender_name.clone(),
+            formatted_content: None,
+        }),
+        None => LazyEventCopy::for_targets(&targets),
+    };
+
+    if !targets.is_empty() {
+        info!(
+            event_id = %event.id,
+            recipient_count = targets.len(),
+            cursor = job.cursor,
+            next_cursor = page.next_cursor,
+            "Processing durable new-post notification page"
+        );
+        if let Err(e) = send_notifications_bounded(
+            state,
+            &event,
+            targets,
+            &copy,
+            token,
+            state.settings.service.new_post_delivery_concurrency,
         )
         .await
         {
-            Ok(page) => page,
-            Err(e) => {
-                error!(
-                    event_id = %event.id,
-                    creator = %event.pubkey,
-                    cursor,
-                    error = %e,
-                    delivered_so_far = target_count,
-                    "Failed to read notify watcher page - abandoning the rest of the bell fan-out for this video"
-                );
-                break;
+            if matches!(e, crate::error::ServiceError::Cancelled) {
+                return Err(e);
             }
+            let retry_secs = match &e {
+                crate::error::ServiceError::RetryableDelivery(delay) => delay
+                    .as_secs()
+                    .max(state.settings.service.new_post_fanout_retry_secs),
+                _ => state.settings.service.new_post_fanout_retry_secs,
+            };
+            error!(event_id = %event.id, cursor = job.cursor, error = %e, "Durable watcher page was incomplete; scheduling retry");
+            redis_store::retry_fanout_job(&state.redis_pool, job_json, retry_secs).await?;
+            return Ok(());
+        }
+    }
+
+    let next_job = if page.next_cursor == 0 {
+        None
+    } else {
+        let next = NewPostFanoutJob {
+            event_json: job.event_json,
+            cursor: page.next_cursor,
+            sender_name: job
+                .sender_name
+                .or_else(|| copy.cell.get().map(|resolved| resolved.sender_name.clone())),
         };
-
-        let next_cursor = page.next_cursor;
-        let new_post_targets = watcher_page_targets(page.watchers, &event.pubkey, &mentioned);
-        if !new_post_targets.is_empty() {
-            let page_target_count = new_post_targets.len();
-            info!(
-                event_id = %event.id,
-                kind = %event.kind,
-                recipient_count = page_target_count,
-                notification_types = ?vec![(NotificationType::NewPost.display_name(), page_target_count)],
-                cursor,
-                next_cursor,
-                "Processing new-post notification page"
-            );
-            send_notifications_bounded(
-                state,
-                event,
-                new_post_targets,
-                &copy,
-                token.clone(),
-                concurrency,
-            )
-            .await?;
-            target_count += page_target_count;
-        }
-
-        if next_cursor == 0 {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    if target_count == 0 {
-        debug!(event_id = %event.id, kind = %event.kind, "No recipients found for event");
-    }
-
-    Ok(())
+        Some(serde_json::to_string(&next)?)
+    };
+    redis_store::complete_fanout_job(&state.redis_pool, job_json, next_job.as_deref()).await
 }
 
 /// Find recipients for a reaction event (kind 7)
@@ -1036,8 +1135,7 @@ impl LazyEventCopy {
         }
     }
 
-    /// Pre-resolved copy, for tests that exercise delivery rather than copy.
-    #[cfg(test)]
+    /// Pre-resolved copy for durable pages and focused delivery tests.
     fn resolved(copy: EventScopedCopy) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new_with(Some(copy)),
@@ -1505,6 +1603,28 @@ async fn send_notification_to_user(
         }
     }
 
+    let recipient_claim = tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled before claiming recipient delivery.");
+            return Err(crate::error::ServiceError::Cancelled);
+        }
+        claim_result = redis_store::try_claim_recipient_event(
+            &state.redis_pool,
+            &event_id,
+            target_pubkey,
+            state.settings.service.processed_event_ttl_secs,
+        ) => claim_result?
+    };
+    let Some(recipient_claim) = recipient_claim else {
+        trace!(
+            event_id = %event_id,
+            target_pubkey = %target_pubkey,
+            "Skipping recipient already claimed for this event"
+        );
+        return Ok(());
+    };
+
     info!(
         event_id = %event_id,
         target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
@@ -1518,6 +1638,12 @@ async fn send_notification_to_user(
         biased;
         _ = token.cancelled() => {
             info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while resolving the event copy.");
+            if let Err(e) = redis_store::release_recipient_event_claim(
+                &state.redis_pool,
+                &recipient_claim,
+            ).await {
+                error!(event_id = %event_id, target_pubkey = %target_pubkey, error = %e, "Failed to release unstarted recipient claim during cancellation");
+            }
             return Err(crate::error::ServiceError::Cancelled);
         }
         resolved = copy.get(state, event) => resolved
@@ -1554,6 +1680,7 @@ async fn send_notification_to_user(
     // FCM 5xx, a timeout — still summarised as `failed_count=0`, which reads as
     // "nothing went wrong" in exactly the logs an operator checks first.
     let mut failed_count = 0;
+    let mut retryable_failure = None;
 
     for (fcm_token, result) in results {
         if token.is_cancelled() {
@@ -1588,6 +1715,9 @@ async fn send_notification_to_user(
                     error = %reason,
                     "FCM send failed for token"
                 );
+                if let Err(fcm_sender::FcmError::RetryableInternal(delay)) = &result {
+                    retryable_failure = Some(*delay);
+                }
             }
         }
     }
@@ -1669,6 +1799,13 @@ async fn send_notification_to_user(
             } else {
                 info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
             }
+        }
+    }
+
+    if success_count == 0 {
+        if let Some(delay) = retryable_failure {
+            redis_store::release_recipient_event_claim(&state.redis_pool, &recipient_claim).await?;
+            return Err(crate::error::ServiceError::RetryableDelivery(delay));
         }
     }
 
@@ -2549,6 +2686,15 @@ mod tests {
             .await
             .expect("video handling degrades to mentions");
 
+        let queued_job = NewPostFanoutJob {
+            event_json: serde_json::to_string(&event).unwrap(),
+            cursor: 0,
+            sender_name: Some(format_short_npub(&author.public_key())),
+        };
+        redis_store::complete_fanout_job(&pool, &serde_json::to_string(&queued_job).unwrap(), None)
+            .await
+            .unwrap();
+
         let _: () = redis::cmd("DEL")
             .arg(&watchers_key)
             .query_async(&mut *conn)
@@ -2719,6 +2865,28 @@ mod tests {
             .unwrap();
 
         let result = handle_video_content_event(&state, &event, CancellationToken::new()).await;
+        result.expect("the handler queues fan-out");
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "watcher delivery must not run on the event-handler loop"
+        );
+
+        for _ in 0..100 {
+            let Some(job_json) = redis_store::claim_fanout_job(
+                &pool,
+                state.settings.service.new_post_fanout_lease_secs,
+            )
+            .await
+            .expect("claim durable page") else {
+                break;
+            };
+            process_fanout_job(&state, &job_json, CancellationToken::new())
+                .await
+                .expect("process durable page");
+            if mock_sender.get_sent_messages().len() == WATCHERS {
+                break;
+            }
+        }
 
         for (idx, watcher) in watchers.iter().enumerate() {
             let _ = redis_store::remove_token(
@@ -2752,12 +2920,177 @@ mod tests {
             .await
             .unwrap();
 
-        result.expect("the fan-out completes");
         assert_eq!(
             mock_sender.get_sent_messages().len(),
             WATCHERS,
             "every watcher is notified, not just the ones on the first page"
         );
+    }
+
+    #[tokio::test]
+    async fn recipient_claims_recover_partial_delivery_without_resending_successes() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let first = Keys::generate().public_key();
+        let second = Keys::generate().public_key();
+        let first_token = format!("partial-first-{}", first.to_hex());
+        let second_token = format!("partial-second-{}", second.to_hex());
+        redis_store::add_or_update_token(&pool, &first, &first_token)
+            .await
+            .unwrap();
+        redis_store::add_or_update_token(&pool, &second, &second_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("partial delivery")
+            .tag(Tag::public_key(first))
+            .tag(Tag::public_key(second))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &first,
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let targets = targets_of(NotificationType::Mention, vec![first, second]);
+        send_notifications_sequential(
+            &state,
+            &event,
+            targets,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            2,
+            "replay reaches the untouched recipient without duplicating the completed one"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{}:{}", event.id.to_hex(), first.to_hex()))
+            .arg(format!("dedup:{}:{}", event.id.to_hex(), second.to_hex()))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &first, &first_token)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &second, &second_token)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retryable_recipient_failure_releases_only_that_recipient_claim() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let first = Keys::generate().public_key();
+        let second = Keys::generate().public_key();
+        let first_token = format!("retry-first-{}", first.to_hex());
+        let second_token = format!("retry-second-{}", second.to_hex());
+        redis_store::add_or_update_token(&pool, &first, &first_token)
+            .await
+            .unwrap();
+        redis_store::add_or_update_token(&pool, &second, &second_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(
+            &second_token,
+            FcmError::RetryableInternal(Duration::from_secs(1)),
+        );
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("retryable partial delivery")
+            .tag(Tag::public_key(first))
+            .tag(Tag::public_key(second))
+            .sign_with_keys(&author)
+            .unwrap();
+        let targets = targets_of(NotificationType::Mention, vec![first, second]);
+
+        let first_pass = send_notifications_sequential(
+            &state,
+            &event,
+            targets.clone(),
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(
+            first_pass,
+            Err(crate::error::ServiceError::RetryableDelivery(_))
+        ));
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+
+        mock_sender.clear();
+        send_notifications_sequential(
+            &state,
+            &event,
+            targets.clone(),
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "only the failed recipient retries"
+        );
+
+        send_notifications_sequential(
+            &state,
+            &event,
+            targets,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "successful retry is retained and cannot deliver twice"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("dedup:{}:{}", event.id.to_hex(), first.to_hex()))
+            .arg(format!("dedup:{}:{}", event.id.to_hex(), second.to_hex()))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &first, &first_token)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &second, &second_token)
+            .await
+            .unwrap();
     }
 
     #[test]

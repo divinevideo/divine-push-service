@@ -24,8 +24,8 @@ sequenceDiagram
     Note over App,Device: Notification Delivery
     Relay->>Push: New event (like, comment, follow, etc.)
     Push->>Redis: Check recipient has registered token
-    Push->>Redis: Check dedup (SET NX EX)
     Push->>Redis: Check user preferences
+    Push->>Redis: Claim (event, recipient) (SET NX EX)
     Push->>FCM: Send data-only message
     FCM->>Device: Push notification
 ```
@@ -173,7 +173,7 @@ GET /health
 {
   "status": "ok",
   "pubkey": "abc123...",
-  "tasks": { "nostr_listener": true, "event_handler": true }
+  "tasks": { "nostr_listener": true, "event_handler": true, "new_post_fanout": true }
 }
 ```
 
@@ -182,15 +182,23 @@ Clients use this pubkey to:
 - Encrypt the NIP-44 content to the service's key
 
 The same endpoint is both Kubernetes probes. It returns `503` with
-`"status": "degraded"` when the Nostr listener or the event handler has died,
+`"status": "degraded"` when the Nostr listener, event handler, or durable
+new-post fan-out worker has died,
 so a pod that can no longer deliver is restarted instead of staying in service.
 The `pubkey` field is present either way.
 
 ## Deduplication
 
-The service uses atomic Redis `SET NX EX` per-event keys to prevent duplicate notifications across multiple replicas. Each event that sends a push is claimed exactly once with a 7-day TTL.
+The service uses atomic Redis `SET NX EX` keys per `(event_id, recipient)` to
+prevent duplicate notifications across replicas. The claim is taken only after
+token, preference, coordinate, and rate-limit gates pass. A confirmed retryable
+FCM failure releases that recipient's claim; any successful token retains it for
+the configured processed-event TTL. This lets a replay resume recipients after
+a partial failure without resending recipients that already succeeded.
 
-Notify lists (kind 30000, `d=notify`) are the exception: they send no push, and claiming them would strand a subscriber's bells for the TTL if the handler failed. See [Ingestion](#ingestion) for why the claim buys nothing there.
+Control events keep a coarse per-event claim because each mutates one
+event-scoped record. Notify lists (kind 30000, `d=notify`) are idempotent through
+their atomic replacement script and take no claim.
 
 ## User Preferences
 
@@ -244,16 +252,11 @@ Two properties are load-bearing:
   `until`, using `notify_list_history_limit` as the per-page size valve.
   Without historical replay, a restart against a fresh Redis silently drops
   every bell until each user republishes.
-- **Notify lists are exempt from the event claim.** `run()` claims every other
-  event before routing it, so two replicas cannot send the same push twice.
-  Notify lists send nothing, and `replace_notify_subscriptions` already rejects
-  any list not strictly newer than the stored one, so the claim prevents nothing
-  here. It does cost something: the claim is taken before routing and never
-  released, so a transient Redis error inside the handler leaves it standing and
-  the replay on the next restart skips the event as already-claimed. That
-  subscriber's bells stay dark for the full `processed_event_ttl_secs`.
-  `requires_event_claim` scopes the exemption with `is_notify_list`, the same
-  kind-plus-`d`-tag check the horizon exemption uses.
+- **Notify lists are idempotent without an event claim.**
+  `replace_notify_subscriptions` already rejects stale list state and reapplies
+  an exact replay as repair. Content events use per-recipient delivery claims,
+  while registration, deregistration, and preference events retain coarse
+  per-event claims.
 - **An empty `p` list is legitimate**, not malformed. It means the user unbelled
   everyone, and it must clear the forward set and remove them from every reverse
   index.
@@ -350,13 +353,16 @@ When the rate limit suppresses a new-post push, the video-coordinate record is
 still written. That video has been intentionally dropped for that watcher, and a
 later NIP-33 edit should not re-announce it as a fresh post.
 
-New-post fan-out is paged by `new_post_fanout_page_size` and each page is
-delivered with at most `new_post_delivery_concurrency` concurrent recipient
-sends. This is separate from the notify-list write cap: one user's list cannot
-stall Redis on write, and one popular creator's audience cannot turn a single
-video into one unbounded Redis read or unbounded sequential delivery loop. The
-page size is not a recipient cap; the handler continues until Redis returns
-cursor 0.
+New-post fan-out is durable and runs outside the event-handler loop. After inline
+mention delivery, the handler atomically queues an initial Redis job containing
+the video and cursor 0. A supervised worker leases one job, reads one `SSCAN`
+page sized by `new_post_fanout_page_size`, and delivers with at most
+`new_post_delivery_concurrency` concurrent recipient sends. Completing the page
+atomically removes it and queues the next cursor. A crashed worker's page is
+eligible again after `new_post_fanout_lease_secs`; recoverable failures use
+`new_post_fanout_retry_secs`. Successful per-recipient claims make these
+at-least-once page retries safe. The page size is not a recipient cap; jobs
+continue until Redis returns cursor 0.
 
 The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and
@@ -394,8 +400,11 @@ the fan-out follow-up rather than done by halves here.
 | `user_tokens:{pubkey}` | Set | FCM tokens registered for a pubkey |
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
 | `stale_tokens` | Sorted Set | Token timestamps for cleanup |
-| `dedup:{event_id}` | String | Per-event processing claim with TTL. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
+| `dedup:{event_id}` | String | Per-event processing claim with TTL for registration, deregistration, and preference control events |
+| `dedup:{event_id}:{recipient}` | String | Per-recipient content-delivery claim with TTL. Acquired before FCM, retained after any successful or ambiguous delivery, and released after confirmed retryable failure |
 | `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Per-recipient video delivery decision, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered or rate-limited bell writes its own |
+| `fanout:enqueued:{event_id}` | String | Initial new-post fan-out enqueue marker with the processed-event TTL |
+| `new_post_fanout_jobs` | Sorted Set | Durable new-post page jobs. The score is the next availability time or active lease deadline |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
 | `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. Exact-id replays apply idempotently for repair. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |

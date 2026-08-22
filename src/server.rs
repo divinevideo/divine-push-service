@@ -144,6 +144,7 @@ mod tests {
         assert_eq!(body["pubkey"], "pubkey-hex");
         assert_eq!(body["tasks"]["event_handler"], true);
         assert_eq!(body["tasks"]["nostr_listener"], true);
+        assert_eq!(body["tasks"]["new_post_fanout"], true);
     }
 
     /// The probe behaviour the outage needed: a dead event handler must fail
