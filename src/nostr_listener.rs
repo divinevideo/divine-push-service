@@ -384,8 +384,14 @@ impl NostrListener {
                 None,
             ) => {
                 match sub_result {
-                    Ok(_output) => {
+                    Ok(output) if !output.success.is_empty() => {
                         info!("Successfully subscribed to diVine notification kinds");
+                    }
+                    Ok(output) => {
+                        error!(failed = ?output.failed, "Failed to send notification subscription to the main relay");
+                        return Err(ServiceError::Internal(
+                            "Notification subscription did not reach the main relay".to_string(),
+                        ));
                     }
                     Err(e) => {
                         error!("Failed to subscribe to notification kinds: {}", e);
@@ -417,8 +423,14 @@ impl NostrListener {
                 None,
             ) => {
                 match sub_result {
-                    Ok(_output) => {
+                    Ok(output) if !output.success.is_empty() => {
                         info!("Successfully subscribed to notify lists");
+                    }
+                    Ok(output) => {
+                        error!(failed = ?output.failed, "Failed to send notify-list subscription to the main relay");
+                        return Err(ServiceError::Internal(
+                            "Notify-list subscription did not reach the main relay".to_string(),
+                        ));
                     }
                     Err(e) => {
                         error!("Failed to subscribe to notify lists: {}", e);
