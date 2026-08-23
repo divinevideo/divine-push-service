@@ -75,7 +75,7 @@ The service is a single async binary running four cooperating tasks: a Nostr lis
 ### Prerequisites
 
 - Rust 1.85+
-- Redis
+- Redis 6.2+
 - A Firebase project with FCM enabled, and a service-account credentials file
 
 ### Development
