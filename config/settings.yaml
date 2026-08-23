@@ -19,7 +19,7 @@ service:
   notify_list_history_limit: 5000  # Page size for historical notify-list replay
   new_post_fanout_page_size: 1000  # Watcher SSCAN page size for one video
   new_post_delivery_concurrency: 50  # Concurrent NewPost deliveries per page
-  new_post_fanout_lease_secs: 3600  # Reclaim a page if its worker dies
+  new_post_fanout_lease_secs: 1200  # 20 waves x 45s FCM ceiling, plus 5m overhead
   new_post_fanout_retry_secs: 5  # Delay before retrying a recoverable page failure
   new_post_fanout_poll_millis: 250  # Idle durable-worker poll interval
   # allowed_pubkeys: [] — empty means no restriction (production default)

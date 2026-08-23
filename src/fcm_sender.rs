@@ -918,10 +918,10 @@ mod tests {
     fn too_many_requests_is_retryable_and_honors_retry_after() {
         let error = classify_error(
             StatusCode::TOO_MANY_REQUESTS,
-            &header_map(&[("Retry-After", "12")]),
+            &header_map(&[("Retry-After", "3600")]),
             r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
         );
-        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(12)));
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(3_600)));
     }
 
     #[test]

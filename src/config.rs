@@ -136,7 +136,10 @@ fn default_new_post_delivery_concurrency() -> usize {
 }
 
 fn default_new_post_fanout_lease() -> u64 {
-    3600
+    // A 1,000-recipient page at concurrency 50 is 20 waves. Each FCM operation
+    // is bounded at 45 seconds, so 20 minutes covers the 15-minute send ceiling
+    // plus Redis/profile overhead while recovering a dead worker promptly.
+    1200
 }
 
 fn default_new_post_fanout_retry() -> u64 {
@@ -546,7 +549,7 @@ mod tests {
             let settings = load_runtime_settings(filename);
             assert!(settings.service.new_post_fanout_page_size > 0);
             assert!(settings.service.new_post_delivery_concurrency > 0);
-            assert!(settings.service.new_post_fanout_lease_secs > 0);
+            assert_eq!(settings.service.new_post_fanout_lease_secs, 1_200);
             assert!(settings.service.new_post_fanout_retry_secs > 0);
             assert!(settings.service.new_post_fanout_poll_millis > 0);
             assert!(

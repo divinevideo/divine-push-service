@@ -405,6 +405,12 @@ pub async fn claim_fanout_job(pool: &RedisPool, lease_secs: u64) -> Result<Optio
 }
 
 /// Completes one page and atomically schedules its successor, if any.
+///
+/// Leases intentionally have no owner token. If a slow worker finishes after
+/// its lease expired and another worker reclaimed the page, both may deliver
+/// the page. The successor is inserted before the current member is removed, so
+/// that race can duplicate work but cannot remove the only copy of the next page.
+/// Recipient claims make the duplicate delivery harmless in the common case.
 pub async fn complete_fanout_job(
     pool: &RedisPool,
     current_job: &str,

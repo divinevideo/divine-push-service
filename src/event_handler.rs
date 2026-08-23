@@ -39,6 +39,7 @@ const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
 const KIND_VIDEO: u16 = 34236;
+const MAX_FANOUT_ATTEMPTS: u16 = 12;
 
 /// NIP-51 people list carrying new-post ("bell") subscriptions.
 const KIND_NOTIFY_LIST: u16 = 30000;
@@ -918,7 +919,7 @@ async fn process_fanout_job(
         Ok(page) => page,
         Err(e) => {
             error!(event_id = %event.id, cursor = job.cursor, error = %e, "Failed to read durable watcher page; scheduling retry");
-            schedule_fanout_retry(state, job_json, &job, 0).await?;
+            schedule_fanout_retry(state, job_json, &job, 0, "watcher_page_read").await?;
             return Ok(());
         }
     };
@@ -962,7 +963,7 @@ async fn process_fanout_job(
                 _ => 0,
             };
             error!(event_id = %event.id, cursor = job.cursor, error = %e, "Durable watcher page was incomplete; scheduling retry");
-            schedule_fanout_retry(state, job_json, &job, provider_delay).await?;
+            schedule_fanout_retry(state, job_json, &job, provider_delay, "delivery").await?;
             return Ok(());
         }
     }
@@ -989,25 +990,44 @@ async fn schedule_fanout_retry(
     current_job: &str,
     job: &NewPostFanoutJob,
     minimum_delay_secs: u64,
+    reason: &'static str,
 ) -> Result<()> {
-    let (retry, delay) = next_fanout_retry(
+    let Some((retry, delay)) = next_fanout_retry(
         job,
         state.settings.service.new_post_fanout_retry_secs,
         minimum_delay_secs,
-    );
+    ) else {
+        redis_store::complete_fanout_job(&state.redis_pool, current_job, None).await?;
+        crate::metrics::new_post_fanout_retry(reason, "exhausted");
+        error!(
+            cursor = job.cursor,
+            attempts = MAX_FANOUT_ATTEMPTS,
+            reason,
+            "Discarding durable new-post fan-out page and its remaining cursor chain after its retry budget was exhausted"
+        );
+        return Ok(());
+    };
     let retry_json = serde_json::to_string(&retry)?;
-    redis_store::retry_fanout_job(&state.redis_pool, current_job, &retry_json, delay).await
+    redis_store::retry_fanout_job(&state.redis_pool, current_job, &retry_json, delay).await?;
+    crate::metrics::new_post_fanout_retry(reason, "scheduled");
+    Ok(())
 }
 
 fn next_fanout_retry(
     job: &NewPostFanoutJob,
     base_delay_secs: u64,
     minimum_delay_secs: u64,
-) -> (NewPostFanoutJob, u64) {
+) -> Option<(NewPostFanoutJob, u64)> {
+    // Twelve total attempts span about 30 minutes of default scheduled backoff
+    // and 5-minute local cap. That rides out sustained provider backpressure
+    // without letting one permanently bad page churn for the seven-day event TTL.
+    if job.attempt.saturating_add(1) >= MAX_FANOUT_ATTEMPTS {
+        return None;
+    }
     let mut retry = job.clone();
     retry.attempt = retry.attempt.saturating_add(1);
     let delay = fanout_retry_delay(base_delay_secs, retry.attempt, minimum_delay_secs);
-    (retry, delay)
+    Some((retry, delay))
 }
 
 fn fanout_retry_delay(base_secs: u64, attempt: u16, minimum_delay_secs: u64) -> u64 {
@@ -1016,7 +1036,9 @@ fn fanout_retry_delay(base_secs: u64, attempt: u16, minimum_delay_secs: u64) -> 
     base_secs
         .saturating_mul(1u64 << exponent)
         .min(MAX_RETRY_DELAY_SECS)
-        .max(minimum_delay_secs.min(MAX_RETRY_DELAY_SECS))
+        // The cap applies to our exponential backoff, not the provider's explicit
+        // floor. Retrying before FCM's Retry-After would amplify backpressure.
+        .max(minimum_delay_secs)
 }
 
 fn fanout_job_expired(job: &NewPostFanoutJob, now: u64) -> bool {
@@ -1871,6 +1893,10 @@ async fn send_notification_to_user(
         }
     }
 
+    // The claim is per recipient, while FCM reports per token. Once any device
+    // receives the notification, retaining the recipient claim avoids resending
+    // to that successful device merely to retry a sibling token. Only an
+    // all-token retryable failure is safe to release and replay.
     if success_count == 0 {
         if let Some(delay) = retryable_failure {
             redis_store::release_recipient_event_claim(&state.redis_pool, &recipient_claim).await?;
@@ -3188,6 +3214,82 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn one_success_retains_the_recipient_claim_when_a_sibling_token_is_retryable() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let live_token = format!("mixed-live-{}", recipient.to_hex());
+        let retryable_token = format!("mixed-retryable-{}", recipient.to_hex());
+        redis_store::add_or_update_token(&pool, &recipient, &live_token)
+            .await
+            .unwrap();
+        redis_store::add_or_update_token(&pool, &recipient, &retryable_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(
+            &retryable_token,
+            FcmError::RetryableInternal(Duration::from_secs(1)),
+        );
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("mixed token delivery")
+            .tag(Tag::public_key(recipient))
+            .sign_with_keys(&author)
+            .unwrap();
+        let targets = targets_of(NotificationType::Mention, vec![recipient]);
+
+        send_notifications_sequential(
+            &state,
+            &event,
+            targets.clone(),
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+
+        mock_sender.clear();
+        send_notifications_sequential(
+            &state,
+            &event,
+            targets,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            mock_sender.get_sent_messages().is_empty(),
+            "recipient replay must not duplicate the token that already succeeded"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!(
+                "dedup:{}:{}",
+                event.id.to_hex(),
+                recipient.to_hex()
+            ))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &recipient, &live_token)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &recipient, &retryable_token)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn test_a_watcher_page_keeps_the_watchers_who_were_not_mentioned() {
         // Partial overlap: the mention pass already covers `mentioned`, so the
@@ -3214,7 +3316,7 @@ mod tests {
         assert_eq!(fanout_retry_delay(5, 7, 0), 300);
         assert_eq!(fanout_retry_delay(5, u16::MAX, 0), 300);
         assert_eq!(fanout_retry_delay(5, 1, 120), 120);
-        assert_eq!(fanout_retry_delay(5, 1, 3_600), 300);
+        assert_eq!(fanout_retry_delay(5, 1, 3_600), 3_600);
     }
 
     #[test]
@@ -3227,10 +3329,10 @@ mod tests {
             expires_at: 1_000,
         };
 
-        let (first, first_delay) = next_fanout_retry(&initial, 5, 0);
+        let (first, first_delay) = next_fanout_retry(&initial, 5, 0).unwrap();
         let persisted = serde_json::to_string(&first).unwrap();
         let restored: NewPostFanoutJob = serde_json::from_str(&persisted).unwrap();
-        let (second, second_delay) = next_fanout_retry(&restored, 5, 0);
+        let (second, second_delay) = next_fanout_retry(&restored, 5, 0).unwrap();
 
         assert_eq!(first.attempt, 1);
         assert_eq!(first_delay, 5);
@@ -3238,6 +3340,25 @@ mod tests {
         assert_eq!(second_delay, 10);
         assert_eq!(second.cursor, initial.cursor);
         assert_eq!(second.expires_at, initial.expires_at);
+    }
+
+    #[test]
+    fn durable_fanout_retry_stops_after_twelve_delivery_attempts() {
+        let mut job = NewPostFanoutJob {
+            event_json: "{}".to_string(),
+            cursor: 17,
+            sender_name: None,
+            attempt: 0,
+            expires_at: 1_000,
+        };
+
+        for expected_attempt in 1..MAX_FANOUT_ATTEMPTS {
+            let (retry, _) = next_fanout_retry(&job, 5, 0).unwrap();
+            assert_eq!(retry.attempt, expected_attempt);
+            job = retry;
+        }
+
+        assert!(next_fanout_retry(&job, 5, 0).is_none());
     }
 
     #[test]
