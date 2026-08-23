@@ -518,6 +518,7 @@ async fn run_live_loop(
     recovery: &dyn SubscriptionRecovery,
 ) -> Result<()> {
     let mut recovery_attempted = false;
+    let mut closed_recovery_attempted = false;
     let mut silence_deadline = Instant::now() + silence_timeout;
 
     loop {
@@ -577,12 +578,17 @@ async fn run_live_loop(
                             }
                             RelayPoolNotification::Message { relay_url, message } => {
                                 if let RelayMessage::Closed { subscription_id, .. } = &message {
-                                    if !recovery_attempted
-                                        && is_owned_subscription(subscription_id.as_ref())
-                                    {
+                                    if is_owned_subscription(subscription_id.as_ref()) {
+                                        if recovery_attempted || closed_recovery_attempted {
+                                            return Err(ServiceError::Internal(format!(
+                                                "Relay closed recovered subscription {subscription_id}"
+                                            )));
+                                        }
+
                                         warn!(%relay_url, subscription_id = %subscription_id, ?message, "Relay closed a live subscription; resubscribing");
                                         recovery.resubscribe(live_subscription_since()).await?;
                                         recovery_attempted = true;
+                                        closed_recovery_attempted = true;
                                         silence_deadline = Instant::now() + silence_timeout;
                                         continue;
                                     }
@@ -903,6 +909,47 @@ mod tests {
             .await
             .expect("live loop panicked")
             .expect("cancellation should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn a_second_owned_closed_message_fails_instead_of_replaying_again() {
+        let (notify_tx, notify_rx) = broadcast::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = MockRecovery::default();
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "rate-limited: slow down",
+            )))
+            .expect("send first CLOSED");
+        notify_tx
+            .send(live_event(&Keys::generate(), "traffic between closures"))
+            .expect("send event");
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "rate-limited: slow down",
+            )))
+            .expect("send second CLOSED");
+
+        let error = timeout(
+            PATIENCE,
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                CancellationToken::new(),
+                Duration::from_secs(60),
+                &recovery,
+            ),
+        )
+        .await
+        .expect("live loop did not react to repeated CLOSED")
+        .expect_err("a repeated owned CLOSED must fail the listener");
+
+        assert!(error.to_string().contains(NOTIFICATION_SUBSCRIPTION_ID));
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
