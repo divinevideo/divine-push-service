@@ -112,7 +112,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start campaign delivery collection
     let state_campaign = Arc::clone(&app_state);
     let token_campaign = token.clone();
-    tracker.spawn(async move {
+    // Not a `CriticalTask`: the collector is off by default and returns
+    // immediately when disabled, so a normal return is expected rather than a
+    // failure. A panic still stops the process, as it does for every task.
+    tracker.spawn("campaign_delivery", None, OnReturn::Tolerated, async move {
         if let Err(e) =
             campaign_delivery::run_campaign_delivery_service(state_campaign, token_campaign).await
         {
