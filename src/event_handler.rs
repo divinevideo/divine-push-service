@@ -3,7 +3,7 @@
 //! Handles Nostr events and routes them to appropriate notification handlers.
 //! Supports:
 //! - Token registration/deregistration (kinds 3079/3080)
-//! - Notification types: likes, comments, follows, mentions, reposts
+//! - Notification types: likes, comments, mentions, reposts, and new posts
 
 use crate::{
     crypto::CryptoService,
@@ -571,12 +571,6 @@ async fn handle_content_event(
         // and the direct parent author (lowercase `p`). create_fcm_payload
         // attaches the authoritative root-video target from the uppercase `A`.
         targets_of(NotificationType::Comment, find_comment_recipients(event))
-    } else if kind_num == 3 {
-        // Kind 3: Contact list - notify newly followed users
-        // Note: This would require tracking previous contact list state
-        // For now, we skip this as it requires state comparison
-        debug!(event_id = %event_id, "Contact list event - follow notifications not yet implemented");
-        return Ok(());
     } else if kind_num == 16 {
         // Kind 16: Repost - notify the author of the reposted event
         targets_of(NotificationType::Repost, find_repost_recipients(event))
@@ -978,10 +972,7 @@ struct EventScopedCopy {
 fn renders_event_content(notification_type: NotificationType) -> bool {
     match notification_type {
         NotificationType::Comment | NotificationType::Mention => true,
-        NotificationType::Like
-        | NotificationType::Follow
-        | NotificationType::Repost
-        | NotificationType::NewPost => false,
+        NotificationType::Like | NotificationType::Repost | NotificationType::NewPost => false,
     }
 }
 
@@ -1730,11 +1721,6 @@ fn create_fcm_payload(
             );
             (title, body)
         }
-        NotificationType::Follow => {
-            let title = "New follower".to_string();
-            let body = format!("{} started following you", sender_name);
-            (title, body)
-        }
         NotificationType::Mention => {
             let title = "You were mentioned".to_string();
             let body = format!(
@@ -2306,7 +2292,6 @@ mod tests {
         assert!(renders_event_content(NotificationType::Mention));
 
         assert!(!renders_event_content(NotificationType::Like));
-        assert!(!renders_event_content(NotificationType::Follow));
         assert!(!renders_event_content(NotificationType::Repost));
         assert!(!renders_event_content(NotificationType::NewPost));
     }
