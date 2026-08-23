@@ -27,6 +27,9 @@ const KIND_PREFERENCES_UPDATE: u16 = 3083;
 /// NIP-51 people list carrying new-post ("bell") subscriptions.
 const KIND_NOTIFY_LIST: u16 = 30000;
 
+const NOTIFICATION_SUBSCRIPTION_ID: &str = "divine-notifications";
+const NOTIFY_LIST_SUBSCRIPTION_ID: &str = "divine-notify-lists";
+
 /// How long to wait for the initial relay connection before treating startup as
 /// failed. A listener exit now stops the process, so this must be long enough to
 /// absorb a slow handshake and short enough that a genuinely unreachable relay
@@ -102,7 +105,8 @@ impl NostrListener {
             .await?;
 
         // Subscribe to live events
-        self.subscribe_to_live_events(&token).await?;
+        let since = Timestamp::now() - Duration::from_secs(60 * 60);
+        self.subscribe_to_live_events(&token, since).await?;
 
         // Main event loop
         self.process_live_events(event_tx, service_pubkey, token)
@@ -332,7 +336,11 @@ impl NostrListener {
         Ok(())
     }
 
-    async fn subscribe_to_live_events(&self, token: &CancellationToken) -> Result<()> {
+    async fn subscribe_to_live_events(
+        &self,
+        token: &CancellationToken,
+        since: Timestamp,
+    ) -> Result<()> {
         let mut all_kinds = vec![
             // Control kinds
             Kind::from(KIND_REGISTRATION),
@@ -357,9 +365,6 @@ impl NostrListener {
             }
         }
 
-        // Look back 1 hour to catch any recent events
-        let since = Timestamp::now() - Duration::from_secs(60 * 60);
-
         let filter = Filter::new().kinds(all_kinds.clone()).since(since);
 
         info!(
@@ -373,7 +378,11 @@ impl NostrListener {
                 info!("Cancelled before live subscription");
                 return Ok(());
             }
-            sub_result = self.state.nostr_client.subscribe(filter, None) => {
+            sub_result = self.state.nostr_client.subscribe_with_id(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                filter,
+                None,
+            ) => {
                 match sub_result {
                     Ok(_output) => {
                         info!("Successfully subscribed to diVine notification kinds");
@@ -402,7 +411,11 @@ impl NostrListener {
                 info!("Cancelled before notify-list subscription");
                 return Ok(());
             }
-            sub_result = self.state.nostr_client.subscribe(notify_filter, None) => {
+            sub_result = self.state.nostr_client.subscribe_with_id(
+                SubscriptionId::new(NOTIFY_LIST_SUBSCRIPTION_ID),
+                notify_filter,
+                None,
+            ) => {
                 match sub_result {
                     Ok(_output) => {
                         info!("Successfully subscribed to notify lists");
@@ -448,15 +461,9 @@ trait SubscriptionRecovery: Send + Sync {
 #[async_trait]
 impl SubscriptionRecovery for NostrListener {
     async fn resubscribe(&self) -> Result<()> {
-        let relay = self
-            .state
-            .nostr_client
-            .relay(self.state.settings.nostr.relay_url.as_str())
-            .await?;
-        relay.resubscribe().await.map_err(|error| {
-            ServiceError::Internal(format!("Failed to resubscribe to main relay: {error}"))
-        })?;
-        Ok(())
+        let token = CancellationToken::new();
+        self.subscribe_to_live_events(&token, Timestamp::now())
+            .await
     }
 }
 
