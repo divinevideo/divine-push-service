@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_config_event_kinds_match_defaults() {
+    fn test_runtime_config_kinds_match_defaults() {
         let expected_event_kinds = default_event_kinds();
         let expected_preference_kinds = default_preference_kinds();
 
