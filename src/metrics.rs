@@ -41,7 +41,7 @@ pub fn init() -> PrometheusHandle {
     );
     metrics::describe_counter!(
         NEW_POST_FANOUT_RETRIES_TOTAL,
-        "Durable new-post fan-out retries, counted by bounded reason and outcome"
+        "Durable new-post fan-out retries and terminal expiry, counted by bounded reason and outcome"
     );
     metrics::describe_counter!(
         TOKENS_PRUNED_TOTAL,

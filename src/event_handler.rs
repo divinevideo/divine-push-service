@@ -907,6 +907,7 @@ async fn process_fanout_job(
     if fanout_job_expired(&job, Timestamp::now().as_secs()) {
         warn!(event_id = %event.id, cursor = job.cursor, attempts = job.attempt, "Discarding expired durable fan-out page");
         redis_store::complete_fanout_job(&state.redis_pool, job_json, None).await?;
+        crate::metrics::new_post_fanout_retry("lifetime", "expired");
         return Ok(());
     }
 
@@ -1019,8 +1020,17 @@ async fn schedule_fanout_retry(
         minimum_delay_secs,
         Timestamp::now().as_secs(),
     ) else {
-        redis_store::complete_fanout_job(&state.redis_pool, current_job, exhausted_next_job)
-            .await?;
+        if let Some(successor) = exhausted_next_job {
+            let delay = fanout_retry_delay(
+                state.settings.service.new_post_fanout_retry_secs,
+                MAX_FANOUT_ATTEMPTS,
+                minimum_delay_secs,
+            )
+            .min(job.expires_at.saturating_sub(Timestamp::now().as_secs()));
+            redis_store::retry_fanout_job(&state.redis_pool, current_job, successor, delay).await?;
+        } else {
+            redis_store::complete_fanout_job(&state.redis_pool, current_job, None).await?;
+        }
         crate::metrics::new_post_fanout_retry(reason, "exhausted");
         error!(
             cursor = job.cursor,
@@ -3464,7 +3474,11 @@ mod tests {
             .await
             .unwrap();
         assert!(current_score.is_none());
-        assert!(successor_score.is_some());
+        assert!(
+            successor_score
+                .is_some_and(|score| score > chrono::Utc::now().timestamp_millis() as f64),
+            "the successor should inherit backoff instead of becoming immediately claimable"
+        );
         redis::cmd("ZREM")
             .arg("new_post_fanout_jobs")
             .arg(&successor_json)

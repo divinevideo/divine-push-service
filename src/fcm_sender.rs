@@ -49,7 +49,7 @@ const FCM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deliberately larger than `FCM_REQUEST_TIMEOUT` so the inner timeout normally
 /// fires first and yields the more specific error; this is the backstop that
 /// bounds whatever else the function grows to do.
-pub(crate) const FCM_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+const FCM_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 fn build_http_client() -> Result<reqwest::Client, FcmError> {

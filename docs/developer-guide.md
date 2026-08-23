@@ -362,7 +362,9 @@ an FCM `Retry-After` remains a floor even when it is longer, bounded by the job'
 remaining lifetime. A page is discarded after 12 total delivery attempts, which
 includes about 30 minutes of scheduled default backoff. When delivery already
 resolved a successor cursor, exhaustion queues that successor so one poison page
-does not drop every later watcher page;
+does not drop every later watcher page. The successor inherits the exhausted
+page's delay so a provider-wide outage cannot immediately march through the
+remaining chain;
 `push_new_post_fanout_retries_total{reason,outcome}` exposes scheduled and
 exhausted retries, plus ownerless preservation after a Redis operation error.
 That preservation path keeps the known queue member rather than trusting a
@@ -371,6 +373,10 @@ counter. Jobs also expire after the processed-event TTL. Graceful
 shutdown releases the active page immediately; a crash relies on lease expiry.
 Successful per-recipient claims make these at-least-once page retries safe. The
 page size is not a recipient cap; jobs continue until Redis returns cursor 0.
+Operators tuning page size or delivery concurrency should retain a lease of at
+least `ceil(page_size / concurrency) * 45 seconds`, plus headroom for Redis and
+profile work. The shipped defaults use 900 seconds for the FCM ceiling and five
+minutes of headroom.
 
 The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and

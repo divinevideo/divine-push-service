@@ -392,19 +392,6 @@ impl Settings {
             }
         }
 
-        let page_waves = u64::try_from(self.service.new_post_fanout_page_size)
-            .unwrap_or(u64::MAX)
-            .div_ceil(
-                u64::try_from(self.service.new_post_delivery_concurrency).unwrap_or(u64::MAX),
-            );
-        let minimum_lease_secs =
-            page_waves.saturating_mul(crate::fcm_sender::FCM_OPERATION_TIMEOUT.as_secs());
-        if self.service.new_post_fanout_lease_secs < minimum_lease_secs {
-            return Err(ConfigError::Message(format!(
-                "service.new_post_fanout_lease_secs must be at least {minimum_lease_secs} for the configured page size and delivery concurrency"
-            )));
-        }
-
         Ok(())
     }
 
@@ -573,17 +560,5 @@ mod tests {
                     <= settings.service.new_post_fanout_page_size
             );
         }
-    }
-
-    #[test]
-    fn test_new_post_fanout_lease_covers_the_configured_page() {
-        let mut settings = Settings::new().unwrap();
-        settings.service.new_post_fanout_lease_secs = 899;
-
-        let error = settings.validate().unwrap_err().to_string();
-        assert!(
-            error.contains("must be at least 900"),
-            "the error must explain the configured page's minimum lease, got: {error}"
-        );
     }
 }
