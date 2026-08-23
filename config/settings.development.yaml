@@ -2,6 +2,7 @@
 
 nostr:
   relay_url: "wss://relay.divine.video"
+  event_silence_timeout_secs: 300  # Resubscribe after 5 quiet minutes; fail health after 5 more
   profile_relays:
     - wss://relay.divine.video
     - wss://purplepag.es
