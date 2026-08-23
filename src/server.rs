@@ -1,6 +1,12 @@
-//! HTTP server exposing the Kubernetes health probe.
+//! HTTP server exposing health and Prometheus metrics.
 
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    routing::get,
+    Json, Router,
+};
+use metrics_exporter_prometheus::PrometheusHandle;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -14,13 +20,19 @@ use crate::state::AppState;
 pub struct ServerState {
     service_pubkey: Option<String>,
     health: Arc<TaskHealth>,
+    metrics: PrometheusHandle,
 }
 
 impl ServerState {
-    pub fn new(service_pubkey: Option<String>, health: Arc<TaskHealth>) -> Self {
+    pub fn new(
+        service_pubkey: Option<String>,
+        health: Arc<TaskHealth>,
+        metrics: PrometheusHandle,
+    ) -> Self {
         Self {
             service_pubkey,
             health,
+            metrics,
         }
     }
 }
@@ -57,18 +69,33 @@ async fn health_check(State(state): State<ServerState>) -> (StatusCode, Json<ser
     )
 }
 
+async fn metrics(
+    State(state): State<ServerState>,
+) -> ([(header::HeaderName, &'static str); 1], String) {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        state.metrics.render(),
+    )
+}
+
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
 pub async fn run_server(
     app_state: Arc<AppState>,
     health: Arc<TaskHealth>,
+    metrics: PrometheusHandle,
     token: CancellationToken,
 ) {
-    let app = router(ServerState::new(app_state.service_pubkey_hex(), health));
+    let app = router(ServerState::new(
+        app_state.service_pubkey_hex(),
+        health,
+        metrics,
+    ));
 
     // Failure paths below deliberately just return. Cancelling the token here
     // would make this look like an ordinary shutdown to the supervising
@@ -115,10 +142,16 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::ServiceExt;
 
+    fn server_state(health: Arc<TaskHealth>) -> ServerState {
+        let metrics = PrometheusBuilder::new().build_recorder().handle();
+        ServerState::new(Some("pubkey-hex".to_string()), health, metrics)
+    }
+
     async fn get_health(health: Arc<TaskHealth>) -> (StatusCode, serde_json::Value) {
-        let response = router(ServerState::new(Some("pubkey-hex".to_string()), health))
+        let response = router(server_state(health))
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -192,5 +225,34 @@ mod tests {
         let (status, _body) = get_health(health).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_rendered_without_caching() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, crate::metrics::event_received);
+        let response = router(ServerState::new(
+            Some("pubkey-hex".to_string()),
+            Arc::new(TaskHealth::new()),
+            handle,
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("push_events_received_total 1"));
     }
 }

@@ -16,6 +16,8 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # --- Serialization & Deserialization ---
 serde = { version = "1.0", features = ["derive"] }
