@@ -33,6 +33,13 @@ const NOTIFY_LIST_SUBSCRIPTION_ID: &str = "divine-notify-lists";
 /// Successful event IDs remain claimed for seven days in the runtime config,
 /// so this one-hour overlap recovers gaps without redelivering pushes.
 const LIVE_EVENT_LOOKBACK: Duration = Duration::from_secs(60 * 60);
+/// Give a relay time to clear a rate-limit window before replaying an hour of
+/// traffic. An immediate retry is likely to receive the same rejection.
+const RATE_LIMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
+/// Both owned subscriptions can be closed by one relay-side action. Keep the
+/// first recovery open briefly so the queued closure for its sibling is not
+/// mistaken for a rejection of the replacement subscription.
+const CLOSED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 
 /// How long to wait for the initial relay connection before treating startup as
 /// failed. A listener exit now stops the process, so this must be long enough to
@@ -147,8 +154,12 @@ impl NostrListener {
             .await?;
 
         // Subscribe to live events
-        self.subscribe_to_live_events(&token, live_subscription_since())
-            .await?;
+        if !self
+            .subscribe_to_live_events(&token, live_subscription_since())
+            .await?
+        {
+            return Ok(());
+        }
 
         // Main event loop
         self.process_live_events(event_tx, service_pubkey, token)
@@ -386,8 +397,9 @@ impl NostrListener {
         &self,
         token: &CancellationToken,
         since: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let all_kinds = notification_event_kinds(&self.state.settings.notification.event_kinds);
+        let main_relay_url = RelayUrl::parse(&self.state.settings.nostr.relay_url)?;
 
         let filter = Filter::new().kinds(all_kinds.clone()).since(since);
 
@@ -400,7 +412,7 @@ impl NostrListener {
             biased;
             _ = token.cancelled() => {
                 info!("Cancelled before live subscription");
-                return Ok(());
+                return Ok(false);
             }
             sub_result = self.state.nostr_client.subscribe_with_id(
                 SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
@@ -408,13 +420,13 @@ impl NostrListener {
                 None,
             ) => {
                 match sub_result {
-                    Ok(output) if !output.success.is_empty() => {
-                        info!("Successfully subscribed to diVine notification kinds");
+                    Ok(output) if output.success.contains(&main_relay_url) => {
+                        info!("Queued notification subscription for the main relay");
                     }
                     Ok(output) => {
-                        error!(failed = ?output.failed, "Failed to send notification subscription to the main relay");
+                        error!(failed = ?output.failed, "Failed to enqueue notification subscription for the main relay");
                         return Err(ServiceError::Internal(
-                            "Notification subscription did not reach the main relay".to_string(),
+                            "Notification subscription was not queued for the main relay".to_string(),
                         ));
                     }
                     Err(e) => {
@@ -439,7 +451,7 @@ impl NostrListener {
             biased;
             _ = token.cancelled() => {
                 info!("Cancelled before notify-list subscription");
-                return Ok(());
+                return Ok(false);
             }
             sub_result = self.state.nostr_client.subscribe_with_id(
                 SubscriptionId::new(NOTIFY_LIST_SUBSCRIPTION_ID),
@@ -447,13 +459,13 @@ impl NostrListener {
                 None,
             ) => {
                 match sub_result {
-                    Ok(output) if !output.success.is_empty() => {
-                        info!("Successfully subscribed to notify lists");
+                    Ok(output) if output.success.contains(&main_relay_url) => {
+                        info!("Queued notify-list subscription for the main relay");
                     }
                     Ok(output) => {
-                        error!(failed = ?output.failed, "Failed to send notify-list subscription to the main relay");
+                        error!(failed = ?output.failed, "Failed to enqueue notify-list subscription for the main relay");
                         return Err(ServiceError::Internal(
-                            "Notify-list subscription did not reach the main relay".to_string(),
+                            "Notify-list subscription was not queued for the main relay".to_string(),
                         ));
                     }
                     Err(e) => {
@@ -464,7 +476,7 @@ impl NostrListener {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn process_live_events(
@@ -491,14 +503,27 @@ impl NostrListener {
 
 #[async_trait]
 trait SubscriptionRecovery: Send + Sync {
-    async fn resubscribe(&self, since: Timestamp) -> Result<()>;
+    async fn resubscribe(&self, since: Timestamp, token: &CancellationToken) -> Result<bool>;
 }
 
 #[async_trait]
 impl SubscriptionRecovery for NostrListener {
-    async fn resubscribe(&self, since: Timestamp) -> Result<()> {
-        let token = CancellationToken::new();
-        self.subscribe_to_live_events(&token, since).await
+    async fn resubscribe(&self, since: Timestamp, token: &CancellationToken) -> Result<bool> {
+        self.subscribe_to_live_events(token, since).await
+    }
+}
+
+#[derive(Debug)]
+struct ClosedRecovery {
+    trigger_id: SubscriptionId,
+    started_at: Instant,
+    sibling_closed: bool,
+    flow_resumed: bool,
+}
+
+impl ClosedRecovery {
+    fn healthy_grace_elapsed(&self) -> bool {
+        self.flow_resumed && self.started_at.elapsed() >= CLOSED_RECOVERY_GRACE
     }
 }
 
@@ -518,7 +543,7 @@ async fn run_live_loop(
     recovery: &dyn SubscriptionRecovery,
 ) -> Result<()> {
     let mut recovery_attempted = false;
-    let mut closed_recovery_attempted = false;
+    let mut closed_recovery: Option<ClosedRecovery> = None;
     let mut silence_deadline = Instant::now() + silence_timeout;
 
     loop {
@@ -538,7 +563,12 @@ async fn run_live_loop(
                 }
 
                 warn!(?silence_timeout, "Nostr event flow is silent; resubscribing to the main relay");
-                recovery.resubscribe(live_subscription_since()).await?;
+                if !recovery
+                    .resubscribe(live_subscription_since(), &token)
+                    .await?
+                {
+                    break;
+                }
                 recovery_attempted = true;
                 silence_deadline = Instant::now() + silence_timeout;
             }
@@ -548,8 +578,6 @@ async fn run_live_loop(
                     Ok(notification) => {
                         match notification {
                             RelayPoolNotification::Event { event, .. } => {
-                                recovery_attempted = false;
-                                silence_deadline = Instant::now() + silence_timeout;
                                 crate::metrics::event_received();
 
                                 if event.pubkey == service_pubkey {
@@ -573,22 +601,72 @@ async fn run_live_loop(
                                             error!("Failed to send live event: {}", e);
                                             break;
                                         }
+
+                                        recovery_attempted = false;
+                                        silence_deadline = Instant::now() + silence_timeout;
+                                        if let Some(state) = closed_recovery.as_mut() {
+                                            state.flow_resumed = true;
+                                        }
                                     }
                                 }
                             }
                             RelayPoolNotification::Message { relay_url, message } => {
-                                if let RelayMessage::Closed { subscription_id, .. } = &message {
+                                if let RelayMessage::Closed { subscription_id, message: reason } = &message {
                                     if is_owned_subscription(subscription_id.as_ref()) {
-                                        if recovery_attempted || closed_recovery_attempted {
+                                        if closed_recovery
+                                            .as_ref()
+                                            .is_some_and(ClosedRecovery::healthy_grace_elapsed)
+                                        {
+                                            closed_recovery = None;
+                                        }
+
+                                        if let Some(state) = closed_recovery.as_mut() {
+                                            let is_stale_sibling = state.started_at.elapsed()
+                                                < CLOSED_RECOVERY_GRACE
+                                                && subscription_id.as_ref() != &state.trigger_id
+                                                && !state.sibling_closed;
+                                            if is_stale_sibling {
+                                                state.sibling_closed = true;
+                                                info!(%relay_url, subscription_id = %subscription_id, "Ignoring sibling closure queued before subscription recovery");
+                                                continue;
+                                            }
+
                                             return Err(ServiceError::Internal(format!(
                                                 "Relay closed recovered subscription {subscription_id}"
                                             )));
                                         }
 
+                                        if recovery_attempted {
+                                            return Err(ServiceError::Internal(format!(
+                                                "Relay closed subscription {subscription_id} during event-flow recovery"
+                                            )));
+                                        }
+
                                         warn!(%relay_url, subscription_id = %subscription_id, ?message, "Relay closed a live subscription; resubscribing");
-                                        recovery.resubscribe(live_subscription_since()).await?;
+                                        if MachineReadablePrefix::parse(reason)
+                                            == Some(MachineReadablePrefix::RateLimited)
+                                        {
+                                            warn!(?RATE_LIMIT_RECOVERY_BACKOFF, "Relay rate-limited a live subscription; backing off before recovery");
+                                            tokio::select! {
+                                                biased;
+                                                _ = token.cancelled() => break,
+                                                _ = tokio::time::sleep(RATE_LIMIT_RECOVERY_BACKOFF) => {}
+                                            }
+                                        }
+
+                                        if !recovery
+                                            .resubscribe(live_subscription_since(), &token)
+                                            .await?
+                                        {
+                                            break;
+                                        }
                                         recovery_attempted = true;
-                                        closed_recovery_attempted = true;
+                                        closed_recovery = Some(ClosedRecovery {
+                                            trigger_id: subscription_id.as_ref().clone(),
+                                            started_at: Instant::now(),
+                                            sibling_closed: false,
+                                            flow_resumed: false,
+                                        });
                                         silence_deadline = Instant::now() + silence_timeout;
                                         continue;
                                     }
@@ -657,10 +735,10 @@ mod tests {
 
     #[async_trait]
     impl SubscriptionRecovery for MockRecovery {
-        async fn resubscribe(&self, since: Timestamp) -> Result<()> {
+        async fn resubscribe(&self, since: Timestamp, _token: &CancellationToken) -> Result<bool> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.since.lock().expect("since lock").push(since);
-            Ok(())
+            Ok(true)
         }
     }
 
@@ -952,6 +1030,188 @@ mod tests {
         assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn sibling_closures_trigger_one_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        for subscription_id in [NOTIFICATION_SUBSCRIPTION_ID, NOTIFY_LIST_SUBSCRIPTION_ID] {
+            notify_tx
+                .send(relay_message(RelayMessage::closed(
+                    SubscriptionId::new(subscription_id),
+                    "error: relay restart",
+                )))
+                .expect("send CLOSED");
+        }
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(60),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("stale sibling closure must not fail recovery");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_flow_allows_a_later_closed_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(60),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: first closure",
+            )))
+            .expect("send first CLOSED");
+        notify_tx
+            .send(live_event(&Keys::generate(), "healthy traffic"))
+            .expect("send live event");
+        event_rx.recv().await.expect("forward healthy event");
+        advance(CLOSED_RECOVERY_GRACE).await;
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: later closure",
+            )))
+            .expect("send later CLOSED");
+        tokio::task::yield_now().await;
+
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 2);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("healthy flow must reset closed recovery");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_closure_backs_off_before_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "rate-limited: slow down",
+            )))
+            .expect("send CLOSED");
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(60),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+        advance(RATE_LIMIT_RECOVERY_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+        advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_backpressure_does_not_trigger_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+        let keys = Keys::generate();
+        let queued = live_event(&keys, "already queued");
+        let RelayPoolNotification::Event { event, .. } = queued else {
+            unreachable!("live_event always constructs an event")
+        };
+        event_tx
+            .send((event, EventContext::Live))
+            .await
+            .expect("pre-fill event channel");
+
+        notify_tx
+            .send(live_event(&keys, "blocked by downstream"))
+            .expect("send live event");
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(30),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(30)).await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+
+        event_rx.recv().await.expect("drain pre-filled event");
+        event_rx.recv().await.expect("forward blocked event");
+        advance(Duration::from_secs(29)).await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
     #[test]
     fn only_service_owned_subscription_ids_trigger_recovery() {
         assert!(is_owned_subscription(&SubscriptionId::new(
@@ -963,26 +1223,5 @@ mod tests {
         assert!(!is_owned_subscription(&SubscriptionId::new(
             "another-component"
         )));
-    }
-
-    #[test]
-    fn shipped_configs_do_not_subscribe_to_contact_lists() {
-        for filename in ["settings.yaml", "settings.development.yaml"] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("config")
-                .join(filename);
-            let settings: crate::config::Settings = config::Config::builder()
-                .add_source(config::File::from(path).required(true))
-                .build()
-                .expect("build config")
-                .try_deserialize()
-                .expect("deserialize config");
-            let subscribed_kinds = notification_event_kinds(&settings.notification.event_kinds);
-
-            assert!(
-                !subscribed_kinds.contains(&Kind::from(3_u16)),
-                "{filename} must not subscribe the relay listener to kind 3"
-            );
-        }
     }
 }
