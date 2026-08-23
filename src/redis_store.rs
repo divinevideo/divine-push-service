@@ -161,6 +161,51 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
     }
 }
 
+/// Records that a push reached these tokens, so the sweep below measures
+/// inactivity rather than time since registration.
+///
+/// The score was previously written only by `add_or_update_token`, which made
+/// the sweep delete devices that were still receiving notifications but had not
+/// re-registered inside the window.
+///
+/// Two flags carry the correctness here, and neither is decoration:
+/// - `XX` never creates a member. A token deregistered or swept between the
+///   send and this call must stay gone; re-adding it would leave a tracked
+///   token with no `token_to_pubkey` owner and no user-set membership, which
+///   nothing clears until it ages out a second full max-age window.
+/// - `GT` never lowers a score. Replicas stamp this from their own clocks, so
+///   without it a peer running behind could pull a live token toward the sweep
+///   — the exact outcome recording activity exists to prevent.
+///
+/// Returns the number of tokens whose score actually moved.
+pub async fn refresh_token_activity(pool: &RedisPool, tokens: &[String]) -> Result<usize> {
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let now_timestamp = Timestamp::now().as_secs();
+
+    // One command for the whole batch: a delivery fans out over every token a
+    // recipient registered, and this runs on the delivery path.
+    let mut cmd = redis::cmd("ZADD");
+    cmd.arg(STALE_TOKENS_ZSET).arg("XX").arg("GT").arg("CH");
+    for token in tokens {
+        cmd.arg(now_timestamp).arg(token);
+    }
+
+    let changed: usize = cmd
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(changed)
+}
+
 /// Cleans up stale tokens based on their last_seen timestamp.
 pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Result<usize> {
     let mut conn = pool

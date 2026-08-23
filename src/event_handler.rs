@@ -1547,7 +1547,10 @@ async fn send_notification_to_user(
 
     // Process results
     let mut tokens_to_remove = Vec::new();
-    let mut success_count = 0;
+    // Doubles as the success count. A delivered push is the only evidence this
+    // service gets that a device still exists, so the tokens are worth keeping
+    // rather than just counting.
+    let mut delivered_tokens = Vec::new();
     // Counted separately from `tokens_to_remove`: a dead token is a *pruned*
     // token, not the only way a send fails. Reporting only removals meant an
     // outage where every send failed for some other reason — bad credentials,
@@ -1565,8 +1568,8 @@ async fn send_notification_to_user(
 
         match classify_send_outcome(&result) {
             SendOutcome::Delivered => {
-                success_count += 1;
                 trace!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Successfully sent notification");
+                delivered_tokens.push(fcm_token);
             }
             SendOutcome::FailedAndPrune => {
                 failed_count += 1;
@@ -1592,6 +1595,8 @@ async fn send_notification_to_user(
         }
     }
 
+    let success_count = delivered_tokens.len();
+
     info!(
         event_id = %event_id,
         target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
@@ -1600,6 +1605,29 @@ async fn send_notification_to_user(
         pruned_count = tokens_to_remove.len(),
         "FCM notification send summary"
     );
+
+    // A delivered push is proof the device is still there, so it has to move the
+    // token away from the staleness sweep. Without this the score is only ever
+    // written at registration, and `cleanup_stale_tokens` deletes devices that
+    // are actively receiving notifications but have not re-registered inside the
+    // window — silently, with no error anywhere.
+    //
+    // Log and continue rather than `?`, for the same reason as the bookkeeping
+    // below: the push has already shipped, and propagating here would report a
+    // delivered notification as failed and skip the writes that follow.
+    if !delivered_tokens.is_empty() {
+        if let Err(e) =
+            redis_store::refresh_token_activity(&state.redis_pool, &delivered_tokens).await
+        {
+            error!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                error = %e,
+                "Failed to refresh token activity after a delivered push; the sweep may \
+                 deregister a live device"
+            );
+        }
+    }
 
     // Open the rate-limit window only on a delivered push.
     //
@@ -2428,6 +2456,139 @@ mod tests {
             copy.cell.get().map(|c| c.sender_name.as_str()),
             Some(format_short_npub(&author.public_key()).as_str()),
             "a delivered push resolves the copy the payload is built from"
+        );
+
+        redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+    }
+
+    /// The sweep in `cleanup_stale_tokens` reads this score and nothing else.
+    /// Documented in AGENTS.md; the constant is private to `redis_store`.
+    async fn staleness_score(pool: &redis_store::RedisPool, token: &str) -> Option<u64> {
+        let mut conn = pool.get().await.unwrap();
+        let score: Option<f64> = redis::cmd("ZSCORE")
+            .arg("stale_tokens")
+            .arg(token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        score.map(|s| s as u64)
+    }
+
+    async fn backdate_staleness_score(pool: &redis_store::RedisPool, token: &str, score: u64) {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZADD")
+            .arg("stale_tokens")
+            .arg(score)
+            .arg(token)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_delivered_push_refreshes_the_tokens_staleness_score() {
+        // A device that keeps receiving pushes is by definition not stale, so
+        // the sweep must not delete it 90 days after its last *registration*.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let fcm_token = format!("staleness-live-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let registered_at = Timestamp::now().as_secs() - 80 * 24 * 60 * 60;
+        backdate_staleness_score(&pool, &fcm_token, registered_at).await;
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("hello")
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mock_sender.get_sent_messages().len(), 1);
+        let score = staleness_score(&pool, &fcm_token)
+            .await
+            .expect("a delivered token stays tracked");
+        assert!(
+            score > registered_at,
+            "a delivered push left the token at its registration score ({score}), \
+             so the sweep still measures age rather than inactivity"
+        );
+
+        redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_send_leaves_the_staleness_score_alone() {
+        // Only a delivered push is evidence the device is alive. An auth
+        // failure or an FCM outage says nothing about the token, and treating
+        // it as activity would keep dead tokens alive forever.
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let fcm_token = format!("staleness-failed-{}", recipient.public_key().to_hex());
+        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+            .await
+            .unwrap();
+
+        let registered_at = Timestamp::now().as_secs() - 80 * 24 * 60 * 60;
+        backdate_staleness_score(&pool, &fcm_token, registered_at).await;
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(
+            &fcm_token,
+            FcmError::Unauthorized("credentials rejected".to_string()),
+        );
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        let event = EventBuilder::text_note("hello")
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&author)
+            .unwrap();
+
+        send_notification_to_user(
+            &state,
+            &event,
+            &recipient.public_key(),
+            NotificationType::Mention,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            staleness_score(&pool, &fcm_token).await,
+            Some(registered_at),
+            "a failed send must not count as proof the device is alive"
         );
 
         redis_store::remove_token(&pool, &recipient.public_key(), &fcm_token)
