@@ -21,7 +21,6 @@ impl Default for UserPreferences {
         Self {
             kinds: vec![
                 1,     // Text notes (comments, mentions)
-                3,     // Contact list (follows)
                 7,     // Reactions/likes
                 16,    // Reposts
                 30023, // Long-form content
@@ -51,7 +50,6 @@ impl UserPreferences {
 pub enum NotificationType {
     Like,
     Comment,
-    Follow,
     Mention,
     Repost,
     /// A creator the recipient subscribed to published a new video.
@@ -68,7 +66,6 @@ impl NotificationType {
         match self {
             NotificationType::Like => 7,
             NotificationType::Comment => 1,
-            NotificationType::Follow => 3,
             NotificationType::Mention => 1, // Same as Comment - both are kind 1
             NotificationType::Repost => 16,
             // Distinct from Mention's kind 1 even though video mentions also
@@ -87,7 +84,6 @@ impl NotificationType {
         match self {
             NotificationType::Like => "like",
             NotificationType::Comment => "comment",
-            NotificationType::Follow => "follow",
             NotificationType::Mention => "mention",
             NotificationType::Repost => "repost",
             NotificationType::NewPost => "newPost",
@@ -189,7 +185,7 @@ mod tests {
     fn test_default_preferences() {
         let prefs = UserPreferences::default();
         assert!(prefs.kinds.contains(&1));
-        assert!(prefs.kinds.contains(&3));
+        assert!(!prefs.kinds.contains(&3));
         assert!(prefs.kinds.contains(&7));
         assert!(prefs.kinds.contains(&16));
         assert!(prefs.kinds.contains(&30023));
@@ -199,7 +195,6 @@ mod tests {
     fn test_notification_type_kind_mapping() {
         assert_eq!(NotificationType::Like.kind(), 7);
         assert_eq!(NotificationType::Comment.kind(), 1);
-        assert_eq!(NotificationType::Follow.kind(), 3);
         assert_eq!(NotificationType::Mention.kind(), 1);
         assert_eq!(NotificationType::Repost.kind(), 16);
     }
@@ -217,7 +212,6 @@ mod tests {
         assert!(NotificationType::Like.is_enabled(&prefs));
         assert!(!NotificationType::Comment.is_enabled(&prefs));
         assert!(!NotificationType::Mention.is_enabled(&prefs));
-        assert!(!NotificationType::Follow.is_enabled(&prefs));
     }
 
     #[test]
@@ -246,7 +240,7 @@ mod tests {
     #[test]
     fn test_new_post_disabled_when_prefs_omit_video_kind() {
         let prefs = UserPreferences {
-            kinds: vec![1, 3, 7, 16, 30023],
+            kinds: vec![1, 7, 16, 30023],
         };
         assert!(!NotificationType::NewPost.is_enabled(&prefs));
     }

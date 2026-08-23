@@ -22,7 +22,7 @@ sequenceDiagram
     Push->>Redis: Store token for pubkey
 
     Note over App,Device: Notification Delivery
-    Relay->>Push: New event (like, comment, follow, etc.)
+    Relay->>Push: New event (like, comment, mention, etc.)
     Push->>Redis: Check recipient has registered token
     Push->>Redis: Check user preferences
     Push->>Redis: Claim (event, recipient) (SET NX EX)
@@ -50,13 +50,10 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Like | 7 | Reaction to user's note (p-tag) |
 | Comment | 1 | Reply to user's note (p-tag, with e-tag reference) |
 | Comment | 1111 | NIP-22 comment on a user's video or article (notifies root author `P` and parent author `p`) |
-| Follow | 3 | New contact list including user (p-tag) |
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
 | NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
-
-> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, reposts, and new posts are the types actually delivered today.
 
 > **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
 
@@ -64,7 +61,7 @@ The service watches for these event kinds and notifies the tagged recipient:
 
 The FCM message carries **no top-level `notification` field** — the `data` map below is always present and is identical in shape for every notification type (only the `title`/`body` strings differ); every `data` value is a string. Per-platform delivery then diverges so that **one incoming push produces exactly one visible banner**:
 
-- **Android** — data-only (`notification` and `android` unset). Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields.
+- **Android** — data-only (top-level `notification` unset) with `android.priority` set to `high`. Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields; high priority lets FCM wake an idle device promptly for this user-visible notification.
 - **iOS** — the service attaches an APNS override: `aps.alert` (title/body) + `mutable-content: 1`, push-type `alert`, priority 10. The OS presents the single banner; a Notification Service Extension (if shipped) uses `mutable-content` to *enrich* that same banner, never to create a second one. `content-available` is deliberately omitted — see [Avoiding duplicate banners](#avoiding-duplicate-banners).
 
 ```json
@@ -99,15 +96,15 @@ For a kind 34236 video mention, the triggering event is itself the addressable t
 
 > **Clients MUST NOT** synthesize a video coordinate by pairing `referencedDTag` (or any d-tag) with the *recipient's* pubkey. The recipient is not necessarily the video owner — e.g. a reply to another user's comment, or a mention — and doing so attributes the notification to the wrong (or a nonexistent) video. Use `referencedAuthorPubkey` / `referencedAddress` for ownership; fall back to `referencedEventId` when no coordinate is present.
 
-When the triggering event is not addressable and carries no addressable reference (a follow, a mention in a plain note, or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
+When the triggering event is not addressable and carries no addressable reference (a mention in a plain note or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
 
 #### Authoritative (routing / attribution)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `like`, `comment`, `follow`, `mention`, `repost`, or `newPost`. Match the exact string: the first five are lowercase, `newPost` is camelCase |
-| `eventId` | hex | The Nostr event that triggered the notification (the like/comment/repost/follow event itself); stable id for dedup and a routing fallback |
-| `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes follows and otherwise-unresolved taps |
+| `type` | string | `like`, `comment`, `mention`, `repost`, or `newPost`. Match the exact string: the first four are lowercase, `newPost` is camelCase |
+| `eventId` | hex | The Nostr event that triggered the notification (the like/comment/mention/repost/video event itself); stable id for dedup and a routing fallback |
+| `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
 | `referencedEventId` | hex | (optional) Target event. For a direct kind 34236 trigger this is the video event's own id. Otherwise it is root-aware: the NIP-22 uppercase `E` root scope when present, else the lowercase `e` tag — so comments anchor to the root video, not the parent comment |
 | `referencedAddress` | string | (optional) Authoritative addressable target coordinate `kind:pubkey:d-tag`. Built from a direct kind 34236 trigger's own identity, or taken from the event's `A` (NIP-22 root) or `a` tag for an indirect reference |
@@ -126,7 +123,7 @@ When the triggering event is not addressable and carries no addressable referenc
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
 | `timestamp` | string | Unix timestamp of the triggering event as a string |
 
-The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and follows/plain-note mentions omit them.
+The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 
 ### iOS APNS shape
 
@@ -205,10 +202,10 @@ their atomic replacement script and take no claim.
 Users can optionally send a Kind 3083 event to control which notification types they receive. The decrypted content is:
 
 ```json
-{ "kinds": [1, 3, 7, 16] }
+{ "kinds": [1, 7, 16] }
 ```
 
-This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), follows (3), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236).
+This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236). Kind 3 contact lists are not notification triggers in this service.
 
 ## New-post subscriptions ("bells")
 
