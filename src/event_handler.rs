@@ -850,6 +850,8 @@ pub async fn run_new_post_fanout(state: Arc<AppState>, token: CancellationToken)
                     .await
                     {
                         error!(error = %retry_error, "Failed to reschedule fan-out page after processing error; lease expiry will recover it");
+                    } else {
+                        crate::metrics::new_post_fanout_retry("worker_error", "preserved");
                     }
                 }
             }
@@ -919,7 +921,7 @@ async fn process_fanout_job(
         Ok(page) => page,
         Err(e) => {
             error!(event_id = %event.id, cursor = job.cursor, error = %e, "Failed to read durable watcher page; scheduling retry");
-            schedule_fanout_retry(state, job_json, &job, 0, "watcher_page_read").await?;
+            schedule_fanout_retry(state, job_json, &job, 0, "watcher_page_read", None).await?;
             return Ok(());
         }
     };
@@ -962,27 +964,45 @@ async fn process_fanout_job(
                 crate::error::ServiceError::RetryableDelivery(delay) => delay.as_secs(),
                 _ => 0,
             };
+            let exhausted_next_job = fanout_successor_job(&job, page.next_cursor, &copy)?;
             error!(event_id = %event.id, cursor = job.cursor, error = %e, "Durable watcher page was incomplete; scheduling retry");
-            schedule_fanout_retry(state, job_json, &job, provider_delay, "delivery").await?;
+            schedule_fanout_retry(
+                state,
+                job_json,
+                &job,
+                provider_delay,
+                "delivery",
+                exhausted_next_job.as_deref(),
+            )
+            .await?;
             return Ok(());
         }
     }
 
-    let next_job = if page.next_cursor == 0 {
-        None
-    } else {
-        let next = NewPostFanoutJob {
-            event_json: job.event_json,
-            cursor: page.next_cursor,
-            sender_name: job
-                .sender_name
-                .or_else(|| copy.cell.get().map(|resolved| resolved.sender_name.clone())),
-            attempt: 0,
-            expires_at: job.expires_at,
-        };
-        Some(serde_json::to_string(&next)?)
-    };
+    let next_job = fanout_successor_job(&job, page.next_cursor, &copy)?;
     redis_store::complete_fanout_job(&state.redis_pool, job_json, next_job.as_deref()).await
+}
+
+fn fanout_successor_job(
+    job: &NewPostFanoutJob,
+    next_cursor: u64,
+    copy: &LazyEventCopy,
+) -> Result<Option<String>> {
+    if next_cursor == 0 {
+        return Ok(None);
+    }
+
+    let next = NewPostFanoutJob {
+        event_json: job.event_json.clone(),
+        cursor: next_cursor,
+        sender_name: job
+            .sender_name
+            .clone()
+            .or_else(|| copy.cell.get().map(|resolved| resolved.sender_name.clone())),
+        attempt: 0,
+        expires_at: job.expires_at,
+    };
+    Ok(Some(serde_json::to_string(&next)?))
 }
 
 async fn schedule_fanout_retry(
@@ -991,19 +1011,23 @@ async fn schedule_fanout_retry(
     job: &NewPostFanoutJob,
     minimum_delay_secs: u64,
     reason: &'static str,
+    exhausted_next_job: Option<&str>,
 ) -> Result<()> {
     let Some((retry, delay)) = next_fanout_retry(
         job,
         state.settings.service.new_post_fanout_retry_secs,
         minimum_delay_secs,
+        Timestamp::now().as_secs(),
     ) else {
-        redis_store::complete_fanout_job(&state.redis_pool, current_job, None).await?;
+        redis_store::complete_fanout_job(&state.redis_pool, current_job, exhausted_next_job)
+            .await?;
         crate::metrics::new_post_fanout_retry(reason, "exhausted");
         error!(
             cursor = job.cursor,
             attempts = MAX_FANOUT_ATTEMPTS,
             reason,
-            "Discarding durable new-post fan-out page and its remaining cursor chain after its retry budget was exhausted"
+            continued = exhausted_next_job.is_some(),
+            "Discarding durable new-post fan-out page after its retry budget was exhausted"
         );
         return Ok(());
     };
@@ -1017,6 +1041,7 @@ fn next_fanout_retry(
     job: &NewPostFanoutJob,
     base_delay_secs: u64,
     minimum_delay_secs: u64,
+    now: u64,
 ) -> Option<(NewPostFanoutJob, u64)> {
     // Twelve total attempts span about 30 minutes of default scheduled backoff
     // and 5-minute local cap. That rides out sustained provider backpressure
@@ -1026,7 +1051,8 @@ fn next_fanout_retry(
     }
     let mut retry = job.clone();
     retry.attempt = retry.attempt.saturating_add(1);
-    let delay = fanout_retry_delay(base_delay_secs, retry.attempt, minimum_delay_secs);
+    let delay = fanout_retry_delay(base_delay_secs, retry.attempt, minimum_delay_secs)
+        .min(job.expires_at.saturating_sub(now));
     Some((retry, delay))
 }
 
@@ -3329,10 +3355,10 @@ mod tests {
             expires_at: 1_000,
         };
 
-        let (first, first_delay) = next_fanout_retry(&initial, 5, 0).unwrap();
+        let (first, first_delay) = next_fanout_retry(&initial, 5, 0, 0).unwrap();
         let persisted = serde_json::to_string(&first).unwrap();
         let restored: NewPostFanoutJob = serde_json::from_str(&persisted).unwrap();
-        let (second, second_delay) = next_fanout_retry(&restored, 5, 0).unwrap();
+        let (second, second_delay) = next_fanout_retry(&restored, 5, 0, 0).unwrap();
 
         assert_eq!(first.attempt, 1);
         assert_eq!(first_delay, 5);
@@ -3353,12 +3379,98 @@ mod tests {
         };
 
         for expected_attempt in 1..MAX_FANOUT_ATTEMPTS {
-            let (retry, _) = next_fanout_retry(&job, 5, 0).unwrap();
+            let (retry, _) = next_fanout_retry(&job, 5, 0, 0).unwrap();
             assert_eq!(retry.attempt, expected_attempt);
             job = retry;
         }
 
-        assert!(next_fanout_retry(&job, 5, 0).is_none());
+        assert!(next_fanout_retry(&job, 5, 0, 0).is_none());
+    }
+
+    #[test]
+    fn durable_fanout_retry_preserves_provider_floor_within_job_lifetime() {
+        let job = NewPostFanoutJob {
+            event_json: "{}".to_string(),
+            cursor: 17,
+            sender_name: None,
+            attempt: 0,
+            expires_at: 10_000,
+        };
+
+        let (_, provider_delay) = next_fanout_retry(&job, 5, 3_600, 100).unwrap();
+        let (_, lifetime_clamped_delay) = next_fanout_retry(&job, 5, u64::MAX, 100).unwrap();
+
+        assert_eq!(provider_delay, 3_600);
+        assert_eq!(lifetime_clamped_delay, 9_900);
+    }
+
+    #[tokio::test]
+    async fn exhausted_fanout_page_preserves_its_known_successor() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let _guard = fanout_test_lock().lock().await;
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        let current = NewPostFanoutJob {
+            event_json: "{}".to_string(),
+            cursor: 17,
+            sender_name: None,
+            attempt: MAX_FANOUT_ATTEMPTS - 1,
+            expires_at: Timestamp::now().as_secs().saturating_add(3_600),
+        };
+        let successor = NewPostFanoutJob {
+            cursor: 23,
+            attempt: 0,
+            ..current.clone()
+        };
+        let current_json = serde_json::to_string(&current).unwrap();
+        let successor_json = serde_json::to_string(&successor).unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZADD")
+            .arg("new_post_fanout_jobs")
+            .arg(0)
+            .arg(&current_json)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        schedule_fanout_retry(
+            &state,
+            &current_json,
+            &current,
+            0,
+            "delivery",
+            Some(&successor_json),
+        )
+        .await
+        .unwrap();
+
+        let mut conn = pool.get().await.unwrap();
+        let current_score: Option<f64> = redis::cmd("ZSCORE")
+            .arg("new_post_fanout_jobs")
+            .arg(&current_json)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let successor_score: Option<f64> = redis::cmd("ZSCORE")
+            .arg("new_post_fanout_jobs")
+            .arg(&successor_json)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(current_score.is_none());
+        assert!(successor_score.is_some());
+        redis::cmd("ZREM")
+            .arg("new_post_fanout_jobs")
+            .arg(&successor_json)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -410,6 +410,9 @@ pub async fn claim_fanout_job(pool: &RedisPool, lease_secs: u64) -> Result<Optio
 /// its lease expired and another worker reclaimed the page, both may deliver
 /// the page. The successor is inserted before the current member is removed, so
 /// that race can duplicate work but cannot remove the only copy of the next page.
+/// A stale worker can also reinsert a successor that another worker already
+/// completed, resurrecting an earlier chain segment; that is still duplicate
+/// work rather than page loss.
 /// Recipient claims make the duplicate delivery harmless in the common case.
 pub async fn complete_fanout_job(
     pool: &RedisPool,

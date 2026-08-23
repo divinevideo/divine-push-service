@@ -358,11 +358,16 @@ page sized by `new_post_fanout_page_size`, and delivers with at most
 atomically removes it and queues the next cursor. A crashed worker's page is
 eligible again after `new_post_fanout_lease_secs`; recoverable failures use
 exponential backoff from `new_post_fanout_retry_secs` up to five minutes, while
-an FCM `Retry-After` remains a floor even when it is longer. A page is discarded
-with its remaining cursor chain after 12 total delivery attempts, which includes
-about 30 minutes of scheduled default backoff;
+an FCM `Retry-After` remains a floor even when it is longer, bounded by the job's
+remaining lifetime. A page is discarded after 12 total delivery attempts, which
+includes about 30 minutes of scheduled default backoff. When delivery already
+resolved a successor cursor, exhaustion queues that successor so one poison page
+does not drop every later watcher page;
 `push_new_post_fanout_retries_total{reason,outcome}` exposes scheduled and
-exhausted retries. Jobs also expire after the processed-event TTL. Graceful
+exhausted retries, plus ownerless preservation after a Redis operation error.
+That preservation path keeps the known queue member rather than trusting a
+possibly completed attempt swap, so it does not advance the durable attempt
+counter. Jobs also expire after the processed-event TTL. Graceful
 shutdown releases the active page immediately; a crash relies on lease expiry.
 Successful per-recipient claims make these at-least-once page retries safe. The
 page size is not a recipient cap; jobs continue until Redis returns cursor 0.

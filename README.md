@@ -186,7 +186,7 @@ The metrics endpoint exposes:
 | `push_fcm_sends_attempted_total` | Counter | FCM sends attempted per device token. |
 | `push_fcm_sends_succeeded_total` | Counter | Successful FCM sends per device token. |
 | `push_fcm_sends_failed_total{reason}` | Counter | Failed FCM sends by bounded failure reason. |
-| `push_new_post_fanout_retries_total{reason,outcome}` | Counter | Durable new-post page retries by bounded failure reason and scheduled/exhausted outcome. |
+| `push_new_post_fanout_retries_total{reason,outcome}` | Counter | Durable new-post page retries by bounded failure reason and scheduled, preserved, or exhausted outcome. |
 | `push_tokens_pruned_total{reason}` | Counter | Tokens removed as `invalid` or `stale`. |
 | `push_last_event_processed_timestamp_seconds` | Gauge | Unix timestamp of the last completed event routing attempt. Initialized at startup to give a new instance one alert window. |
 

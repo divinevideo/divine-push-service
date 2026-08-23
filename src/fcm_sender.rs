@@ -49,7 +49,7 @@ const FCM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deliberately larger than `FCM_REQUEST_TIMEOUT` so the inner timeout normally
 /// fires first and yields the more specific error; this is the backstop that
 /// bounds whatever else the function grows to do.
-const FCM_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const FCM_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 fn build_http_client() -> Result<reqwest::Client, FcmError> {
@@ -916,6 +916,16 @@ mod tests {
 
     #[test]
     fn too_many_requests_is_retryable_and_honors_retry_after() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "12")]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn too_many_requests_preserves_an_hour_retry_after() {
         let error = classify_error(
             StatusCode::TOO_MANY_REQUESTS,
             &header_map(&[("Retry-After", "3600")]),
