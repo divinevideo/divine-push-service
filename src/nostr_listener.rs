@@ -89,6 +89,33 @@ fn is_owned_subscription(subscription_id: &SubscriptionId) -> bool {
     )
 }
 
+fn notification_event_kinds(configured_kinds: &[u64]) -> Vec<Kind> {
+    let mut kinds = vec![
+        Kind::from(KIND_REGISTRATION),
+        Kind::from(KIND_DEREGISTRATION),
+        Kind::from(KIND_PREFERENCES_UPDATE),
+    ];
+
+    for configured_kind in configured_kinds {
+        match u16::try_from(*configured_kind) {
+            Ok(kind) => {
+                let kind = Kind::from(kind);
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            Err(_) => {
+                warn!(
+                    kind = configured_kind,
+                    "Skipping notification event kind outside Nostr u16 range"
+                );
+            }
+        }
+    }
+
+    kinds
+}
+
 pub struct NostrListener {
     state: Arc<AppState>,
 }
@@ -214,6 +241,8 @@ impl NostrListener {
                         info!(count = historical_events.len(), "Processing historical control events...");
 
                         for event in historical_events {
+                            crate::metrics::event_received();
+
                             if event.pubkey == *service_pubkey {
                                 continue;
                             }
@@ -297,6 +326,8 @@ impl NostrListener {
             let mut oldest = None;
             let mut new_count = 0usize;
             for event in lists {
+                crate::metrics::event_received();
+
                 oldest = match oldest {
                     Some(current) if current <= event.created_at => Some(current),
                     _ => Some(event.created_at),
@@ -356,29 +387,7 @@ impl NostrListener {
         token: &CancellationToken,
         since: Timestamp,
     ) -> Result<()> {
-        let mut all_kinds = vec![
-            // Control kinds
-            Kind::from(KIND_REGISTRATION),
-            Kind::from(KIND_DEREGISTRATION),
-            Kind::from(KIND_PREFERENCES_UPDATE),
-        ];
-
-        for kind in &self.state.settings.notification.event_kinds {
-            match u16::try_from(*kind) {
-                Ok(kind) => {
-                    let kind = Kind::from(kind);
-                    if !all_kinds.contains(&kind) {
-                        all_kinds.push(kind);
-                    }
-                }
-                Err(_) => {
-                    warn!(
-                        kind,
-                        "Skipping notification event kind outside Nostr u16 range"
-                    );
-                }
-            }
-        }
+        let all_kinds = notification_event_kinds(&self.state.settings.notification.event_kinds);
 
         let filter = Filter::new().kinds(all_kinds.clone()).since(since);
 
@@ -540,6 +549,7 @@ async fn run_live_loop(
                             RelayPoolNotification::Event { event, .. } => {
                                 recovery_attempted = false;
                                 silence_deadline = Instant::now() + silence_timeout;
+                                crate::metrics::event_received();
 
                                 if event.pubkey == service_pubkey {
                                     debug!("Skipping event from service account");
@@ -906,5 +916,26 @@ mod tests {
         assert!(!is_owned_subscription(&SubscriptionId::new(
             "another-component"
         )));
+    }
+
+    #[test]
+    fn shipped_configs_do_not_subscribe_to_contact_lists() {
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("config")
+                .join(filename);
+            let settings: crate::config::Settings = config::Config::builder()
+                .add_source(config::File::from(path).required(true))
+                .build()
+                .expect("build config")
+                .try_deserialize()
+                .expect("deserialize config");
+            let subscribed_kinds = notification_event_kinds(&settings.notification.event_kinds);
+
+            assert!(
+                !subscribed_kinds.contains(&Kind::from(3_u16)),
+                "{filename} must not subscribe the relay listener to kind 3"
+            );
+        }
     }
 }

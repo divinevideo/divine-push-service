@@ -45,7 +45,7 @@ fn test_pubkey() -> String {
 
 fn default_prefs() -> DefaultPreferences {
     DefaultPreferences {
-        kinds: vec![1, 3, 7, 16, 30023],
+        kinds: vec![1, 7, 16, 30023],
     }
 }
 
@@ -66,6 +66,7 @@ async fn test_preferences_roundtrip() {
         .expect("Should get default preferences");
 
     assert!(prefs.kinds.contains(&1));
+    assert!(!prefs.kinds.contains(&3));
     assert!(prefs.kinds.contains(&7));
     assert!(prefs.kinds.contains(&16));
 
@@ -136,7 +137,6 @@ async fn test_notification_type_filtering_with_kinds() {
 
     assert!(NotificationType::Like.is_enabled(&prefs)); // kind 7 ✓
     assert!(!NotificationType::Comment.is_enabled(&prefs)); // kind 1 ✗
-    assert!(!NotificationType::Follow.is_enabled(&prefs)); // kind 3 ✗
     assert!(!NotificationType::Mention.is_enabled(&prefs)); // kind 1 ✗
     assert!(NotificationType::Repost.is_enabled(&prefs)); // kind 16 ✓
 }
@@ -168,7 +168,7 @@ async fn test_preferences_update() {
 
     // Set initial preferences - all kinds enabled
     let initial = UserPreferences {
-        kinds: vec![1, 3, 7, 16, 30023],
+        kinds: vec![1, 7, 16, 30023],
     };
 
     preferences::set_user_preferences(&pool, &pubkey, &initial)
@@ -209,7 +209,6 @@ fn test_build_preferences_key_format() {
 fn test_notification_type_display_names() {
     assert_eq!(NotificationType::Like.display_name(), "like");
     assert_eq!(NotificationType::Comment.display_name(), "comment");
-    assert_eq!(NotificationType::Follow.display_name(), "follow");
     assert_eq!(NotificationType::Mention.display_name(), "mention");
     assert_eq!(NotificationType::Repost.display_name(), "repost");
 }
@@ -218,7 +217,6 @@ fn test_notification_type_display_names() {
 fn test_notification_type_kind_values() {
     assert_eq!(NotificationType::Like.kind(), 7);
     assert_eq!(NotificationType::Comment.kind(), 1);
-    assert_eq!(NotificationType::Follow.kind(), 3);
     assert_eq!(NotificationType::Mention.kind(), 1); // Same as Comment
     assert_eq!(NotificationType::Repost.kind(), 16);
 }
@@ -243,7 +241,6 @@ fn test_empty_preferences_disables_all() {
 
     assert!(!NotificationType::Like.is_enabled(&prefs));
     assert!(!NotificationType::Comment.is_enabled(&prefs));
-    assert!(!NotificationType::Follow.is_enabled(&prefs));
     assert!(!NotificationType::Mention.is_enabled(&prefs));
     assert!(!NotificationType::Repost.is_enabled(&prefs));
 }

@@ -3,7 +3,7 @@
 //! Handles Nostr events and routes them to appropriate notification handlers.
 //! Supports:
 //! - Token registration/deregistration (kinds 3079/3080)
-//! - Notification types: likes, comments, follows, mentions, reposts
+//! - Notification types: likes, comments, mentions, reposts, and new posts
 
 use crate::{
     crypto::CryptoService,
@@ -196,6 +196,8 @@ pub async fn run(
                         error!(event_id = %event_id, error = %e, "Failed to handle event");
                     }
                 }
+
+                crate::metrics::event_processed();
 
                 if token.is_cancelled() {
                     info!(event_id = %event_id, "Event handler cancellation detected after processing event.");
@@ -569,12 +571,6 @@ async fn handle_content_event(
         // and the direct parent author (lowercase `p`). create_fcm_payload
         // attaches the authoritative root-video target from the uppercase `A`.
         targets_of(NotificationType::Comment, find_comment_recipients(event))
-    } else if kind_num == 3 {
-        // Kind 3: Contact list - notify newly followed users
-        // Note: This would require tracking previous contact list state
-        // For now, we skip this as it requires state comparison
-        debug!(event_id = %event_id, "Contact list event - follow notifications not yet implemented");
-        return Ok(());
     } else if kind_num == 16 {
         // Kind 16: Repost - notify the author of the reposted event
         targets_of(NotificationType::Repost, find_repost_recipients(event))
@@ -976,10 +972,7 @@ struct EventScopedCopy {
 fn renders_event_content(notification_type: NotificationType) -> bool {
     match notification_type {
         NotificationType::Comment | NotificationType::Mention => true,
-        NotificationType::Like
-        | NotificationType::Follow
-        | NotificationType::Repost
-        | NotificationType::NewPost => false,
+        NotificationType::Like | NotificationType::Repost | NotificationType::NewPost => false,
     }
 }
 
@@ -1658,21 +1651,34 @@ async fn send_notification_to_user(
                 return Err(crate::error::ServiceError::Cancelled);
             }
             let truncated_token = fcm_sender::token_prefix(&fcm_token_to_remove);
-            if let Err(e) =
-                redis_store::remove_token(&state.redis_pool, target_pubkey, &fcm_token_to_remove)
-                    .await
+            match redis_store::remove_token(&state.redis_pool, target_pubkey, &fcm_token_to_remove)
+                .await
             {
-                error!(
-                    target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
-                    "Failed to remove invalid token"
-                );
-            } else {
-                info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
+                Ok(removed) => {
+                    record_invalid_token_pruned(removed);
+                    if removed {
+                        info!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Removed invalid token");
+                    } else {
+                        debug!(target_pubkey = %target_pubkey, token_prefix = %truncated_token, "Invalid token was already removed");
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        target_pubkey = %target_pubkey, token_prefix = %truncated_token, error = %e,
+                        "Failed to remove invalid token"
+                    );
+                }
             }
         }
     }
 
     Ok(())
+}
+
+fn record_invalid_token_pruned(removed: bool) {
+    if removed {
+        crate::metrics::tokens_pruned("invalid", 1);
+    }
 }
 
 /// Create FCM payload for a notification
@@ -1713,11 +1719,6 @@ fn create_fcm_payload(
                 sender_name,
                 truncate_string(&formatted_content(), 150)
             );
-            (title, body)
-        }
-        NotificationType::Follow => {
-            let title = "New follower".to_string();
-            let body = format!("{} started following you", sender_name);
             (title, body)
         }
         NotificationType::Mention => {
@@ -1912,6 +1913,24 @@ mod tests {
     use super::*;
     use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
     use nostr_sdk::prelude::{Keys, SecretKey};
+
+    #[test]
+    fn invalid_pruning_records_confirmed_removal() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            record_invalid_token_pruned(true);
+            record_invalid_token_pruned(false);
+        });
+
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"push_tokens_pruned_total{reason="invalid"} 1"#),
+            "{rendered}"
+        );
+    }
 
     async fn test_redis_pool() -> Option<redis_store::RedisPool> {
         let redis_url =
@@ -2273,7 +2292,6 @@ mod tests {
         assert!(renders_event_content(NotificationType::Mention));
 
         assert!(!renders_event_content(NotificationType::Like));
-        assert!(!renders_event_content(NotificationType::Follow));
         assert!(!renders_event_content(NotificationType::Repost));
         assert!(!renders_event_content(NotificationType::NewPost));
     }
