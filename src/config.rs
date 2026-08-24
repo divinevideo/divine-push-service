@@ -37,6 +37,10 @@ pub struct Settings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct NostrSettings {
     pub relay_url: String,
+    /// Maximum silence before the listener resubscribes, and the recovery
+    /// window before continued silence makes the listener unhealthy.
+    #[serde(default = "default_event_silence_timeout")]
+    pub event_silence_timeout_secs: u64,
     #[serde(default)]
     pub profile_relays: Vec<String>,
     #[serde(default = "default_profile_cache_ttl")]
@@ -48,6 +52,10 @@ pub struct NostrSettings {
     /// changing it to affect anything.
     #[serde(default = "default_query_timeout")]
     pub query_timeout_secs: u64,
+}
+
+fn default_event_silence_timeout() -> u64 {
+    300
 }
 
 fn default_profile_cache_ttl() -> u64 {
@@ -326,7 +334,12 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 11] = [
+        let must_be_positive: [(&str, u64, &str); 12] = [
+            (
+                "nostr.event_silence_timeout_secs",
+                self.nostr.event_silence_timeout_secs,
+                "the event-flow watchdog would continuously resubscribe and fail health",
+            ),
             (
                 "nostr.profile_cache_ttl_secs",
                 self.nostr.profile_cache_ttl_secs,
@@ -478,7 +491,10 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 11] = [
+        let cases: [ZeroCase; 12] = [
+            ("nostr.event_silence_timeout_secs", |s| {
+                s.nostr.event_silence_timeout_secs = 0
+            }),
             ("nostr.profile_cache_ttl_secs", |s| {
                 s.nostr.profile_cache_ttl_secs = 0
             }),

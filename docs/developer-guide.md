@@ -413,8 +413,8 @@ the fan-out follow-up rather than done by halves here.
 |-------------|------|-------------|
 | `user_tokens:{pubkey}` | Set | FCM tokens registered for a pubkey |
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
-| `stale_tokens` | Sorted Set | Token timestamps for cleanup |
-| `dedup:{event_id}` | String | Per-event processing claim with TTL for registration, deregistration, and preference control events |
+| `stale_tokens` | Sorted Set | Last time each token was known good, for cleanup. Scored at registration and refreshed on every delivered push, so the sweep deletes devices that have gone quiet rather than devices that merely registered a long time ago. The refresh is `ZADD XX GT`: `XX` never re-creates a token deregistered between the send and the refresh, `GT` never lowers a score |
+| `dedup:{event_id}` | String | Per-event processing claim with TTL for registration, deregistration, and preference control events. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
 | `dedup:{event_id}:{recipient}` | String | Per-recipient content-delivery claim with TTL. Acquired before FCM, retained after any successful or ambiguous delivery, and released after confirmed retryable failure |
 | `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Per-recipient video delivery decision, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered or rate-limited bell writes its own |
 | `fanout:enqueued:{event_id}` | String | Initial new-post fan-out enqueue marker with the processed-event TTL |
