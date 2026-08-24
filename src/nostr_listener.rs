@@ -43,6 +43,11 @@ const CLOSED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 /// Limit relay-driven recovery churn within one silence-watchdog window. A
 /// relay that repeatedly closes subscriptions while still trickling events can
 /// otherwise keep the listener healthy and replay the lookback indefinitely.
+///
+/// The window is the configured event-silence timeout, not a separate knob, so
+/// raising `event_silence_timeout_secs` also widens the span these recoveries
+/// are counted over and makes the budget easier to trip. Keep that in mind when
+/// tuning the silence timeout.
 const MAX_CLOSED_RECOVERIES_PER_WINDOW: usize = 3;
 
 /// How long to wait for the initial relay connection before treating startup as
