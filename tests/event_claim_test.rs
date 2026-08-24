@@ -59,17 +59,7 @@ fn test_notify_lists_are_exempt_from_the_event_claim() {
 }
 
 #[test]
-fn test_the_exemption_does_not_cover_other_kind_30000_lists() {
-    // Same scoping as the replay-horizon exemption. The idempotency argument
-    // rests on the notify-list Lua script, which only runs for `d=notify`, so an
-    // unrelated people list keeps the claim.
-    assert!(event_handler::requires_event_claim(&list_event("mute")));
-}
-
-#[test]
-fn test_push_sending_events_still_claim() {
-    // Everything that actually sends a push depends on the claim to stop two
-    // replicas notifying the same user twice.
+fn test_content_events_use_recipient_claims_instead_of_event_claims() {
     let video = EventBuilder::new(Kind::from(34236u16), "video")
         .tag(Tag::identifier("vid-1"))
         .sign_with_keys(&Keys::generate())
@@ -81,9 +71,20 @@ fn test_push_sending_events_still_claim() {
         .sign_with_keys(&Keys::generate())
         .unwrap();
 
-    assert!(event_handler::requires_event_claim(&video));
-    assert!(event_handler::requires_event_claim(&reaction));
-    assert!(event_handler::requires_event_claim(&note));
+    assert!(!event_handler::requires_event_claim(&video));
+    assert!(!event_handler::requires_event_claim(&reaction));
+    assert!(!event_handler::requires_event_claim(&note));
+    assert!(!event_handler::requires_event_claim(&list_event("mute")));
+}
+
+#[test]
+fn test_control_events_keep_the_event_claim() {
+    for kind in [3079u16, 3080, 3083] {
+        let event = EventBuilder::new(Kind::from(kind), "ciphertext")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(event_handler::requires_event_claim(&event));
+    }
 }
 
 #[tokio::test]

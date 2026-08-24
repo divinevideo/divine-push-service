@@ -50,6 +50,7 @@ const FCM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// fires first and yields the more specific error; this is the backstop that
 /// bounds whatever else the function grows to do.
 const FCM_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 fn build_http_client() -> Result<reqwest::Client, FcmError> {
     build_http_client_with(FCM_REQUEST_TIMEOUT, FCM_CONNECT_TIMEOUT)
@@ -182,11 +183,15 @@ fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> FcmErr
     let message = extract_error_message(body);
     let error_code = extract_fcm_error_code(body);
 
-    if status.is_server_error() {
-        return match parse_retry_after(headers) {
-            Some(retry_after) => FcmError::RetryableInternal(retry_after),
-            None => FcmError::InternalError,
-        };
+    // 429 is FCM's explicit backpressure signal, and a large new-post fan-out is
+    // exactly where it shows up. It carries the same "retry later" meaning as a
+    // 5xx and honours the same `Retry-After`, so it must be retryable: a 429 that
+    // sent nothing is unambiguous, and treating it as permanent strands the whole
+    // page's watchers for the recipient-claim TTL.
+    if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+        return FcmError::RetryableInternal(
+            parse_retry_after(headers).unwrap_or(DEFAULT_RETRY_AFTER),
+        );
     }
 
     // Deliberately NOT keyed on the 404 status alone. `TokenNotRegistered`
@@ -900,13 +905,43 @@ mod tests {
     }
 
     #[test]
-    fn server_error_without_retry_after_is_internal() {
+    fn server_error_without_retry_after_uses_default_retry_delay() {
         let error = classify_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &header_map(&[]),
             r#"{"error":{"code":500,"message":"Internal error"}}"#,
         );
-        assert!(matches!(error, FcmError::InternalError));
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == DEFAULT_RETRY_AFTER));
+    }
+
+    #[test]
+    fn too_many_requests_is_retryable_and_honors_retry_after() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "12")]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn too_many_requests_preserves_an_hour_retry_after() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "3600")]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn too_many_requests_without_retry_after_uses_default_retry_delay() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == DEFAULT_RETRY_AFTER));
     }
 
     #[test]
@@ -1003,16 +1038,18 @@ mod tests {
 
     #[test]
     fn client_error_body_is_preserved_rather_than_discarded() {
-        // The old library collapsed every non-400 4xx to "Unknown invalid
-        // request (no details provided)", losing the reason entirely.
+        // The old library collapsed every non-retryable 4xx to "Unknown invalid
+        // request (no details provided)", losing the reason entirely. (429 is no
+        // longer an example here: it is now retryable backpressure, not a
+        // permanent client error.)
         let error = classify_error(
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_REQUEST,
             &header_map(&[]),
-            r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Send requests'"}}"#,
+            r#"{"error":{"code":400,"message":"Invalid value at 'message.token'","status":"INVALID_ARGUMENT"}}"#,
         );
         match error {
             FcmError::InvalidRequest(message) => {
-                assert!(message.contains("Quota exceeded"), "got: {message}")
+                assert!(message.contains("Invalid value"), "got: {message}")
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }

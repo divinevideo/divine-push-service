@@ -56,6 +56,9 @@ pub enum ServiceError {
 
     #[error("Operation cancelled")]
     Cancelled,
+
+    #[error("Retryable delivery failure; retry after {0:?}")]
+    RetryableDelivery(std::time::Duration),
 }
 
 impl IntoResponse for ServiceError {
@@ -113,6 +116,10 @@ impl IntoResponse for ServiceError {
             ServiceError::Cancelled => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Operation cancelled".to_string(),
+            ),
+            ServiceError::RetryableDelivery(delay) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Retryable delivery failure; retry after {:?}", delay),
             ),
         };
 

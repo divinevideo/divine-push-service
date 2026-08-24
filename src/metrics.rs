@@ -8,6 +8,7 @@ pub const EVENTS_PROCESSED_TOTAL: &str = "push_events_processed_total";
 pub const FCM_SENDS_ATTEMPTED_TOTAL: &str = "push_fcm_sends_attempted_total";
 pub const FCM_SENDS_SUCCEEDED_TOTAL: &str = "push_fcm_sends_succeeded_total";
 pub const FCM_SENDS_FAILED_TOTAL: &str = "push_fcm_sends_failed_total";
+pub const NEW_POST_FANOUT_RETRIES_TOTAL: &str = "push_new_post_fanout_retries_total";
 pub const TOKENS_PRUNED_TOTAL: &str = "push_tokens_pruned_total";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
@@ -37,6 +38,10 @@ pub fn init() -> PrometheusHandle {
     metrics::describe_counter!(
         FCM_SENDS_FAILED_TOTAL,
         "Failed FCM deliveries, counted per device token and reason"
+    );
+    metrics::describe_counter!(
+        NEW_POST_FANOUT_RETRIES_TOTAL,
+        "Durable new-post fan-out retries and terminal expiry, counted by bounded reason and outcome"
     );
     metrics::describe_counter!(
         TOKENS_PRUNED_TOTAL,
@@ -73,6 +78,15 @@ pub fn fcm_send_failed(reason: &'static str) {
     metrics::counter!(FCM_SENDS_FAILED_TOTAL, "reason" => reason).increment(1);
 }
 
+pub fn new_post_fanout_retry(reason: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        NEW_POST_FANOUT_RETRIES_TOTAL,
+        "reason" => reason,
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
 pub fn tokens_pruned(reason: &'static str, count: u64) {
     metrics::counter!(TOKENS_PRUNED_TOTAL, "reason" => reason).increment(count);
 }
@@ -96,6 +110,7 @@ mod tests {
             fcm_send_attempted();
             fcm_send_succeeded();
             fcm_send_failed("unauthorized");
+            new_post_fanout_retry("delivery", "scheduled");
             tokens_pruned("invalid", 1);
         });
 
@@ -119,6 +134,12 @@ mod tests {
         );
         assert!(
             rendered.contains(r#"push_fcm_sends_failed_total{reason="unauthorized"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"push_new_post_fanout_retries_total{reason="delivery",outcome="scheduled"} 1"#
+            ),
             "{rendered}"
         );
         assert!(

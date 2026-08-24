@@ -16,16 +16,22 @@ use tokio_util::sync::CancellationToken;
 pub enum CriticalTask {
     NostrListener,
     EventHandler,
+    NewPostFanout,
 }
 
 impl CriticalTask {
-    pub const ALL: [CriticalTask; 2] = [CriticalTask::NostrListener, CriticalTask::EventHandler];
+    pub const ALL: [CriticalTask; 3] = [
+        CriticalTask::NostrListener,
+        CriticalTask::EventHandler,
+        CriticalTask::NewPostFanout,
+    ];
 
     /// Stable identifier used in log fields and in the `/health` body.
     pub fn name(self) -> &'static str {
         match self {
             CriticalTask::NostrListener => "nostr_listener",
             CriticalTask::EventHandler => "event_handler",
+            CriticalTask::NewPostFanout => "new_post_fanout",
         }
     }
 }
@@ -35,6 +41,7 @@ impl CriticalTask {
 pub struct TaskHealth {
     nostr_listener: AtomicBool,
     event_handler: AtomicBool,
+    new_post_fanout: AtomicBool,
     unexpected_exit: AtomicBool,
 }
 
@@ -43,6 +50,7 @@ impl TaskHealth {
         Self {
             nostr_listener: AtomicBool::new(true),
             event_handler: AtomicBool::new(true),
+            new_post_fanout: AtomicBool::new(true),
             unexpected_exit: AtomicBool::new(false),
         }
     }
@@ -51,6 +59,7 @@ impl TaskHealth {
         match task {
             CriticalTask::NostrListener => &self.nostr_listener,
             CriticalTask::EventHandler => &self.event_handler,
+            CriticalTask::NewPostFanout => &self.new_post_fanout,
         }
     }
 
@@ -237,6 +246,7 @@ mod tests {
     fn task_names_are_stable() {
         assert_eq!(CriticalTask::NostrListener.name(), "nostr_listener");
         assert_eq!(CriticalTask::EventHandler.name(), "event_handler");
+        assert_eq!(CriticalTask::NewPostFanout.name(), "new_post_fanout");
     }
 
     /// The outage this guards against: an FCM 5xx panicked the event handler,

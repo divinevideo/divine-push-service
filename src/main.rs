@@ -111,6 +111,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!("Event handler started");
 
+    // Start durable new-post fan-out worker
+    let state_fanout = Arc::clone(&app_state);
+    let token_fanout = token.clone();
+    tracker.spawn(
+        "new_post_fanout",
+        Some(CriticalTask::NewPostFanout),
+        OnReturn::Fatal,
+        async move {
+            if let Err(e) = event_handler::run_new_post_fanout(state_fanout, token_fanout).await {
+                tracing::error!("New-post fan-out worker failed: {}", e);
+            }
+            tracing::info!("New-post fan-out worker task finished.");
+        },
+    );
+    tracing::info!("New-post fan-out worker started");
+
     // Start cleanup service
     let state_cleanup = Arc::clone(&app_state);
     let token_cleanup = token.clone();
