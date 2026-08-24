@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       include_production:
-        description: 'Also push to production registry'
+        description: 'Also push and deploy production (version tags always include production)'
         required: false
         default: false
         type: boolean
@@ -114,8 +114,9 @@ jobs:
             "$GITHUB_SHA" \
             "$GITHUB_REPOSITORY" \
             "$REF_NAME")"
+          include_production="$(jq -r '.client_payload.environments | index("production") != null' <<<"$payload")"
           echo "payload=$payload" >> "$GITHUB_OUTPUT"
-          echo "include_production=$(jq -r '.client_payload.environments | index("production") != null' <<<"$payload")" >> "$GITHUB_OUTPUT"
+          echo "include_production=$include_production" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         uses: docker/build-push-action@v6
@@ -167,12 +168,13 @@ jobs:
       - name: Summary
         env:
           INCLUDE_PRODUCTION: ${{ steps.deploy-payload.outputs.include_production }}
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
           {
             echo "### Docker Image Published"
             echo ""
             echo "**Image:** divine-push-service"
-            echo "**Tags:** ${{ steps.tags.outputs.tags }}"
+            echo "**Tags:** $TAGS"
             echo ""
             echo "**Environments:**"
             echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/divine-push-service\`"

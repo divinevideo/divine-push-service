@@ -62,3 +62,8 @@ assert_payload \
   "manual dispatch without opt-in excludes production" \
   "workflow_dispatch" "refs/heads/main" "false" "main" \
   '["poc","staging"]' "false"
+
+assert_payload \
+  "manual dispatch of a version tag includes production" \
+  "workflow_dispatch" "refs/tags/v1.2.3" "false" "v1.2.3" \
+  '["poc","staging","production"]' "true"
