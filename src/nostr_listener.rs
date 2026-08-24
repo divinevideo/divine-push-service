@@ -989,6 +989,13 @@ mod tests {
             .expect("cancellation should stop cleanly");
     }
 
+    /// A second closure of an already-recovered subscription must fail the
+    /// listener rather than replay again.
+    ///
+    /// The closure reason deliberately carries no `rate-limited:` prefix. That
+    /// prefix would add a real five-second `RATE_LIMIT_RECOVERY_BACKOFF` sleep
+    /// to a test bounded by an equally long `PATIENCE`, leaving the assertion
+    /// to race its own timeout. The backoff has its own test below.
     #[tokio::test]
     async fn a_second_owned_closed_message_fails_instead_of_replaying_again() {
         let (notify_tx, notify_rx) = broadcast::channel(4);
@@ -998,7 +1005,7 @@ mod tests {
         notify_tx
             .send(relay_message(RelayMessage::closed(
                 SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
-                "rate-limited: slow down",
+                "error: closed by relay",
             )))
             .expect("send first CLOSED");
         notify_tx
@@ -1007,7 +1014,7 @@ mod tests {
         notify_tx
             .send(relay_message(RelayMessage::closed(
                 SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
-                "rate-limited: slow down",
+                "error: closed by relay",
             )))
             .expect("send second CLOSED");
 
