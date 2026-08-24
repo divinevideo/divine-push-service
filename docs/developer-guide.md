@@ -386,6 +386,9 @@ the fan-out follow-up rather than done by halves here.
 
 ## Redis Keys
 
+The canonical registration and removal rules live in the push specification's
+[Token lifecycle](nip-xx-push-notifications.md#token-lifecycle) section.
+
 | Key Pattern | Type | Description |
 |-------------|------|-------------|
 | `user_tokens:{pubkey}` | Set | FCM tokens registered for a pubkey |

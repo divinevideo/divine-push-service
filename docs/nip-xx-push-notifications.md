@@ -33,6 +33,9 @@ read it. It is not one of the control kinds above and carries no ciphertext.
 
 ### Registration (kind 3079)
 
+The `expiration` tag in this example is optional. Clients may include it for
+NIP-40 relay interoperability, but this service does not interpret it.
+
 ```json
 {
   "kind": 3079,
@@ -55,13 +58,14 @@ The content field contains the NIP-44 encrypted token payload. Example plaintext
 **Note:** The exact payload structure is implementation-specific. Services define their own required fields.
 
 **Rules:**
-- `p`, `app`, `expiration` MUST be present.
+- `p` and `app` MUST be present. `expiration` MAY be present.
 - `content` MUST be NIP-44 ciphertext; services MUST reject plaintext.
-- Expiration per NIP-40. Servers MUST ignore expired events. Clients SHOULD refresh early (30–90d).
+- This service does not use `expiration` to accept, reject, or remove a token.
 
 ### Deregistration (kind 3080)
 
-Same structure and rules as 3079.
+Uses the same encrypted token payload and required `p` and `app` tags as 3079.
+It MAY also carry an `expiration` tag under the same optional policy.
 
 ```json
 {
@@ -69,13 +73,28 @@ Same structure and rules as 3079.
   "pubkey": "<client-pubkey>",
   "tags": [
     ["p", "<push-service-pubkey>"],
-    ["app", "<app-id>"],
-    ["expiration", "<unix-seconds>"]
+    ["app", "<app-id>"]
   ],
   "content": nip44_encrypt({"token": "<platform-token>"}),
   "sig": "<signature>"
 }
 ```
+
+### Token lifecycle
+
+The service removes a stored registration under any of these conditions:
+
+- the client publishes an explicit kind 3080 deregistration;
+- the push provider returns a terminal token error such as `UNREGISTERED` or
+  `SENDER_ID_MISMATCH`; or
+- the token has not had a successful delivery for the configured
+  `token_max_age_days` inactivity window. Registration sets the initial
+  activity time, and every delivered push refreshes it.
+
+The control event's `expiration` timestamp does not determine how long the
+stored token remains valid. The inactivity policy can therefore remove a token
+that has received no pushes during the configured window, even when the
+provider has not reported it invalid.
 
 ### Notification Preferences (kind 3083) — optional
 
@@ -164,7 +183,7 @@ on the trigger event (see [Author subscriptions](#author-subscriptions-kind-3000
 
 1. **Encryption**: Reject plaintext for all event kinds. Content must be valid NIP-44 ciphertext.
 2. **App isolation**: Partition by app tag; ignore events with unknown app.
-3. **Expiration**: Ignore expired events (NIP-40).
+3. **Control-event age**: Ignore control events whose `created_at` is beyond the seven-day replay horizon.
 4. **Multiple devices**: Support multiple tokens per (pubkey, app).
 5. **Idempotency**: At most one notification per (recipient_pubkey, app, event_id).
 6. **Error handling**: Remove invalid tokens on provider errors.
@@ -176,13 +195,13 @@ on the trigger event (see [Author subscriptions](#author-subscriptions-kind-3000
 1. Encrypt with NIP-44 to service pubkey.
 2. Follow service's documentation for required payload fields.
 3. Stable app id per application.
-4. Refresh before expiration; deregister on logout.
+4. Register when the push session becomes ready, republish when the provider token rotates, and deregister on logout.
 5. Verify service identity via discovery.
 
 ## Security
 
 - **Token privacy**: Publishing {pubkey ↔ token} enables correlation; NIP-44 mitigates.
-- **Replay**: Expiration (NIP-40) bounds replays.
+- **Replay**: Control events older than the seven-day replay horizon are ignored, and repeat processing of the same event ID is suppressed for `processed_event_ttl_secs`.
 - **Rotation**: Refresh/rotate tokens to limit exposure.
 - **Isolation**: `app` tag prevents cross-app misuse.
 
