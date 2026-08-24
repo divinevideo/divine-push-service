@@ -1267,6 +1267,87 @@ mod tests {
         );
     }
 
+    /// The budget only trips on closures bunched inside one window. Recoveries
+    /// spaced further apart than the window are the ordinary "isolated relay
+    /// restart" case and must keep recovering: each earlier attempt ages out of
+    /// the window before the next closure arrives, so the count never builds up.
+    #[tokio::test(start_paused = true)]
+    async fn recoveries_spaced_beyond_the_window_do_not_fail_listener_health() {
+        let (notify_tx, notify_rx) = broadcast::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let recovery = Arc::new(MockRecovery::default());
+        let silence_timeout = Duration::from_secs(60);
+        let token = CancellationToken::new();
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                silence_timeout,
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        // More closures than the per-window budget, but each separated by more
+        // than one window. If aging were broken these would accumulate and the
+        // listener would fail health on the fourth; it must not.
+        let rounds = MAX_CLOSED_RECOVERIES_PER_WINDOW + 2;
+        for round in 0..rounds {
+            notify_tx
+                .send(relay_message(RelayMessage::closed(
+                    SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                    "rate-limited: slow down",
+                )))
+                .expect("send CLOSED");
+            tokio::task::yield_now().await;
+            advance(RATE_LIMIT_RECOVERY_BACKOFF).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                recovery.calls.load(Ordering::SeqCst),
+                round + 1,
+                "each aged-out closure must still recover"
+            );
+
+            // Healthy traffic resumes so the recovery grace clears and the next
+            // closure is treated as fresh rather than a repeat rejection.
+            notify_tx
+                .send(live_event(&Keys::generate(), "healthy traffic"))
+                .expect("send healthy event");
+            event_rx.recv().await.expect("forward healthy event");
+            advance(CLOSED_RECOVERY_GRACE).await;
+
+            // Let a full counting window elapse before the next closure, while
+            // steady events keep the silence watchdog satisfied so only the
+            // window ages out. Each advance stays under silence_timeout so the
+            // silence path never fires between the events.
+            let step = silence_timeout * 2 / 3;
+            for _ in 0..2 {
+                notify_tx
+                    .send(live_event(&Keys::generate(), "steady traffic"))
+                    .expect("send steady event");
+                event_rx.recv().await.expect("forward steady event");
+                advance(step).await;
+            }
+        }
+
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            rounds,
+            "recoveries spaced beyond the window must not trip the budget"
+        );
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("aged-out recoveries must keep the listener healthy");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn rate_limited_closure_backs_off_before_recovery() {
         let (notify_tx, notify_rx) = broadcast::channel(2);
