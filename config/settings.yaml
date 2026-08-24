@@ -2,7 +2,11 @@
 
 nostr:
   relay_url: "wss://relay.divine.video"
-  event_silence_timeout_secs: 300  # Resubscribe after 5 quiet minutes; fail health after 5 more
+  # Quiet window the listener tolerates before acting on relay silence.
+  # A cold silence resubscribes once, then fails health if a second window
+  # passes with no event. A relay CLOSED resubscribes immediately, so there
+  # the next quiet window is the one that fails health.
+  event_silence_timeout_secs: 300
   profile_relays:
     - wss://relay.divine.video
     - wss://purplepag.es
