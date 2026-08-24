@@ -150,9 +150,12 @@ The service authenticates to FCM per the app's `firebase` config:
 
 Production images are built and published by the `Build, Test & Push` GitHub Actions workflow (`.github/workflows/publish-and-release.yml`):
 
-- On every push to `main`, the workflow runs tests, builds a single Docker image, and pushes it to the POC, Test, and Staging Google Artifact Registry environments using Workload Identity federation.
-- Pushes to a `v*` tag (or a manual dispatch opting in) additionally publish to the Production registry.
-- After publishing, it dispatches an `image-deploy` event to `divinevideo/divine-iac-coreconfig`, which drives the ArgoCD rollout to the selected environments.
+- On every push to `main`, the workflow runs tests, builds a single Docker image, and pushes it to the POC and Staging Google Artifact Registry environments using Workload Identity federation.
+- Pushes to a `v*` tag additionally publish and deploy to Production as an intentional automatic promotion.
+- A manual workflow dispatch publishes and deploys to POC and Staging by default. Selecting `include_production` additionally publishes and deploys to Production as an intentional automatic promotion.
+- After publishing, the workflow dispatches an `image-deploy` event to `divinevideo/divine-iac-coreconfig`, which creates and automatically merges the deployment PR before checking the ArgoCD sync. Production payloads use `auto_promote: true`; they are not labeled as emergency hotfixes.
+
+Emergency production deployments use a direct `image-deploy` dispatch with `hotfix: true` under the platform deployment runbook. Use that path only when an incident requires bypassing the normal release workflow; ordinary version tags and manual production promotions must use this repository's workflow.
 
 The container is a multi-stage build on `debian:bookworm-slim` that bundles the release binary and the `config/` directory, and exposes port 8000.
 
