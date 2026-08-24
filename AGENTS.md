@@ -70,7 +70,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 ### Redis Keys
 - `user_tokens:{pubkey}` - Set of FCM tokens registered for a pubkey
 - `token_to_pubkey` - Hash mapping a token back to its owner
-- `stale_tokens` - Sorted set of token timestamps, for cleanup
+- `stale_tokens` - Sorted set scored by the last time a token was known good, for cleanup. Written at registration and again on every delivered push, so the sweep means "inactive" rather than "registered long ago". The refresh uses `ZADD XX GT`: `XX` so a token deregistered mid-send is not resurrected as an owner-less member, `GT` so a replica's clock cannot pull a live token toward the sweep
 - `user_preferences:{pubkey}` - User's notification preferences (JSON)
 - `dedup:{event_id}` - Per-event processing claim with TTL. Notify lists are exempt: they are idempotent by `created_at`, so the claim prevents nothing and a failed handler would otherwise strand the list for the TTL
 - `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` - Per-recipient video delivery, so a NIP-33 edit does not re-notify. Scoped by notification type so a bell does not suppress a later mention on the same video. The scoping is one-directional: a delivered mention also writes the `newPost` record, because naming the video already tells the recipient it exists
