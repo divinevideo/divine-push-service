@@ -913,6 +913,69 @@ mod tests {
         assert!(health.had_unexpected_exit());
     }
 
+    /// Resumed event flow must rearm the watchdog after a silence recovery.
+    ///
+    /// This is what keeps an ordinary quiet spell from compounding into a
+    /// restart. The first silent window resubscribes and arms
+    /// `recovery_attempted`; once events reach the handler again that flag has
+    /// to clear, so the *next* silent window resubscribes as well instead of
+    /// taking the failure branch. The test above only covers the opposite
+    /// direction, where flow never resumes and the listener is meant to die.
+    #[tokio::test(start_paused = true)]
+    async fn resumed_flow_rearms_the_watchdog_after_a_silence_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+        let silence_timeout = Duration::from_secs(30);
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                silence_timeout,
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        advance(silence_timeout).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            1,
+            "the first silent window must resubscribe"
+        );
+
+        notify_tx
+            .send(live_event(&Keys::generate(), "flow resumed"))
+            .expect("send live event");
+        event_rx.recv().await.expect("forward the resumed event");
+
+        advance(silence_timeout).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !loop_handle.is_finished(),
+            "resumed flow must clear the recovery flag, not leave the listener one quiet window from exit"
+        );
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            2,
+            "a later silent window must resubscribe again rather than fail the listener"
+        );
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn our_closed_subscription_resubscribes_immediately() {
         let (notify_tx, notify_rx) = broadcast::channel(2);
