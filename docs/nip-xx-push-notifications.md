@@ -85,8 +85,7 @@ It MAY also carry an `expiration` tag under the same optional policy.
 The service removes a stored registration under any of these conditions:
 
 - the client publishes an explicit kind 3080 deregistration;
-- the push provider returns a terminal token error such as `UNREGISTERED` or
-  `SENDER_ID_MISMATCH`; or
+- the push provider reports that the token is no longer registered or valid; or
 - the token has not had a successful delivery for the configured
   `token_max_age_days` inactivity window. Registration sets the initial
   activity time, and every delivered push refreshes it.
