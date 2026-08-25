@@ -92,8 +92,8 @@ The service removes a stored registration under any of these conditions:
 
 The control event's `expiration` timestamp does not determine how long the
 stored token remains valid. The inactivity policy can therefore remove a token
-that has received no pushes during the configured window, even when the
-provider has not reported it invalid.
+that has received no registrations or pushes during the configured window,
+even when the provider has not reported it invalid.
 
 ### Notification Preferences (kind 3083) — optional
 
