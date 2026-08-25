@@ -11,7 +11,7 @@ The service implements a draft push-notification protocol; see [docs/nip-xx-push
 - **User preferences** — users can opt in or out of notification kinds with a preferences event; sensible defaults apply otherwise.
 - **Deduplication** — atomic Redis `SET NX EX` per-event locks ensure each event is delivered once, even across replicas.
 - **Replay protection** — a configurable processing window (7 days by default) ignores stale events.
-- **Token cleanup** — a background task prunes stale tokens (older than 90 days by default) once a day.
+- **Token cleanup** — a daily background task prunes tokens with no registration or successful delivery for 90 days by default.
 - **Prometheus metrics** — relay ingestion, event processing, FCM delivery outcomes, and token pruning are exposed for monitoring.
 - **Optional allow-list** — `allowed_pubkeys` can restrict delivery to a specific set of recipients.
 

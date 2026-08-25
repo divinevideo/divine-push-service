@@ -86,9 +86,9 @@ The service removes a stored registration under any of these conditions:
 
 - the client publishes an explicit kind 3080 deregistration;
 - the push provider reports that the token is no longer registered or valid; or
-- the token has not had a successful delivery for the configured
-  `token_max_age_days` inactivity window. Registration sets the initial
-  activity time, and every delivered push refreshes it.
+- the token has had neither an accepted registration nor a successful delivery
+  during the configured `token_max_age_days` inactivity window. Each accepted
+  registration sets its activity time, and every delivered push refreshes it.
 
 The control event's `expiration` timestamp does not determine how long the
 stored token remains valid. The inactivity policy can therefore remove a token
