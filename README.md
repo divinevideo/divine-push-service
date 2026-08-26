@@ -197,11 +197,13 @@ The metrics endpoint exposes:
 The delivery deadman is based on the last-processed gauge:
 
 ```promql
-time() - max(push_last_event_processed_timestamp_seconds) > 900
+absent(push_last_event_processed_timestamp_seconds)
+or
+time() - max by (pod) (push_last_event_processed_timestamp_seconds) > 900
 ```
 
-This deadman detects a pipeline that stops completing event-routing attempts. It
-does not claim that an attempt delivered a push: use
+This deadman detects an absent metric or a pod that stops completing
+event-routing attempts. It does not claim that an attempt delivered a push: use
 `push_fcm_sends_succeeded_total` and `push_fcm_sends_failed_total{reason}` to
 alert on FCM rejecting every delivery. Use the deadman alongside task-health and
 restart alerting; the startup timestamp avoids a premature deadman alert while a
