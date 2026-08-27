@@ -39,7 +39,6 @@ pub enum EventContext {
 const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
-const KIND_GIFT_WRAP: u16 = 1059;
 const KIND_VIDEO: u16 = 34236;
 const MAX_FANOUT_ATTEMPTS: u16 = 12;
 
@@ -569,14 +568,6 @@ async fn handle_content_event(
     } else if kind_num == 16 {
         // Kind 16: Repost - notify the author of the reposted event
         targets_of(NotificationType::Repost, find_repost_recipients(event))
-    } else if kind_num == KIND_GIFT_WRAP {
-        // NIP-17 routes each gift wrap through its cleartext recipient p tag.
-        // The wrapper author is an ephemeral key and its content is encrypted;
-        // neither is suitable notification copy.
-        targets_of(
-            NotificationType::DirectMessage,
-            find_mentioned_pubkeys(event),
-        )
     } else if kind_num == 30023 {
         // Kind 30023: Long-form content - check for mentions
         targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
@@ -2446,28 +2437,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gift_wrap_routes_to_its_p_tag_as_a_direct_message() {
-        let wrapper = Keys::generate();
-        let recipient = Keys::generate().public_key();
-        let event = EventBuilder::new(Kind::from(KIND_GIFT_WRAP), "encrypted gift wrap")
-            .tag(Tag::public_key(recipient))
-            .sign_with_keys(&wrapper)
-            .unwrap();
-
-        let targets = targets_of(
-            NotificationType::DirectMessage,
-            find_mentioned_pubkeys(&event),
-        );
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].recipient, recipient);
-        assert_eq!(
-            targets[0].notification_type,
-            NotificationType::DirectMessage
-        );
-    }
-
-    #[test]
     fn test_video_notification_resolves_mentions_with_mention_type() {
         let sender = Keys::generate();
         let mentioned1 = Keys::generate();
@@ -2655,7 +2624,20 @@ mod tests {
 
         assert!(!renders_event_content(NotificationType::Like));
         assert!(!renders_event_content(NotificationType::Repost));
+        assert!(!renders_event_content(NotificationType::DirectMessage));
         assert!(!renders_event_content(NotificationType::NewPost));
+    }
+
+    #[test]
+    fn test_direct_messages_need_neither_sender_nor_content() {
+        assert!(!renders_sender(NotificationType::DirectMessage));
+
+        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient: Keys::generate().public_key(),
+            notification_type: NotificationType::DirectMessage,
+        }]);
+        assert!(!copy.needs_sender);
+        assert!(!copy.needs_content);
     }
 
     #[test]
@@ -2978,7 +2960,7 @@ mod tests {
         let wrapper = Keys::generate();
         let recipient = Keys::generate().public_key();
         let encrypted_content = "private-ciphertext-must-not-leak";
-        let event = EventBuilder::new(Kind::from(KIND_GIFT_WRAP), encrypted_content)
+        let event = EventBuilder::new(Kind::from(1059), encrypted_content)
             .tag(Tag::public_key(recipient))
             .sign_with_keys(&wrapper)
             .unwrap();
