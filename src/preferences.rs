@@ -56,6 +56,7 @@ pub enum NotificationType {
     ///
     /// The wrapper reveals neither the real sender nor the message, so its push
     /// copy must remain generic.
+    // TODO(#65): Route this only after the service receives classified gift wraps.
     DirectMessage,
     /// A creator the recipient subscribed to published a new video.
     ///
