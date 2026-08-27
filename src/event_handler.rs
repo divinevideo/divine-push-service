@@ -3,7 +3,8 @@
 //! Handles Nostr events and routes them to appropriate notification handlers.
 //! Supports:
 //! - Token registration/deregistration (kinds 3079/3080)
-//! - Notification types: likes, comments, mentions, reposts, and new posts
+//! - Notification types: likes, comments, mentions, reposts, direct messages,
+//!   and new posts
 
 use crate::{
     crypto::CryptoService,
@@ -38,6 +39,7 @@ pub enum EventContext {
 const KIND_REGISTRATION: u16 = 3079;
 const KIND_DEREGISTRATION: u16 = 3080;
 const KIND_PREFERENCES_UPDATE: u16 = 3083;
+const KIND_GIFT_WRAP: u16 = 1059;
 const KIND_VIDEO: u16 = 34236;
 const MAX_FANOUT_ATTEMPTS: u16 = 12;
 
@@ -567,6 +569,14 @@ async fn handle_content_event(
     } else if kind_num == 16 {
         // Kind 16: Repost - notify the author of the reposted event
         targets_of(NotificationType::Repost, find_repost_recipients(event))
+    } else if kind_num == KIND_GIFT_WRAP {
+        // NIP-17 routes each gift wrap through its cleartext recipient p tag.
+        // The wrapper author is an ephemeral key and its content is encrypted;
+        // neither is suitable notification copy.
+        targets_of(
+            NotificationType::DirectMessage,
+            find_mentioned_pubkeys(event),
+        )
     } else if kind_num == 30023 {
         // Kind 30023: Long-form content - check for mentions
         targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
@@ -1198,8 +1208,15 @@ struct EventScopedCopy {
 fn renders_event_content(notification_type: NotificationType) -> bool {
     match notification_type {
         NotificationType::Comment | NotificationType::Mention => true,
-        NotificationType::Like | NotificationType::Repost | NotificationType::NewPost => false,
+        NotificationType::Like
+        | NotificationType::Repost
+        | NotificationType::DirectMessage
+        | NotificationType::NewPost => false,
     }
+}
+
+fn renders_sender(notification_type: NotificationType) -> bool {
+    !matches!(notification_type, NotificationType::DirectMessage)
 }
 
 /// The event-scoped copy, resolved at most once and only if it is needed.
@@ -1240,6 +1257,8 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
 /// notifications.
 struct LazyEventCopy {
     cell: tokio::sync::OnceCell<EventScopedCopy>,
+    /// Whether any target renders the event author.
+    needs_sender: bool,
     /// Whether any target renders the event body, decided over the whole target
     /// list rather than the one recipient that happens to resolve it first.
     needs_content: bool,
@@ -1249,6 +1268,9 @@ impl LazyEventCopy {
     fn for_targets(targets: &[NotificationTarget]) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
+            needs_sender: targets
+                .iter()
+                .any(|target| renders_sender(target.notification_type)),
             needs_content: targets
                 .iter()
                 .any(|target| renders_event_content(target.notification_type)),
@@ -1259,13 +1281,16 @@ impl LazyEventCopy {
     fn resolved(copy: EventScopedCopy) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new_with(Some(copy)),
+            needs_sender: false,
             needs_content: false,
         }
     }
 
     async fn get(&self, state: &AppState, event: &Event) -> &EventScopedCopy {
         self.cell
-            .get_or_init(|| resolve_event_scoped_copy(state, event, self.needs_content))
+            .get_or_init(|| {
+                resolve_event_scoped_copy(state, event, self.needs_sender, self.needs_content)
+            })
             .await
     }
 }
@@ -1277,8 +1302,16 @@ impl LazyEventCopy {
 async fn resolve_event_scoped_copy(
     state: &AppState,
     event: &Event,
+    needs_sender: bool,
     needs_content: bool,
 ) -> EventScopedCopy {
+    if !needs_sender && !needs_content {
+        return EventScopedCopy {
+            sender_name: String::new(),
+            formatted_content: None,
+        };
+    }
+
     let Some(mention_parser) = state.mention_parser_service.as_ref() else {
         return EventScopedCopy {
             sender_name: format_short_npub(&event.pubkey),
@@ -2031,6 +2064,10 @@ fn create_fcm_payload(
             let body = format!("{} reposted your post", sender_name);
             (title, body)
         }
+        NotificationType::DirectMessage => (
+            "New message".to_string(),
+            "You have a new message".to_string(),
+        ),
         NotificationType::NewPost => {
             // Provisional copy. divine-mobile/brand-guidelines/TONE_OF_VOICE.md
             // governs user-facing strings; confirm before release.
@@ -2046,24 +2083,25 @@ fn create_fcm_payload(
     data.insert("eventId".to_string(), event.id.to_hex());
     data.insert("title".to_string(), title.clone());
     data.insert("body".to_string(), body.clone());
-    data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
-    data.insert("senderName".to_string(), sender_name);
     data.insert("receiverPubkey".to_string(), target_pubkey.to_hex());
     data.insert(
         "receiverNpub".to_string(),
         target_pubkey.to_bech32().unwrap_or_default(),
     );
     data.insert("eventKind".to_string(), event.kind.as_u16().to_string());
-    data.insert(
-        "timestamp".to_string(),
-        event.created_at.as_secs().to_string(),
-    );
+    if notification_type != NotificationType::DirectMessage {
+        data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
+        data.insert("senderName".to_string(), sender_name);
+        data.insert(
+            "timestamp".to_string(),
+            event.created_at.as_secs().to_string(),
+        );
 
-    // Add authoritative routing/attribution target fields: the referenced event
-    // id and, for addressable targets (e.g. kind 34236 videos), the signed
-    // coordinate (`referencedAddress` + components) so the client never has to
-    // guess the target's owner.
-    insert_trigger_reference_fields(&mut data, event);
+        // Add authoritative routing/attribution target fields: the referenced
+        // event id and, for addressable targets (e.g. kind 34236 videos), the
+        // signed coordinate so the client never has to guess the target owner.
+        insert_trigger_reference_fields(&mut data, event);
+    }
 
     FcmPayload {
         notification: None, // Data-only message for better client control
@@ -2405,6 +2443,28 @@ mod tests {
 
         let pubkeys = find_mentioned_pubkeys(&event);
         assert_eq!(pubkeys.len(), 3);
+    }
+
+    #[test]
+    fn test_gift_wrap_routes_to_its_p_tag_as_a_direct_message() {
+        let wrapper = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::from(KIND_GIFT_WRAP), "encrypted gift wrap")
+            .tag(Tag::public_key(recipient))
+            .sign_with_keys(&wrapper)
+            .unwrap();
+
+        let targets = targets_of(
+            NotificationType::DirectMessage,
+            find_mentioned_pubkeys(&event),
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].recipient, recipient);
+        assert_eq!(
+            targets[0].notification_type,
+            NotificationType::DirectMessage
+        );
     }
 
     #[test]
@@ -2911,6 +2971,39 @@ mod tests {
             data.get("body"),
             Some(&"Alice posted a new vine".to_string())
         );
+    }
+
+    #[test]
+    fn test_direct_message_payload_is_contentless_and_senderless() {
+        let wrapper = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let encrypted_content = "private-ciphertext-must-not-leak";
+        let event = EventBuilder::new(Kind::from(KIND_GIFT_WRAP), encrypted_content)
+            .tag(Tag::public_key(recipient))
+            .sign_with_keys(&wrapper)
+            .unwrap();
+        let copy = EventScopedCopy {
+            sender_name: "ephemeral wrapper author".to_string(),
+            formatted_content: Some(encrypted_content.to_string()),
+        };
+
+        let payload =
+            create_fcm_payload(&event, &recipient, NotificationType::DirectMessage, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(data.get("type"), Some(&"directMessage".to_string()));
+        assert_eq!(data.get("title"), Some(&"New message".to_string()));
+        assert_eq!(
+            data.get("body"),
+            Some(&"You have a new message".to_string())
+        );
+        assert!(!data.contains_key("senderPubkey"));
+        assert!(!data.contains_key("senderName"));
+        assert!(!data.contains_key("timestamp"));
+        assert!(!data.values().any(|value| value.contains(encrypted_content)));
+        assert!(!data
+            .values()
+            .any(|value| value.contains(&event.pubkey.to_hex())));
     }
 
     #[test]
