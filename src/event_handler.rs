@@ -2146,10 +2146,9 @@ fn create_fcm_payload(
             let body = format!("{} reposted your post", sender_name);
             (title, body)
         }
-        NotificationType::DirectMessage => (
-            "New message".to_string(),
-            "You have a new message".to_string(),
-        ),
+        NotificationType::DirectMessage => {
+            return create_direct_message_payload(event.id, target_pubkey);
+        }
         NotificationType::NewPost => {
             // Provisional copy. divine-mobile/brand-guidelines/TONE_OF_VOICE.md
             // governs user-facing strings; confirm before release.

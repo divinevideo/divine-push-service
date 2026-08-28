@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -129,21 +130,8 @@ async fn metrics(
 
 async fn direct_message(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Json(request): Json<DirectMessageRequest>,
 ) -> Response {
-    let Some(expected_token) = state.internal_api_token.as_deref() else {
-        tracing::error!("Internal push endpoint is disabled because no bearer token is configured");
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Internal push endpoint is not configured",
-        );
-    };
-
-    if !has_bearer_token(&headers, expected_token) {
-        return error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
-    }
-
     let event_id = match EventId::from_hex(&request.event_id) {
         Ok(event_id) => event_id,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid eventId"),
@@ -173,6 +161,26 @@ async fn direct_message(
     }
 }
 
+async fn require_internal_api_token(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected_token) = state.internal_api_token.as_deref() else {
+        tracing::error!("Internal push endpoint is disabled because no bearer token is configured");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Internal push endpoint is not configured",
+        );
+    };
+
+    if !has_bearer_token(request.headers(), expected_token) {
+        return error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+
+    next.run(request).await
+}
+
 fn has_bearer_token(headers: &HeaderMap, expected_token: &str) -> bool {
     let Some(provided_token) = headers
         .get(header::AUTHORIZATION)
@@ -193,7 +201,13 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/metrics", get(metrics))
-        .route("/internal/v1/direct-message", post(direct_message))
+        .route(
+            "/internal/v1/direct-message",
+            post(direct_message).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_internal_api_token,
+            )),
+        )
         .with_state(state)
 }
 
@@ -409,6 +423,19 @@ mod tests {
             .oneshot(direct_message_request(
                 Some("wrong-token"),
                 r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn direct_message_authenticates_before_parsing_the_body() {
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(direct_message_request(
+                Some("wrong-token"),
+                r#"{"messageType":"reaction"}"#,
             ))
             .await
             .unwrap();

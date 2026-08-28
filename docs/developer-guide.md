@@ -150,6 +150,16 @@ classification is the reason the hook can trigger a message push while the raw
 kind-1059 relay stream cannot. The event id supplies replay deduplication; none
 of the request fields add sender or content metadata to the FCM payload.
 
+This initial contract covers automated moderation notices and report outcomes.
+Manual moderator replies and automated community warnings remain outside the
+classified hook until their message classes are added to both services.
+
+Do not configure callers until Divine Mobile can publish kind 1059 in its
+notification preferences and has bumped its published-kinds schema version.
+Older clients replace the server's stored kind list without 1059, which leaves
+direct-message pushes disabled for that user. The mobile schema bump marks
+existing preferences dirty and republishes the expanded list during rollout.
+
 The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 
 ### iOS APNS shape
