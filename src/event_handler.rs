@@ -2170,19 +2170,17 @@ fn create_fcm_payload(
         target_pubkey.to_bech32().unwrap_or_default(),
     );
     data.insert("eventKind".to_string(), event.kind.as_u16().to_string());
-    if notification_type != NotificationType::DirectMessage {
-        data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
-        data.insert("senderName".to_string(), sender_name);
-        data.insert(
-            "timestamp".to_string(),
-            event.created_at.as_secs().to_string(),
-        );
+    data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
+    data.insert("senderName".to_string(), sender_name);
+    data.insert(
+        "timestamp".to_string(),
+        event.created_at.as_secs().to_string(),
+    );
 
-        // Add authoritative routing/attribution target fields: the referenced
-        // event id and, for addressable targets (e.g. kind 34236 videos), the
-        // signed coordinate so the client never has to guess the target owner.
-        insert_trigger_reference_fields(&mut data, event);
-    }
+    // Add authoritative routing/attribution target fields: the referenced
+    // event id and, for addressable targets (e.g. kind 34236 videos), the
+    // signed coordinate so the client never has to guess the target owner.
+    insert_trigger_reference_fields(&mut data, event);
 
     FcmPayload {
         notification: None, // Data-only message for better client control
@@ -2195,7 +2193,10 @@ fn create_fcm_payload(
 
 fn create_direct_message_payload(event_id: EventId, target_pubkey: &PublicKey) -> FcmPayload {
     let mut data = std::collections::HashMap::new();
-    data.insert("type".to_string(), "directMessage".to_string());
+    data.insert(
+        "type".to_string(),
+        NotificationType::DirectMessage.display_name().to_string(),
+    );
     data.insert("eventId".to_string(), event_id.to_hex());
     data.insert("title".to_string(), "New message".to_string());
     data.insert("body".to_string(), "You have a new message".to_string());
@@ -2204,7 +2205,10 @@ fn create_direct_message_payload(event_id: EventId, target_pubkey: &PublicKey) -
         "receiverNpub".to_string(),
         target_pubkey.to_bech32().unwrap_or_default(),
     );
-    data.insert("eventKind".to_string(), "1059".to_string());
+    data.insert(
+        "eventKind".to_string(),
+        NotificationType::DirectMessage.kind().to_string(),
+    );
 
     FcmPayload {
         notification: None,
@@ -3101,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_direct_message_payload_matches_the_mobile_contract() {
+    fn test_internal_direct_message_payload_matches_the_documented_contract() {
         let recipient = Keys::generate().public_key();
         let event_id =
             EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")

@@ -155,10 +155,11 @@ Manual moderator replies and automated community warnings remain outside the
 classified hook until their message classes are added to both services.
 
 Do not configure callers until Divine Mobile can publish kind 1059 in its
-notification preferences and has bumped its published-kinds schema version.
-Older clients replace the server's stored kind list without 1059, which leaves
-direct-message pushes disabled for that user. The mobile schema bump marks
-existing preferences dirty and republishes the expanded list during rollout.
+notification preferences, has bumped its published-kinds schema version, and
+routes `directMessage` notification taps to the message inbox. Older clients
+replace the server's stored kind list without 1059, which leaves direct-message
+pushes disabled for that user. The mobile schema bump marks existing preferences
+dirty and republishes the expanded list during rollout.
 
 A `204` means the request was processed, not that FCM reached a device. Missing
 tokens, disabled preferences, an existing delivery claim, and terminal FCM
