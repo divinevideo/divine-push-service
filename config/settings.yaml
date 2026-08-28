@@ -7,8 +7,17 @@ nostr:
   # passes with no event. A relay CLOSED resubscribes immediately, so there
   # the next quiet window is the one that fails health.
   event_silence_timeout_secs: 300
+  # Sender-name lookups only. These are queried by a separate client from the
+  # one carrying the notification subscription, so a relay here can never
+  # introduce an event that triggers a push.
+  #
+  # Kind 0 is an "indexed kind": no ordinary relay holds the latest profile for
+  # every pubkey, so a handful of purpose-built aggregators do. Listing more
+  # than one matters because a reaction can come from anywhere on the network,
+  # and relay.divine.video only holds profiles for people who reached us.
   profile_relays:
     - wss://relay.divine.video
+    - wss://relay.nos.social
     - wss://purplepag.es
   profile_cache_ttl_secs: 300
   query_timeout_secs: 3
