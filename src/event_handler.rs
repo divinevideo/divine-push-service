@@ -541,35 +541,11 @@ async fn handle_content_event(
     // Determine notification type and find recipients based on event kind
     let kind_num = event_kind.as_u16();
 
-    let targets = if kind_num == 7 {
-        // Kind 7: Reaction/Like - notify the author of the liked event
-        targets_of(NotificationType::Like, find_reaction_recipients(event))
-    } else if kind_num == 1 {
-        // Kind 1: Text note - could be a comment or mention
-        let recipients = find_text_note_recipients(event);
-        // Determine if it's a comment (has e-tag) or mention (has p-tag only)
-        let has_e_tag = event.tags.find(TagKind::e()).is_some();
-        let notification_type = if has_e_tag {
-            NotificationType::Comment
-        } else {
-            NotificationType::Mention
-        };
-        targets_of(notification_type, recipients)
-    } else if kind_num == 1111 {
-        // Kind 1111: NIP-22 comment (diVine publishes video comments here, not
-        // as kind 1). Notify the root author (uppercase `P`, the video owner)
-        // and the direct parent author (lowercase `p`). create_fcm_payload
-        // attaches the authoritative root-video target from the uppercase `A`.
-        targets_of(NotificationType::Comment, find_comment_recipients(event))
-    } else if kind_num == 16 {
-        // Kind 16: Repost - notify the author of the reposted event
-        targets_of(NotificationType::Repost, find_repost_recipients(event))
-    } else if kind_num == 30023 {
-        // Kind 30023: Long-form content - check for mentions
-        targets_of(NotificationType::Mention, find_mentioned_pubkeys(event))
-    } else if kind_num == KIND_VIDEO {
+    if kind_num == KIND_VIDEO {
         return handle_video_content_event(state, event, token).await;
-    } else {
+    }
+
+    let Some(targets) = content_notification_targets(event) else {
         trace!(event_id = %event_id, kind = %event_kind, "Ignoring event kind - no notification handler");
         return Ok(());
     };
@@ -614,6 +590,23 @@ async fn handle_content_event(
     let copy = LazyEventCopy::for_targets(&targets);
 
     send_notifications_sequential(state, event, targets, &copy, token).await
+}
+
+fn content_notification_targets(event: &Event) -> Option<Vec<NotificationTarget>> {
+    let targets = match event.kind.as_u16() {
+        // Kind 7: notify the author of the event being reacted to.
+        7 => targets_of(NotificationType::Like, find_reaction_recipients(event)),
+        // Divine video comments use NIP-22 rather than kind-1 text notes. Notify
+        // the root author (`P`) and direct parent author (`p`).
+        1111 => targets_of(NotificationType::Comment, find_comment_recipients(event)),
+        // Kind 16: notify the author of the reposted event.
+        16 => targets_of(NotificationType::Repost, find_repost_recipients(event)),
+        // Kind 30023: notify mentioned users.
+        30023 => targets_of(NotificationType::Mention, find_mentioned_pubkeys(event)),
+        _ => return None,
+    };
+
+    Some(targets)
 }
 
 async fn send_notifications_sequential(
@@ -1090,13 +1083,6 @@ fn find_reaction_recipients(event: &Event) -> Vec<PublicKey> {
         .filter_map(|t| t.content())
         .filter_map(|content| PublicKey::from_str(content).ok())
         .collect()
-}
-
-/// Find recipients for a text note event (kind 1)
-/// Could be a comment (e-tag) or mention (p-tag)
-fn find_text_note_recipients(event: &Event) -> Vec<PublicKey> {
-    // Get all p-tagged users (mentions or reply targets)
-    find_mentioned_pubkeys(event)
 }
 
 /// Find recipients for a repost event (kind 16)
@@ -2467,36 +2453,6 @@ mod tests {
             .unwrap();
 
         let recipients = find_reaction_recipients(&event);
-        assert!(recipients.is_empty());
-    }
-
-    #[test]
-    fn test_find_text_note_recipients_with_mentions() {
-        let sender = Keys::generate();
-        let mentioned1 = Keys::generate();
-        let mentioned2 = Keys::generate();
-
-        let event = EventBuilder::text_note("Hello @someone")
-            .tag(Tag::public_key(mentioned1.public_key()))
-            .tag(Tag::public_key(mentioned2.public_key()))
-            .sign_with_keys(&sender)
-            .unwrap();
-
-        let recipients = find_text_note_recipients(&event);
-        assert_eq!(recipients.len(), 2);
-        assert!(recipients.contains(&mentioned1.public_key()));
-        assert!(recipients.contains(&mentioned2.public_key()));
-    }
-
-    #[test]
-    fn test_find_text_note_recipients_no_mentions() {
-        let sender = Keys::generate();
-
-        let event = EventBuilder::text_note("Just a regular post")
-            .sign_with_keys(&sender)
-            .unwrap();
-
-        let recipients = find_text_note_recipients(&event);
         assert!(recipients.is_empty());
     }
 
@@ -4768,39 +4724,36 @@ mod tests {
         assert!(recipients.is_empty());
     }
 
-    // =========================================================================
-    // Notification Type Detection Tests
-    // =========================================================================
-
     #[test]
-    fn test_comment_vs_mention_detection_comment() {
+    fn kind_one_is_ignored_while_supported_content_remains_enabled() {
         let sender = Keys::generate();
         let target = Keys::generate();
-
-        // A reply (has e-tag) should be a Comment
-        let reply_event = EventBuilder::text_note("This is a reply")
-            .tag(Tag::event(EventId::all_zeros())) // e-tag makes it a reply
+        let defaults = UserPreferences::from(&crate::config::DefaultPreferences::default());
+        let text_note = EventBuilder::text_note("A text-note reply")
+            .tag(Tag::event(EventId::all_zeros()))
+            .tag(Tag::public_key(target.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+        let comment = EventBuilder::new(Kind::from(1111), "A video comment")
+            .tag(Tag::public_key(target.public_key()))
+            .sign_with_keys(&sender)
+            .unwrap();
+        let mention = EventBuilder::new(Kind::from(30023), "A long-form mention")
             .tag(Tag::public_key(target.public_key()))
             .sign_with_keys(&sender)
             .unwrap();
 
-        let has_e_tag = reply_event.tags.find(TagKind::e()).is_some();
-        assert!(has_e_tag, "Reply should have e-tag");
-    }
+        assert!(content_notification_targets(&text_note).is_none());
 
-    #[test]
-    fn test_comment_vs_mention_detection_mention() {
-        let sender = Keys::generate();
-        let target = Keys::generate();
-
-        // A mention (no e-tag, only p-tag) should be a Mention
-        let mention_event = EventBuilder::text_note("Hey @user check this out")
-            .tag(Tag::public_key(target.public_key()))
-            .sign_with_keys(&sender)
-            .unwrap();
-
-        let has_e_tag = mention_event.tags.find(TagKind::e()).is_some();
-        assert!(!has_e_tag, "Mention should not have e-tag");
+        for (event, expected_type) in [
+            (comment, NotificationType::Comment),
+            (mention, NotificationType::Mention),
+        ] {
+            let targets = content_notification_targets(&event).unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].notification_type, expected_type);
+            assert!(targets[0].notification_type.is_enabled(&defaults));
+        }
     }
 
     // =========================================================================
