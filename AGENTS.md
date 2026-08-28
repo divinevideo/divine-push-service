@@ -93,13 +93,15 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `notify_rate:{subscriber}:{creator}` - New-post rate-limit window marker
 
 ### Notification Types
-| Type | Kind | Description |
-|------|------|-------------|
+| Type | Trigger Kind | Description |
+|------|--------------|-------------|
 | Like | 7 | Reactions to user's notes |
-| Comment | 1 | Replies to user's notes |
-| Mention | 1 | Notes mentioning user |
+| Comment | 1111 | NIP-22 comments on a user's video or article |
+| Mention | 30023, 34236 | Long-form content or videos mentioning a user |
 | Repost | 16 | Reposts of user's notes |
 | NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
+
+Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes.
 
 ## Unblocking Workflow
 

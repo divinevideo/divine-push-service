@@ -66,7 +66,7 @@ impl NotificationType {
         match self {
             NotificationType::Like => 7,
             // Kind 1 is the shared preference category for comments and mentions,
-            // including notifications triggered by kinds 1111 and 30023.
+            // including notifications triggered by kinds 1111, 30023, and 34236.
             NotificationType::Comment | NotificationType::Mention => 1,
             NotificationType::Repost => 16,
             // Distinct from Mention's kind 1 even though video mentions also

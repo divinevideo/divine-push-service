@@ -267,7 +267,7 @@ pub struct DefaultPreferences {
 
 fn default_preference_kinds() -> Vec<u16> {
     vec![
-        1,     // Text notes (comments, mentions)
+        1,     // Comment/mention category (triggered by kinds 1111, 30023, or 34236)
         7,     // Reactions/likes
         16,    // Reposts
         30023, // Long-form content
