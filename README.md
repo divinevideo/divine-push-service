@@ -136,6 +136,7 @@ Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nes
 | `NOSTR_PUSH__REDIS__URL` | No | Redis connection URL (overrides the config file) |
 | `NOSTR_PUSH__NOSTR__RELAY_URL` | No | Nostr relay to subscribe to |
 | `NOSTR_PUSH__NOSTR__EVENT_SILENCE_TIMEOUT_SECS` | No | Quiet period before the listener resubscribes, and the window after any resubscribe before it fails health (default `300`) |
+| `NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN` | No | Shared bearer token that enables authenticated internal push requests |
 | `APP_ENV` | No | Selects the config file (default `development`) |
 | `RUST_LOG` | No | Log level (default `info`) |
 

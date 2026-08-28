@@ -43,8 +43,8 @@ See [NIP-XX Push Notifications](nip-xx-push-notifications.md) for the full proto
 
 ## Notification Types
 
-The service supports these notification types. Direct-message payload handling
-is prepared but not enabled; all other rows are watched in production config.
+The service supports these notification types. Direct messages enter through an
+authenticated internal hook; all other rows are watched in production config.
 
 | Type | Event Kind | Trigger |
 |------|-----------|---------|
@@ -54,7 +54,7 @@ is prepared but not enabled; all other rows are watched in production config.
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
-| DirectMessage | 1059 | Prepared only. Enabling ingestion waits on the privileged-reader versus internal-hook architecture decision; a raw gift wrap does not reveal whether it is an incoming chat message, sender self-copy, reaction, or file message |
+| DirectMessage | 1059 | Triggered only by the authenticated internal hook. The relay listener deliberately does not ingest gift wraps because a raw wrap does not reveal whether it is chat, a sender self-copy, a reaction, or a file message |
 | NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
 
 > **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
@@ -129,6 +129,26 @@ When the triggering event is not addressable and carries no addressable referenc
 | `receiverNpub` | bech32 | Bech32-encoded npub of the recipient |
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
 | `timestamp` | string | (omitted for `directMessage`) Unix timestamp of the triggering event as a string |
+
+### Internal direct-message hook
+
+Trusted senders request a generic direct-message push with
+`POST /internal/v1/direct-message` and the bearer token configured through
+`NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN`. The endpoint is unavailable when the
+token is unset.
+
+```json
+{
+  "eventId": "<gift-wrap event id>",
+  "recipientPubkey": "<recipient hex pubkey>",
+  "messageType": "moderation_notice"
+}
+```
+
+`messageType` accepts `moderation_notice` and `report_outcome`. This explicit
+classification is the reason the hook can trigger a message push while the raw
+kind-1059 relay stream cannot. The event id supplies replay deduplication; none
+of the request fields add sender or content metadata to the FCM payload.
 
 The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 

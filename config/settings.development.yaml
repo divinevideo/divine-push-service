@@ -59,8 +59,10 @@ notification:
       - 1      # Text notes (comments, mentions)
       - 7      # Reactions/likes
       - 16     # Reposts
+      - 1059   # Direct messages from classified internal hooks
       - 30023  # Long-form content
       - 34236  # Videos from subscribed creators (new-post "bells")
 
 server:
   listen_addr: "0.0.0.0:8000"
+  # Set via NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN to enable trusted push hooks.

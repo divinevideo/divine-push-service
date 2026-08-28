@@ -23,6 +23,7 @@ impl Default for UserPreferences {
                 1,     // Text notes (comments, mentions)
                 7,     // Reactions/likes
                 16,    // Reposts
+                1059,  // Direct messages from classified internal hooks
                 30023, // Long-form content
                 34236, // Videos from subscribed creators (new-post "bells")
             ],
@@ -56,7 +57,7 @@ pub enum NotificationType {
     ///
     /// The wrapper reveals neither the real sender nor the message, so its push
     /// copy must remain generic.
-    // TODO(#65): Route this only after the service receives classified gift wraps.
+    // Routed only from authenticated, classified internal delivery requests.
     DirectMessage,
     /// A creator the recipient subscribed to published a new video.
     ///
@@ -196,6 +197,7 @@ mod tests {
         assert!(!prefs.kinds.contains(&3));
         assert!(prefs.kinds.contains(&7));
         assert!(prefs.kinds.contains(&16));
+        assert!(prefs.kinds.contains(&1059));
         assert!(prefs.kinds.contains(&30023));
     }
 
@@ -215,6 +217,7 @@ mod tests {
         assert!(NotificationType::Like.is_enabled(&prefs));
         assert!(NotificationType::Comment.is_enabled(&prefs));
         assert!(NotificationType::Mention.is_enabled(&prefs));
+        assert!(NotificationType::DirectMessage.is_enabled(&prefs));
 
         // Only kind 7 enabled
         let prefs = UserPreferences { kinds: vec![7] };
