@@ -160,6 +160,13 @@ Older clients replace the server's stored kind list without 1059, which leaves
 direct-message pushes disabled for that user. The mobile schema bump marks
 existing preferences dirty and republishes the expanded list during rollout.
 
+A `204` means the request was processed, not that FCM reached a device. Missing
+tokens, disabled preferences, an existing delivery claim, and terminal FCM
+failures are successful no-op outcomes under the existing delivery contract.
+An all-token retryable FCM failure releases the claim and returns `5xx`, but the
+moderation caller is deliberately best-effort and does not retry; push failure
+must never delay or fail the moderation action.
+
 The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 
 ### iOS APNS shape
