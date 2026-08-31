@@ -15,6 +15,8 @@ use redis::{RedisResult, Script, Value};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 // Type alias for the connection pool
 pub type RedisPool = Pool<RedisConnectionManager>;
@@ -22,6 +24,7 @@ pub type RedisPool = Pool<RedisConnectionManager>;
 // Redis key constants
 const STALE_TOKENS_ZSET: &str = "stale_tokens";
 const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
+const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 
 /// Build key for user tokens set
 fn build_user_tokens_key(pubkey: &PublicKey) -> String {
@@ -160,6 +163,51 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
             Ok(false)
         }
     }
+}
+
+/// Records that a push reached these tokens, so the sweep below measures
+/// inactivity rather than time since registration.
+///
+/// The score was previously written only by `add_or_update_token`, which made
+/// the sweep delete devices that were still receiving notifications but had not
+/// re-registered inside the window.
+///
+/// Two flags carry the correctness here, and neither is decoration:
+/// - `XX` never creates a member. A token deregistered or swept between the
+///   send and this call must stay gone; re-adding it would leave a tracked
+///   token with no `token_to_pubkey` owner and no user-set membership, which
+///   nothing clears until it ages out a second full max-age window.
+/// - `GT` never lowers a score. Replicas stamp this from their own clocks, so
+///   without it a peer running behind could pull a live token toward the sweep
+///   — the exact outcome recording activity exists to prevent.
+///
+/// Returns the number of tokens whose score actually moved.
+pub async fn refresh_token_activity(pool: &RedisPool, tokens: &[String]) -> Result<usize> {
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let now_timestamp = Timestamp::now().as_secs();
+
+    // One command for the whole batch: a delivery fans out over every token a
+    // recipient registered, and this runs on the delivery path.
+    let mut cmd = redis::cmd("ZADD");
+    cmd.arg(STALE_TOKENS_ZSET).arg("XX").arg("GT").arg("CH");
+    for token in tokens {
+        cmd.arg(now_timestamp).arg(token);
+    }
+
+    let changed: usize = cmd
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(changed)
 }
 
 /// Deletes a campaign claim, but only while this attempt still owns it.
@@ -409,6 +457,211 @@ pub async fn try_claim_event(
 
     // SET NX returns "OK" if the key was set, None if it already existed
     Ok(result.is_some())
+}
+
+/// Ownership token for a per-recipient event claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientEventClaim {
+    key: String,
+    value: String,
+}
+
+/// Claims one `(event_id, recipient)` delivery before it reaches FCM.
+pub async fn try_claim_recipient_event(
+    pool: &RedisPool,
+    event_id: &EventId,
+    recipient: &PublicKey,
+    ttl_seconds: u64,
+) -> Result<Option<RecipientEventClaim>> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let claim = RecipientEventClaim {
+        key: format!("dedup:{}:{}", event_id.to_hex(), recipient.to_hex()),
+        value: Uuid::new_v4().to_string(),
+    };
+    let result: Option<String> = redis::cmd("SET")
+        .arg(&claim.key)
+        .arg(&claim.value)
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_seconds)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(result.map(|_| claim))
+}
+
+/// Releases a claim only if it is still owned by this delivery attempt.
+pub async fn release_recipient_event_claim(
+    pool: &RedisPool,
+    claim: &RecipientEventClaim,
+) -> Result<bool> {
+    const RELEASE_SCRIPT: &str = r#"
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+          return redis.call('DEL', KEYS[1])
+        end
+        return 0
+    "#;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let released: i64 = redis::Script::new(RELEASE_SCRIPT)
+        .key(&claim.key)
+        .arg(&claim.value)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(released == 1)
+}
+
+fn unix_time_millis() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| ServiceError::Internal(format!("System clock is before Unix epoch: {}", e)))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| ServiceError::Internal("Unix timestamp does not fit in u64".to_string()))
+}
+
+/// Atomically records an event's initial durable fan-out job once.
+pub async fn enqueue_initial_fanout_job(
+    pool: &RedisPool,
+    event_id: &EventId,
+    job: &str,
+    marker_ttl_secs: u64,
+) -> Result<bool> {
+    const ENQUEUE_SCRIPT: &str = r#"
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+          return 0
+        end
+        redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+        redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+        return 1
+    "#;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let enqueued: i64 = redis::Script::new(ENQUEUE_SCRIPT)
+        .key(format!("fanout:enqueued:{}", event_id.to_hex()))
+        .key(NEW_POST_FANOUT_JOBS_ZSET)
+        .arg(marker_ttl_secs)
+        .arg(unix_time_millis()?)
+        .arg(job)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(enqueued == 1)
+}
+
+/// Claims the oldest available fan-out job until its lease expires.
+pub async fn claim_fanout_job(pool: &RedisPool, lease_secs: u64) -> Result<Option<String>> {
+    const CLAIM_SCRIPT: &str = r#"
+        local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1)
+        if #jobs == 0 then
+          return nil
+        end
+        redis.call('ZADD', KEYS[1], ARGV[2], jobs[1])
+        return jobs[1]
+    "#;
+    let now = unix_time_millis()?;
+    let lease_millis = lease_secs.saturating_mul(1000);
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    redis::Script::new(CLAIM_SCRIPT)
+        .key(NEW_POST_FANOUT_JOBS_ZSET)
+        .arg(now)
+        .arg(now.saturating_add(lease_millis))
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)
+}
+
+/// Completes one page and atomically schedules its successor, if any.
+///
+/// Leases intentionally have no owner token. If a slow worker finishes after
+/// its lease expired and another worker reclaimed the page, both may deliver
+/// the page. The successor is inserted before the current member is removed, so
+/// that race can duplicate work but cannot remove the only copy of the next page.
+/// A stale worker can also reinsert a successor that another worker already
+/// completed, resurrecting an earlier chain segment; that is still duplicate
+/// work rather than page loss.
+/// Recipient claims make the duplicate delivery harmless in the common case.
+pub async fn complete_fanout_job(
+    pool: &RedisPool,
+    current_job: &str,
+    next_job: Option<&str>,
+) -> Result<()> {
+    const COMPLETE_SCRIPT: &str = r#"
+        if ARGV[2] ~= '' then
+          redis.call('ZADD', KEYS[1], 'NX', ARGV[3], ARGV[2])
+        end
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        return 1
+    "#;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    redis::Script::new(COMPLETE_SCRIPT)
+        .key(NEW_POST_FANOUT_JOBS_ZSET)
+        .arg(current_job)
+        .arg(next_job.unwrap_or_default())
+        .arg(unix_time_millis()?)
+        .invoke_async::<i64>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(())
+}
+
+/// Makes the same leased fan-out job available again after a bounded delay.
+pub async fn rescore_fanout_job(pool: &RedisPool, job: &str, delay_secs: u64) -> Result<()> {
+    let available_at = unix_time_millis()?.saturating_add(delay_secs.saturating_mul(1000));
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    redis::cmd("ZADD")
+        .arg(NEW_POST_FANOUT_JOBS_ZSET)
+        .arg("XX")
+        .arg(available_at)
+        .arg(job)
+        .query_async::<()>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)
+}
+
+/// Atomically replaces a failed page with its next retry attempt.
+pub async fn retry_fanout_job(
+    pool: &RedisPool,
+    current_job: &str,
+    retry_job: &str,
+    delay_secs: u64,
+) -> Result<()> {
+    const RETRY_SCRIPT: &str = r#"
+        redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        return 1
+    "#;
+    let available_at = unix_time_millis()?.saturating_add(delay_secs.saturating_mul(1000));
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    redis::Script::new(RETRY_SCRIPT)
+        .key(NEW_POST_FANOUT_JOBS_ZSET)
+        .arg(current_job)
+        .arg(retry_job)
+        .arg(available_at)
+        .invoke_async::<i64>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(())
 }
 
 // =============================================================================
@@ -781,5 +1034,134 @@ mod tests {
         let key = build_user_tokens_key(&pubkey);
         assert!(key.starts_with("user_tokens:"));
         assert!(key.contains(&pubkey.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn durable_fanout_job_is_reclaimed_and_advances_atomically() {
+        let base_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let Ok(mut redis_url) = url::Url::parse(&base_url) else {
+            return;
+        };
+        // Keep the global production queue out of this lease-expiry test.
+        redis_url.set_path("/14");
+        let Ok(pool) = create_pool(redis_url.as_str(), 2).await else {
+            return;
+        };
+        let Ok(mut conn) = pool.get().await else {
+            return;
+        };
+        if redis::cmd("PING")
+            .query_async::<String>(&mut *conn)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let event_id = EventId::all_zeros();
+        redis::cmd("DEL")
+            .arg(format!("fanout:enqueued:{}", event_id.to_hex()))
+            .arg(NEW_POST_FANOUT_JOBS_ZSET)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis::cmd("SET")
+            .arg(NEW_POST_FANOUT_JOBS_ZSET)
+            .arg("wrong-type")
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let first_job = r#"{"event":"first","cursor":0}"#;
+        let next_job = r#"{"event":"first","cursor":9}"#;
+        assert!(
+            enqueue_initial_fanout_job(&pool, &event_id, first_job, 60)
+                .await
+                .is_err(),
+            "a broken queue must reject the enqueue"
+        );
+        let marker = get_cached_string(&pool, &format!("fanout:enqueued:{}", event_id.to_hex()))
+            .await
+            .unwrap();
+        assert!(
+            marker.is_none(),
+            "a failed queue write must not consume the event's enqueue marker"
+        );
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(NEW_POST_FANOUT_JOBS_ZSET)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(enqueue_initial_fanout_job(&pool, &event_id, first_job, 60)
+            .await
+            .unwrap());
+        assert!(
+            !enqueue_initial_fanout_job(&pool, &event_id, first_job, 60)
+                .await
+                .unwrap(),
+            "an event replay must not enqueue a second initial page"
+        );
+
+        assert_eq!(
+            claim_fanout_job(&pool, 1).await.unwrap().as_deref(),
+            Some(first_job)
+        );
+        assert!(
+            claim_fanout_job(&pool, 1).await.unwrap().is_none(),
+            "a live lease prevents concurrent processing"
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
+            Some(first_job),
+            "a crashed worker's page becomes available after its lease"
+        );
+        rescore_fanout_job(&pool, first_job, 0).await.unwrap();
+        assert_eq!(
+            claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
+            Some(first_job),
+            "graceful shutdown can release a page without waiting for lease expiry"
+        );
+
+        let retry_job = r#"{"event":"first","cursor":0,"attempt":1}"#;
+        retry_fanout_job(&pool, first_job, retry_job, 0)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let queued: usize = redis::cmd("ZCARD")
+            .arg(NEW_POST_FANOUT_JOBS_ZSET)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(queued, 1, "retry must remove the previous leased member");
+        assert_eq!(
+            claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
+            Some(retry_job),
+            "retry atomically replaces the leased member with its persisted attempt"
+        );
+
+        complete_fanout_job(&pool, retry_job, Some(next_job))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_fanout_job(&pool, 30).await.unwrap().as_deref(),
+            Some(next_job),
+            "completion removes the current page and exposes its successor"
+        );
+        complete_fanout_job(&pool, next_job, None).await.unwrap();
+        assert!(claim_fanout_job(&pool, 30).await.unwrap().is_none());
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("fanout:enqueued:{}", event_id.to_hex()))
+            .arg(NEW_POST_FANOUT_JOBS_ZSET)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
     }
 }

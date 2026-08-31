@@ -103,6 +103,10 @@ fn default_campaign_dedup_ttl() -> u64 {
 #[derive(Debug, Deserialize, Clone)]
 pub struct NostrSettings {
     pub relay_url: String,
+    /// Maximum silence before the listener resubscribes, and the recovery
+    /// window before continued silence makes the listener unhealthy.
+    #[serde(default = "default_event_silence_timeout")]
+    pub event_silence_timeout_secs: u64,
     #[serde(default)]
     pub profile_relays: Vec<String>,
     #[serde(default = "default_profile_cache_ttl")]
@@ -114,6 +118,10 @@ pub struct NostrSettings {
     /// changing it to affect anything.
     #[serde(default = "default_query_timeout")]
     pub query_timeout_secs: u64,
+}
+
+fn default_event_silence_timeout() -> u64 {
+    300
 }
 
 fn default_profile_cache_ttl() -> u64 {
@@ -160,6 +168,15 @@ pub struct ServiceSettings {
     /// Maximum concurrent new-post deliveries for one watcher page.
     #[serde(default = "default_new_post_delivery_concurrency")]
     pub new_post_delivery_concurrency: usize,
+    /// Lease held while one worker processes a durable new-post page.
+    #[serde(default = "default_new_post_fanout_lease")]
+    pub new_post_fanout_lease_secs: u64,
+    /// Delay before retrying a durable new-post page after a recoverable failure.
+    #[serde(default = "default_new_post_fanout_retry")]
+    pub new_post_fanout_retry_secs: u64,
+    /// Idle poll interval for the durable new-post worker.
+    #[serde(default = "default_new_post_fanout_poll")]
+    pub new_post_fanout_poll_millis: u64,
     /// When set, only send notifications to these pubkeys (hex). Empty means no restriction.
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
@@ -190,6 +207,21 @@ fn default_new_post_fanout_page_size() -> usize {
 
 fn default_new_post_delivery_concurrency() -> usize {
     50
+}
+
+fn default_new_post_fanout_lease() -> u64 {
+    // A 1,000-recipient page at concurrency 50 is 20 waves. Each FCM operation
+    // is bounded at 45 seconds, so 20 minutes covers the 15-minute send ceiling
+    // plus Redis/profile overhead while recovering a dead worker promptly.
+    1200
+}
+
+fn default_new_post_fanout_retry() -> u64 {
+    5
+}
+
+fn default_new_post_fanout_poll() -> u64 {
+    250
 }
 
 fn default_new_post_rate_limit() -> u64 {
@@ -284,7 +316,6 @@ pub struct NotificationSettings {
 fn default_event_kinds() -> Vec<u64> {
     vec![
         1,     // Text notes (comments, mentions)
-        3,     // Contact list (follows)
         7,     // Reactions/likes (NIP-25)
         16,    // Generic reposts (NIP-18)
         1111,  // NIP-22 comments
@@ -304,7 +335,6 @@ pub struct DefaultPreferences {
 fn default_preference_kinds() -> Vec<u16> {
     vec![
         1,     // Text notes (comments, mentions)
-        3,     // Contact list (follows)
         7,     // Reactions/likes
         16,    // Reposts
         30023, // Long-form content
@@ -370,7 +400,12 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 8] = [
+        let must_be_positive: [(&str, u64, &str); 12] = [
+            (
+                "nostr.event_silence_timeout_secs",
+                self.nostr.event_silence_timeout_secs,
+                "the event-flow watchdog would continuously resubscribe and fail health",
+            ),
             (
                 "nostr.profile_cache_ttl_secs",
                 self.nostr.profile_cache_ttl_secs,
@@ -410,6 +445,21 @@ impl Settings {
                 "service.new_post_delivery_concurrency",
                 self.service.new_post_delivery_concurrency as u64,
                 "new-post fan-out cannot start delivery work",
+            ),
+            (
+                "service.new_post_fanout_lease_secs",
+                self.service.new_post_fanout_lease_secs,
+                "durable fan-out jobs can be claimed concurrently",
+            ),
+            (
+                "service.new_post_fanout_retry_secs",
+                self.service.new_post_fanout_retry_secs,
+                "recoverable fan-out failures retry in a tight loop",
+            ),
+            (
+                "service.new_post_fanout_poll_millis",
+                self.service.new_post_fanout_poll_millis,
+                "an idle worker spins continuously against Redis",
             ),
         ];
 
@@ -452,7 +502,7 @@ mod tests {
     fn test_default_preferences() {
         let prefs = DefaultPreferences::default();
         assert!(prefs.kinds.contains(&1)); // Text notes
-        assert!(prefs.kinds.contains(&3)); // Follows
+        assert!(!prefs.kinds.contains(&3)); // Contact lists are not notification triggers
         assert!(prefs.kinds.contains(&7)); // Likes
         assert!(prefs.kinds.contains(&16)); // Reposts
         assert!(prefs.kinds.contains(&30023)); // Long-form
@@ -462,7 +512,7 @@ mod tests {
     fn test_default_event_kinds() {
         let kinds = default_event_kinds();
         assert!(kinds.contains(&1)); // Text notes
-        assert!(kinds.contains(&3)); // Contact list
+        assert!(!kinds.contains(&3)); // Contact lists are not notification triggers
         assert!(kinds.contains(&7)); // Reactions
         assert!(kinds.contains(&16)); // Reposts
         assert!(kinds.contains(&1111)); // NIP-22 comments
@@ -471,14 +521,19 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_config_event_kinds_match_defaults() {
-        let expected = default_event_kinds();
+    fn test_runtime_config_kinds_match_defaults() {
+        let expected_event_kinds = default_event_kinds();
+        let expected_preference_kinds = default_preference_kinds();
 
         for filename in ["settings.yaml", "settings.development.yaml"] {
             let settings = load_runtime_settings(filename);
             assert_eq!(
-                settings.notification.event_kinds, expected,
+                settings.notification.event_kinds, expected_event_kinds,
                 "{filename} must stay in sync with default_event_kinds()"
+            );
+            assert_eq!(
+                settings.notification.default_preferences.kinds, expected_preference_kinds,
+                "{filename} must stay in sync with default_preference_kinds()"
             );
         }
     }
@@ -502,7 +557,10 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 8] = [
+        let cases: [ZeroCase; 12] = [
+            ("nostr.event_silence_timeout_secs", |s| {
+                s.nostr.event_silence_timeout_secs = 0
+            }),
             ("nostr.profile_cache_ttl_secs", |s| {
                 s.nostr.profile_cache_ttl_secs = 0
             }),
@@ -526,6 +584,15 @@ mod tests {
             }),
             ("service.new_post_delivery_concurrency", |s| {
                 s.service.new_post_delivery_concurrency = 0
+            }),
+            ("service.new_post_fanout_lease_secs", |s| {
+                s.service.new_post_fanout_lease_secs = 0
+            }),
+            ("service.new_post_fanout_retry_secs", |s| {
+                s.service.new_post_fanout_retry_secs = 0
+            }),
+            ("service.new_post_fanout_poll_millis", |s| {
+                s.service.new_post_fanout_poll_millis = 0
             }),
         ];
 
@@ -564,6 +631,12 @@ mod tests {
             let settings = load_runtime_settings(filename);
             assert!(settings.service.new_post_fanout_page_size > 0);
             assert!(settings.service.new_post_delivery_concurrency > 0);
+            assert_eq!(
+                settings.service.new_post_fanout_lease_secs,
+                default_new_post_fanout_lease()
+            );
+            assert!(settings.service.new_post_fanout_retry_secs > 0);
+            assert!(settings.service.new_post_fanout_poll_millis > 0);
             assert!(
                 settings.service.new_post_delivery_concurrency
                     <= settings.service.new_post_fanout_page_size

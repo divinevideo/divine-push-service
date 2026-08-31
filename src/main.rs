@@ -13,6 +13,7 @@ use divine_push_service::config;
 use divine_push_service::error::Result;
 use divine_push_service::event_handler;
 use divine_push_service::health::{CriticalTask, OnReturn, TaskHealth, TaskTracker};
+use divine_push_service::metrics;
 use divine_push_service::nostr_listener;
 use divine_push_service::server::run_server;
 use divine_push_service::state;
@@ -62,6 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting diVine Push Service...");
 
+    let metrics_handle = metrics::init();
+
     let settings = config::Settings::new()?;
     tracing::info!("Configuration loaded successfully");
 
@@ -109,6 +112,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!("Event handler started");
 
+    // Start durable new-post fan-out worker
+    let state_fanout = Arc::clone(&app_state);
+    let token_fanout = token.clone();
+    tracker.spawn(
+        "new_post_fanout",
+        Some(CriticalTask::NewPostFanout),
+        OnReturn::Fatal,
+        async move {
+            if let Err(e) = event_handler::run_new_post_fanout(state_fanout, token_fanout).await {
+                tracing::error!("New-post fan-out worker failed: {}", e);
+            }
+            tracing::info!("New-post fan-out worker task finished.");
+        },
+    );
+    tracing::info!("New-post fan-out worker started");
     // Start campaign delivery collection
     let state_campaign = Arc::clone(&app_state);
     let token_campaign = token.clone();
@@ -134,12 +152,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tracing::info!("Cleanup service started");
 
-    // Start HTTP server (health check only)
+    // Start HTTP server
     let token_server = token.clone();
     let state_server = Arc::clone(&app_state);
     let health_server = Arc::clone(&health);
     tracker.spawn("http_server", None, OnReturn::Fatal, async move {
-        run_server(state_server, health_server, token_server).await;
+        run_server(state_server, health_server, metrics_handle, token_server).await;
         tracing::info!("HTTP server task finished.");
     });
     tracing::info!("HTTP server started");

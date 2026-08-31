@@ -11,7 +11,8 @@ The service implements a draft push-notification protocol; see [docs/nip-xx-push
 - **User preferences** — users can opt in or out of notification kinds with a preferences event; sensible defaults apply otherwise.
 - **Deduplication** — atomic Redis `SET NX EX` per-event locks ensure each event is delivered once, even across replicas.
 - **Replay protection** — a configurable processing window (7 days by default) ignores stale events.
-- **Token cleanup** — a background task prunes stale tokens (older than 90 days by default) once a day.
+- **Token cleanup** — a daily background task prunes tokens with no registration or successful delivery for 90 days by default.
+- **Prometheus metrics** — relay ingestion, event processing, FCM delivery outcomes, and token pruning are exposed for monitoring.
 - **Optional allow-list** — `allowed_pubkeys` can restrict delivery to a specific set of recipients.
 
 ## Protocol
@@ -41,7 +42,7 @@ The service subscribes to trigger events on its relay and notifies the tagged re
 
 New-post notifications are the one type not anchored to a `p` tag on the trigger event. Recipients come from the subscriber's own NIP-51 list (kind 30000, `d=notify`), so the service resolves them from a Redis reverse index rather than from the video. They are rate-limited to one push per (subscriber, creator) per hour, and fan-out is paged and delivered with bounded concurrency so one popular creator cannot force one unbounded Redis read or sequential delivery loop. The in-app feed is not throttled. See [the protocol doc](docs/nip-xx-push-notifications.md) for the list shape.
 
-Divine video comments are NIP-22 `kind:1111` and notify both the root video author and the direct parent author (deduplicated when they coincide). Follows (kind 3) are defined in the protocol and subscribed to, but new-follow notifications are **not currently emitted** — that requires diffing contact-list state, which is not yet implemented.
+Divine video comments are NIP-22 `kind:1111` and notify both the root video author and the direct parent author (deduplicated when they coincide). Follow notifications are not handled by this service, so it does not subscribe to kind 3 contact lists.
 
 Each FCM message carries a stable `data` payload with routing and presentation fields. Routing to the correct video uses the authoritative addressable coordinate from the triggering event, never a coordinate synthesized from the recipient's pubkey. The full payload contract is documented in the [developer guide](docs/developer-guide.md#fcm-payload-format).
 
@@ -68,14 +69,15 @@ Each FCM message carries a stable `data` payload with routing and presentation f
 4. For each match it checks dedup and the recipient's preferences, then sends a data message to Firebase FCM.
 5. Firebase delivers the notification to the device.
 
-The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks, plus an optional campaign delivery collector (off by default; see below). Those tasks are supervised: if one ends unexpectedly, the others are cancelled and the process exits non-zero, so a pod whose delivery pipeline has died is restarted instead of staying in service. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
+The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks and metrics, plus an optional campaign delivery collector (off by default; see below). Those tasks are supervised: if one ends unexpectedly, the others are cancelled and the process exits non-zero, so a pod whose delivery pipeline has died is restarted instead of staying in service. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
+
 
 ## Getting started
 
 ### Prerequisites
 
 - Rust 1.85+
-- Redis
+- Redis 6.2+
 - A Firebase project with FCM enabled, and a service-account credentials file
 
 ### Development
@@ -140,6 +142,7 @@ Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nes
 | `NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX` | Yes | Service's Nostr private key (hex), used for NIP-44 decryption |
 | `NOSTR_PUSH__REDIS__URL` | No | Redis connection URL (overrides the config file) |
 | `NOSTR_PUSH__NOSTR__RELAY_URL` | No | Nostr relay to subscribe to |
+| `NOSTR_PUSH__NOSTR__EVENT_SILENCE_TIMEOUT_SECS` | No | Quiet period before the listener resubscribes, and the window after any resubscribe before it fails health (default `300`) |
 | `NOSTR_PUSH__CAMPAIGN_DELIVERY__ENABLED` | No | Turns campaign delivery collection on (default `false`) |
 | `NOSTR_PUSH__CAMPAIGN_DELIVERY__API_BASE_URL` | No | Base URL of the campaign tool's delivery API. Must be `https`. |
 | `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_ID` | No | Cloudflare Access service token client id |
@@ -159,9 +162,12 @@ The service authenticates to FCM per the app's `firebase` config:
 
 Production images are built and published by the `Build, Test & Push` GitHub Actions workflow (`.github/workflows/publish-and-release.yml`):
 
-- On every push to `main`, the workflow runs tests, builds a single Docker image, and pushes it to the POC, Test, and Staging Google Artifact Registry environments using Workload Identity federation.
-- Pushes to a `v*` tag (or a manual dispatch opting in) additionally publish to the Production registry.
-- After publishing, it dispatches an `image-deploy` event to `divinevideo/divine-iac-coreconfig`, which drives the ArgoCD rollout to the selected environments.
+- On every push to `main`, the workflow runs tests, builds a single Docker image, and pushes it to the POC and Staging Google Artifact Registry environments using Workload Identity federation.
+- Pushes to a `v*` tag additionally publish and deploy to Production as an intentional automatic promotion.
+- A manual workflow dispatch publishes and deploys to POC and Staging by default. Selecting `include_production` additionally publishes and deploys to Production as an intentional automatic promotion.
+- After publishing, the workflow dispatches an `image-deploy` event to `divinevideo/divine-iac-coreconfig`, which creates and automatically merges the deployment PR before checking the ArgoCD sync. Production payloads use `auto_promote: true`; they are not labeled as emergency hotfixes.
+
+Emergency production deployments are an out-of-band platform operation that uses a direct `image-deploy` dispatch with `hotfix: true`. Use that path only when an incident requires bypassing the normal release workflow; ordinary version tags and manual production promotions must use this repository's workflow.
 
 The container is a multi-stage build on `debian:bookworm-slim` that bundles the release binary and the `config/` directory, and exposes port 8000.
 
@@ -170,6 +176,7 @@ The container is a multi-stage build on `debian:bookworm-slim` that bundles the 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Health check and service-key discovery. Clients read `pubkey` to discover the service key for registration and encryption. |
+| `GET /metrics` | Prometheus metrics for relay ingestion and push delivery. Responses include `Cache-Control: no-store`. |
 
 `/health` answers `200` while the delivery pipeline is alive:
 
@@ -185,6 +192,33 @@ If the Nostr listener or the event handler has died it answers `503` with
 `"status": "degraded"` and that task set to `false`. Both the liveness and the
 readiness probe point here, so a dead pipeline fails its probes rather than
 serving `200` behind a healthy-looking pod.
+
+The metrics endpoint exposes:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `push_events_received_total` | Counter | Events received from the Nostr relay. |
+| `push_events_processed_total` | Counter | Events whose routing attempt completed, including attempts that ended in an error. |
+| `push_fcm_sends_attempted_total` | Counter | FCM sends attempted per device token. |
+| `push_fcm_sends_succeeded_total` | Counter | Successful FCM sends per device token. |
+| `push_fcm_sends_failed_total{reason}` | Counter | Failed FCM sends by bounded failure reason. |
+| `push_new_post_fanout_retries_total{reason,outcome}` | Counter | Durable new-post page retries by bounded failure reason and scheduled, preserved, exhausted, or expired outcome. |
+| `push_tokens_pruned_total{reason}` | Counter | Tokens removed as `invalid` or `stale`. |
+| `push_last_event_processed_timestamp_seconds` | Gauge | Unix timestamp of the last completed event routing attempt. Initialized at startup to give a new instance one alert window. |
+
+The delivery deadman is based on the last-processed gauge:
+
+```promql
+time() - max(push_last_event_processed_timestamp_seconds) > 900
+```
+
+This deadman detects a pipeline that stops completing event-routing attempts. It
+does not claim that an attempt delivered a push: use
+`push_fcm_sends_succeeded_total` and `push_fcm_sends_failed_total{reason}` to
+alert on FCM rejecting every delivery. Use the deadman alongside task-health and
+restart alerting; the startup timestamp avoids a premature deadman alert while a
+new instance waits for its first event, while task-health alerting covers a
+crash-looping instance that repeatedly resets that startup grace.
 
 ## License
 

@@ -2,6 +2,11 @@
 
 nostr:
   relay_url: "wss://relay.divine.video"
+  # Quiet window the listener tolerates before acting on relay silence.
+  # A cold silence resubscribes once, then fails health if a second window
+  # passes with no event. A relay CLOSED resubscribes immediately, so there
+  # the next quiet window is the one that fails health.
+  event_silence_timeout_secs: 300
   profile_relays:
     - wss://relay.divine.video
     - wss://purplepag.es
@@ -19,6 +24,9 @@ service:
   notify_list_history_limit: 5000  # Page size for historical notify-list replay
   new_post_fanout_page_size: 1000  # Watcher SSCAN page size for one video
   new_post_delivery_concurrency: 50  # Concurrent NewPost deliveries per page
+  new_post_fanout_lease_secs: 1200  # 20 waves x 45s FCM ceiling, plus 5m overhead
+  new_post_fanout_retry_secs: 5  # Delay before retrying a recoverable page failure
+  new_post_fanout_poll_millis: 250  # Idle durable-worker poll interval
   # allowed_pubkeys: [] — empty means no restriction (production default)
 
 redis:
@@ -41,7 +49,6 @@ notification:
   # Event kinds to subscribe to for notification triggers
   event_kinds:
     - 1      # Text notes (comments, mentions)
-    - 3      # Contact list (follows)
     - 7      # Reactions/likes (NIP-25)
     - 16     # Generic reposts (NIP-18)
     - 1111   # NIP-22 comments
@@ -51,7 +58,6 @@ notification:
   default_preferences:
     kinds:
       - 1      # Text notes (comments, mentions)
-      - 3      # Contact list (follows)
       - 7      # Reactions/likes
       - 16     # Reposts
       - 30023  # Long-form content

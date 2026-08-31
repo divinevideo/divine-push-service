@@ -8,12 +8,14 @@ use crate::{
     event_handler::EventContext,
     state::AppState,
 };
+use async_trait::async_trait;
 use nostr_sdk::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::Sender;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +26,29 @@ const KIND_PREFERENCES_UPDATE: u16 = 3083;
 
 /// NIP-51 people list carrying new-post ("bell") subscriptions.
 const KIND_NOTIFY_LIST: u16 = 30000;
+
+const NOTIFICATION_SUBSCRIPTION_ID: &str = "divine-notifications";
+const NOTIFY_LIST_SUBSCRIPTION_ID: &str = "divine-notify-lists";
+/// Replays events that may have arrived while the subscription was stalled.
+/// Successful event IDs remain claimed for seven days in the runtime config,
+/// so this one-hour overlap recovers gaps without redelivering pushes.
+const LIVE_EVENT_LOOKBACK: Duration = Duration::from_secs(60 * 60);
+/// Give a relay time to clear a rate-limit window before replaying an hour of
+/// traffic. An immediate retry is likely to receive the same rejection.
+const RATE_LIMIT_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
+/// Both owned subscriptions can be closed by one relay-side action. Keep the
+/// first recovery open briefly so the queued closure for its sibling is not
+/// mistaken for a rejection of the replacement subscription.
+const CLOSED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+/// Limit relay-driven recovery churn within one silence-watchdog window. A
+/// relay that repeatedly closes subscriptions while still trickling events can
+/// otherwise keep the listener healthy and replay the lookback indefinitely.
+///
+/// The window is the configured event-silence timeout, not a separate knob, so
+/// raising `event_silence_timeout_secs` also widens the span these recoveries
+/// are counted over and makes the budget easier to trip. Keep that in mind when
+/// tuning the silence timeout.
+const MAX_CLOSED_RECOVERIES_PER_WINDOW: usize = 3;
 
 /// How long to wait for the initial relay connection before treating startup as
 /// failed. A listener exit now stops the process, so this must be long enough to
@@ -69,6 +94,44 @@ fn notify_list_live_filter(since: Timestamp) -> Filter {
         .since(since)
 }
 
+fn live_subscription_since() -> Timestamp {
+    Timestamp::now() - LIVE_EVENT_LOOKBACK
+}
+
+fn is_owned_subscription(subscription_id: &SubscriptionId) -> bool {
+    matches!(
+        subscription_id.as_str(),
+        NOTIFICATION_SUBSCRIPTION_ID | NOTIFY_LIST_SUBSCRIPTION_ID
+    )
+}
+
+fn notification_event_kinds(configured_kinds: &[u64]) -> Vec<Kind> {
+    let mut kinds = vec![
+        Kind::from(KIND_REGISTRATION),
+        Kind::from(KIND_DEREGISTRATION),
+        Kind::from(KIND_PREFERENCES_UPDATE),
+    ];
+
+    for configured_kind in configured_kinds {
+        match u16::try_from(*configured_kind) {
+            Ok(kind) => {
+                let kind = Kind::from(kind);
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            Err(_) => {
+                warn!(
+                    kind = configured_kind,
+                    "Skipping notification event kind outside Nostr u16 range"
+                );
+            }
+        }
+    }
+
+    kinds
+}
+
 pub struct NostrListener {
     state: Arc<AppState>,
 }
@@ -100,7 +163,12 @@ impl NostrListener {
             .await?;
 
         // Subscribe to live events
-        self.subscribe_to_live_events(&token).await?;
+        if !self
+            .subscribe_to_live_events(&token, live_subscription_since())
+            .await?
+        {
+            return Ok(());
+        }
 
         // Main event loop
         self.process_live_events(event_tx, service_pubkey, token)
@@ -111,8 +179,11 @@ impl NostrListener {
     }
 
     async fn is_connected(&self) -> bool {
-        let relays = self.state.nostr_client.relays().await;
-        !relays.is_empty() && relays.values().any(|s| s.is_connected())
+        self.state
+            .nostr_client
+            .relay(self.state.settings.nostr.relay_url.as_str())
+            .await
+            .is_ok_and(|relay| relay.is_connected())
     }
 
     async fn ensure_connected(&self) -> Result<()> {
@@ -190,6 +261,8 @@ impl NostrListener {
                         info!(count = historical_events.len(), "Processing historical control events...");
 
                         for event in historical_events {
+                            crate::metrics::event_received();
+
                             if event.pubkey == *service_pubkey {
                                 continue;
                             }
@@ -273,6 +346,8 @@ impl NostrListener {
             let mut oldest = None;
             let mut new_count = 0usize;
             for event in lists {
+                crate::metrics::event_received();
+
                 oldest = match oldest {
                     Some(current) if current <= event.created_at => Some(current),
                     _ => Some(event.created_at),
@@ -327,33 +402,13 @@ impl NostrListener {
         Ok(())
     }
 
-    async fn subscribe_to_live_events(&self, token: &CancellationToken) -> Result<()> {
-        let mut all_kinds = vec![
-            // Control kinds
-            Kind::from(KIND_REGISTRATION),
-            Kind::from(KIND_DEREGISTRATION),
-            Kind::from(KIND_PREFERENCES_UPDATE),
-        ];
-
-        for kind in &self.state.settings.notification.event_kinds {
-            match u16::try_from(*kind) {
-                Ok(kind) => {
-                    let kind = Kind::from(kind);
-                    if !all_kinds.contains(&kind) {
-                        all_kinds.push(kind);
-                    }
-                }
-                Err(_) => {
-                    warn!(
-                        kind,
-                        "Skipping notification event kind outside Nostr u16 range"
-                    );
-                }
-            }
-        }
-
-        // Look back 1 hour to catch any recent events
-        let since = Timestamp::now() - Duration::from_secs(60 * 60);
+    async fn subscribe_to_live_events(
+        &self,
+        token: &CancellationToken,
+        since: Timestamp,
+    ) -> Result<bool> {
+        let all_kinds = notification_event_kinds(&self.state.settings.notification.event_kinds);
+        let main_relay_url = RelayUrl::parse(&self.state.settings.nostr.relay_url)?;
 
         let filter = Filter::new().kinds(all_kinds.clone()).since(since);
 
@@ -366,12 +421,22 @@ impl NostrListener {
             biased;
             _ = token.cancelled() => {
                 info!("Cancelled before live subscription");
-                return Ok(());
+                return Ok(false);
             }
-            sub_result = self.state.nostr_client.subscribe(filter, None) => {
+            sub_result = self.state.nostr_client.subscribe_with_id(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                filter,
+                None,
+            ) => {
                 match sub_result {
-                    Ok(_output) => {
-                        info!("Successfully subscribed to diVine notification kinds");
+                    Ok(output) if output.success.contains(&main_relay_url) => {
+                        info!("Queued notification subscription for the main relay");
+                    }
+                    Ok(output) => {
+                        error!(failed = ?output.failed, "Failed to enqueue notification subscription for the main relay");
+                        return Err(ServiceError::Internal(
+                            "Notification subscription was not queued for the main relay".to_string(),
+                        ));
                     }
                     Err(e) => {
                         error!("Failed to subscribe to notification kinds: {}", e);
@@ -395,12 +460,22 @@ impl NostrListener {
             biased;
             _ = token.cancelled() => {
                 info!("Cancelled before notify-list subscription");
-                return Ok(());
+                return Ok(false);
             }
-            sub_result = self.state.nostr_client.subscribe(notify_filter, None) => {
+            sub_result = self.state.nostr_client.subscribe_with_id(
+                SubscriptionId::new(NOTIFY_LIST_SUBSCRIPTION_ID),
+                notify_filter,
+                None,
+            ) => {
                 match sub_result {
-                    Ok(_output) => {
-                        info!("Successfully subscribed to notify lists");
+                    Ok(output) if output.success.contains(&main_relay_url) => {
+                        info!("Queued notify-list subscription for the main relay");
+                    }
+                    Ok(output) => {
+                        error!(failed = ?output.failed, "Failed to enqueue notify-list subscription for the main relay");
+                        return Err(ServiceError::Internal(
+                            "Notify-list subscription was not queued for the main relay".to_string(),
+                        ));
                     }
                     Err(e) => {
                         error!("Failed to subscribe to notify lists: {}", e);
@@ -410,7 +485,7 @@ impl NostrListener {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn process_live_events(
@@ -423,9 +498,41 @@ impl NostrListener {
 
         info!("Processing live events...");
 
-        run_live_loop(notifications, event_tx, service_pubkey, token).await;
+        run_live_loop(
+            notifications,
+            event_tx,
+            service_pubkey,
+            token,
+            Duration::from_secs(self.state.settings.nostr.event_silence_timeout_secs),
+            self,
+        )
+        .await
+    }
+}
 
-        Ok(())
+#[async_trait]
+trait SubscriptionRecovery: Send + Sync {
+    async fn resubscribe(&self, since: Timestamp, token: &CancellationToken) -> Result<bool>;
+}
+
+#[async_trait]
+impl SubscriptionRecovery for NostrListener {
+    async fn resubscribe(&self, since: Timestamp, token: &CancellationToken) -> Result<bool> {
+        self.subscribe_to_live_events(token, since).await
+    }
+}
+
+#[derive(Debug)]
+struct ClosedRecovery {
+    trigger_id: SubscriptionId,
+    started_at: Instant,
+    sibling_closed: bool,
+    flow_resumed: bool,
+}
+
+impl ClosedRecovery {
+    fn healthy_grace_elapsed(&self) -> bool {
+        self.flow_resumed && self.started_at.elapsed() >= CLOSED_RECOVERY_GRACE
     }
 }
 
@@ -441,7 +548,14 @@ async fn run_live_loop(
     event_tx: Sender<(Box<Event>, EventContext)>,
     service_pubkey: PublicKey,
     token: CancellationToken,
-) {
+    silence_timeout: Duration,
+    recovery: &dyn SubscriptionRecovery,
+) -> Result<()> {
+    let mut recovery_attempted = false;
+    let mut closed_recovery: Option<ClosedRecovery> = None;
+    let mut closed_recovery_attempts = VecDeque::new();
+    let mut silence_deadline = Instant::now() + silence_timeout;
+
     loop {
         tokio::select! {
             biased;
@@ -450,11 +564,32 @@ async fn run_live_loop(
                 break;
             }
 
+            _ = tokio::time::sleep_until(silence_deadline) => {
+                if recovery_attempted {
+                    return Err(ServiceError::Internal(format!(
+                        "Nostr event flow did not resume within {:?} after resubscribing",
+                        silence_timeout
+                    )));
+                }
+
+                warn!(?silence_timeout, "Nostr event flow is silent; resubscribing to the main relay");
+                if !recovery
+                    .resubscribe(live_subscription_since(), &token)
+                    .await?
+                {
+                    break;
+                }
+                recovery_attempted = true;
+                silence_deadline = Instant::now() + silence_timeout;
+            }
+
             res = notifications.recv() => {
                 match res {
                     Ok(notification) => {
                         match notification {
                             RelayPoolNotification::Event { event, .. } => {
+                                crate::metrics::event_received();
+
                                 if event.pubkey == service_pubkey {
                                     debug!("Skipping event from service account");
                                     continue;
@@ -476,11 +611,100 @@ async fn run_live_loop(
                                             error!("Failed to send live event: {}", e);
                                             break;
                                         }
+
+                                        recovery_attempted = false;
+                                        silence_deadline = Instant::now() + silence_timeout;
+                                        if let Some(state) = closed_recovery.as_mut() {
+                                            state.flow_resumed = true;
+                                        }
                                     }
                                 }
                             }
                             RelayPoolNotification::Message { relay_url, message } => {
-                                debug!(%relay_url, ?message, "Received relay message");
+                                if let RelayMessage::Closed { subscription_id, message: reason } = &message {
+                                    if is_owned_subscription(subscription_id.as_ref()) {
+                                        if closed_recovery
+                                            .as_ref()
+                                            .is_some_and(ClosedRecovery::healthy_grace_elapsed)
+                                        {
+                                            closed_recovery = None;
+                                        }
+
+                                        if let Some(state) = closed_recovery.as_mut() {
+                                            let is_stale_sibling = state.started_at.elapsed()
+                                                < CLOSED_RECOVERY_GRACE
+                                                && subscription_id.as_ref() != &state.trigger_id
+                                                && !state.sibling_closed;
+                                            if is_stale_sibling {
+                                                state.sibling_closed = true;
+                                                info!(%relay_url, subscription_id = %subscription_id, "Ignoring sibling closure queued before subscription recovery");
+                                                continue;
+                                            }
+
+                                            return Err(ServiceError::Internal(format!(
+                                                "Relay closed recovered subscription {subscription_id}"
+                                            )));
+                                        }
+
+                                        if recovery_attempted {
+                                            return Err(ServiceError::Internal(format!(
+                                                "Relay closed subscription {subscription_id} during event-flow recovery"
+                                            )));
+                                        }
+
+                                        let now = Instant::now();
+                                        closed_recovery_attempts.retain(|started_at| {
+                                            now.duration_since(*started_at) < silence_timeout
+                                        });
+                                        if closed_recovery_attempts.len()
+                                            >= MAX_CLOSED_RECOVERIES_PER_WINDOW
+                                        {
+                                            return Err(ServiceError::Internal(format!(
+                                                "Relay repeatedly closed live subscriptions: {} recoveries within {:?}",
+                                                closed_recovery_attempts.len(),
+                                                silence_timeout
+                                            )));
+                                        }
+
+                                        warn!(%relay_url, subscription_id = %subscription_id, ?message, "Relay closed a live subscription; resubscribing");
+                                        if MachineReadablePrefix::parse(reason)
+                                            == Some(MachineReadablePrefix::RateLimited)
+                                        {
+                                            warn!(?RATE_LIMIT_RECOVERY_BACKOFF, "Relay rate-limited a live subscription; backing off before recovery");
+                                            tokio::select! {
+                                                biased;
+                                                _ = token.cancelled() => break,
+                                                _ = tokio::time::sleep(RATE_LIMIT_RECOVERY_BACKOFF) => {}
+                                            }
+                                        }
+
+                                        if !recovery
+                                            .resubscribe(live_subscription_since(), &token)
+                                            .await?
+                                        {
+                                            break;
+                                        }
+                                        closed_recovery_attempts.push_back(now);
+                                        recovery_attempted = true;
+                                        closed_recovery = Some(ClosedRecovery {
+                                            trigger_id: subscription_id.as_ref().clone(),
+                                            started_at: Instant::now(),
+                                            sibling_closed: false,
+                                            flow_resumed: false,
+                                        });
+                                        silence_deadline = Instant::now() + silence_timeout;
+                                        continue;
+                                    }
+                                }
+
+                                match message {
+                                    RelayMessage::Closed { .. } | RelayMessage::Notice(_) => {
+                                        info!(%relay_url, ?message, "Received relay message");
+                                    }
+                                    _ => {
+                                        debug!(%relay_url, ?message, "Received relay message");
+                                    }
+                                }
                             }
                             RelayPoolNotification::Shutdown => {
                                 info!("Received shutdown notification");
@@ -511,17 +735,37 @@ async fn run_live_loop(
             }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::{CriticalTask, OnReturn, TaskHealth, TaskTracker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use tokio::sync::mpsc;
-    use tokio::time::timeout;
+    use tokio::time::{advance, timeout};
 
     /// A test's patience for the loop making progress. Generous enough not to
     /// flake on a loaded CI box, short enough to fail instead of hanging.
     const PATIENCE: Duration = Duration::from_secs(5);
+
+    #[derive(Default)]
+    struct MockRecovery {
+        calls: AtomicUsize,
+        since: Mutex<Vec<Timestamp>>,
+    }
+
+    #[async_trait]
+    impl SubscriptionRecovery for MockRecovery {
+        async fn resubscribe(&self, since: Timestamp, _token: &CancellationToken) -> Result<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.since.lock().expect("since lock").push(since);
+            Ok(true)
+        }
+    }
 
     fn live_event(keys: &Keys, content: &str) -> RelayPoolNotification {
         RelayPoolNotification::Event {
@@ -532,6 +776,13 @@ mod tests {
                     .sign_with_keys(keys)
                     .expect("sign test event"),
             ),
+        }
+    }
+
+    fn relay_message(message: RelayMessage<'static>) -> RelayPoolNotification {
+        RelayPoolNotification::Message {
+            relay_url: RelayUrl::parse("wss://relay.example").expect("valid relay url"),
+            message,
         }
     }
 
@@ -554,12 +805,18 @@ mod tests {
             notify_tx.send(live_event(&keys, content)).expect("send");
         }
 
-        let loop_handle = tokio::spawn(run_live_loop(
-            notify_rx,
-            event_tx,
-            Keys::generate().public_key(),
-            CancellationToken::new(),
-        ));
+        let loop_handle = tokio::spawn(async move {
+            let recovery = MockRecovery::default();
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                CancellationToken::new(),
+                Duration::from_secs(60),
+                &recovery,
+            )
+            .await
+        });
 
         let first = timeout(PATIENCE, event_rx.recv())
             .await
@@ -579,7 +836,8 @@ mod tests {
         timeout(PATIENCE, loop_handle)
             .await
             .expect("loop did not stop once the channel closed")
-            .expect("live loop panicked");
+            .expect("live loop panicked")
+            .expect("closed channel should stop cleanly");
     }
 
     /// The other half of the same decision: `Closed` really is terminal, so
@@ -598,10 +856,13 @@ mod tests {
                 event_tx,
                 Keys::generate().public_key(),
                 CancellationToken::new(),
+                Duration::from_secs(60),
+                &MockRecovery::default(),
             ),
         )
         .await
-        .expect("loop spun on a closed channel instead of stopping");
+        .expect("loop spun on a closed channel instead of stopping")
+        .expect("closed channel should stop cleanly");
     }
 
     /// Cancellation still wins over a pending receive.
@@ -614,9 +875,587 @@ mod tests {
 
         timeout(
             PATIENCE,
-            run_live_loop(notify_rx, event_tx, Keys::generate().public_key(), token),
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token,
+                Duration::from_secs(60),
+                &MockRecovery::default(),
+            ),
         )
         .await
-        .expect("loop ignored cancellation");
+        .expect("loop ignored cancellation")
+        .expect("cancellation should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_subscription_resubscribes_then_fails_listener_health() {
+        let (_notify_tx, notify_rx) = broadcast::channel::<RelayPoolNotification>(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let silence_timeout = Duration::from_secs(30);
+        let recovery = Arc::new(MockRecovery::default());
+        let health = Arc::new(TaskHealth::new());
+        let token = CancellationToken::new();
+        let mut tracker = TaskTracker::new(Arc::clone(&health), token.clone());
+
+        let recovery_for_task = Arc::clone(&recovery);
+        tracker.spawn(
+            "nostr_listener",
+            Some(CriticalTask::NostrListener),
+            OnReturn::Fatal,
+            async move {
+                let _ = run_live_loop(
+                    notify_rx,
+                    event_tx,
+                    Keys::generate().public_key(),
+                    token,
+                    silence_timeout,
+                    recovery_for_task.as_ref(),
+                )
+                .await;
+            },
+        );
+
+        tokio::task::yield_now().await;
+        advance(silence_timeout).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+        let since = recovery.since.lock().expect("since lock")[0];
+        let lookback = Timestamp::now().as_secs() - since.as_secs();
+        assert!(
+            (LIVE_EVENT_LOOKBACK.as_secs() - 1..=LIVE_EVENT_LOOKBACK.as_secs() + 1)
+                .contains(&lookback),
+            "recovery must replay the one-hour window, got {lookback} seconds"
+        );
+        assert!(health.is_alive(CriticalTask::NostrListener));
+
+        advance(silence_timeout).await;
+        tracker.wait().await;
+
+        assert!(!health.is_alive(CriticalTask::NostrListener));
+        assert!(health.had_unexpected_exit());
+    }
+
+    /// Resumed event flow must rearm the watchdog after a silence recovery.
+    ///
+    /// This is what keeps an ordinary quiet spell from compounding into a
+    /// restart. The first silent window resubscribes and arms
+    /// `recovery_attempted`; once events reach the handler again that flag has
+    /// to clear, so the *next* silent window resubscribes as well instead of
+    /// taking the failure branch. The test above only covers the opposite
+    /// direction, where flow never resumes and the listener is meant to die.
+    #[tokio::test(start_paused = true)]
+    async fn resumed_flow_rearms_the_watchdog_after_a_silence_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+        let silence_timeout = Duration::from_secs(30);
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                silence_timeout,
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        advance(silence_timeout).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            1,
+            "the first silent window must resubscribe"
+        );
+
+        notify_tx
+            .send(live_event(&Keys::generate(), "flow resumed"))
+            .expect("send live event");
+        event_rx.recv().await.expect("forward the resumed event");
+
+        advance(silence_timeout).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !loop_handle.is_finished(),
+            "resumed flow must clear the recovery flag, not leave the listener one quiet window from exit"
+        );
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            2,
+            "a later silent window must resubscribe again rather than fail the listener"
+        );
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn our_closed_subscription_resubscribes_immediately() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: closed by relay",
+            )))
+            .expect("send CLOSED");
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(30),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_closed_subscription_does_not_resubscribe() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new("another-component"),
+                "error: closed by relay",
+            )))
+            .expect("send CLOSED");
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(30),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
+    /// A second closure of an already-recovered subscription must fail the
+    /// listener rather than replay again.
+    ///
+    /// The closure reason deliberately carries no `rate-limited:` prefix. That
+    /// prefix would add a real five-second `RATE_LIMIT_RECOVERY_BACKOFF` sleep
+    /// to a test bounded by an equally long `PATIENCE`, leaving the assertion
+    /// to race its own timeout. The backoff has its own test below.
+    #[tokio::test]
+    async fn a_second_owned_closed_message_fails_instead_of_replaying_again() {
+        let (notify_tx, notify_rx) = broadcast::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = MockRecovery::default();
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: closed by relay",
+            )))
+            .expect("send first CLOSED");
+        notify_tx
+            .send(live_event(&Keys::generate(), "traffic between closures"))
+            .expect("send event");
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: closed by relay",
+            )))
+            .expect("send second CLOSED");
+
+        let error = timeout(
+            PATIENCE,
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                CancellationToken::new(),
+                Duration::from_secs(60),
+                &recovery,
+            ),
+        )
+        .await
+        .expect("live loop did not react to repeated CLOSED")
+        .expect_err("a repeated owned CLOSED must fail the listener");
+
+        assert!(error.to_string().contains(NOTIFICATION_SUBSCRIPTION_ID));
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sibling_closures_trigger_one_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        for subscription_id in [NOTIFICATION_SUBSCRIPTION_ID, NOTIFY_LIST_SUBSCRIPTION_ID] {
+            notify_tx
+                .send(relay_message(RelayMessage::closed(
+                    SubscriptionId::new(subscription_id),
+                    "error: relay restart",
+                )))
+                .expect("send CLOSED");
+        }
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(60),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("stale sibling closure must not fail recovery");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_flow_allows_a_later_closed_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(60),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: first closure",
+            )))
+            .expect("send first CLOSED");
+        notify_tx
+            .send(live_event(&Keys::generate(), "healthy traffic"))
+            .expect("send live event");
+        event_rx.recv().await.expect("forward healthy event");
+        advance(CLOSED_RECOVERY_GRACE).await;
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "error: later closure",
+            )))
+            .expect("send later CLOSED");
+        tokio::task::yield_now().await;
+
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 2);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("healthy flow must reset closed recovery");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_closed_recoveries_fail_listener_health() {
+        let (notify_tx, notify_rx) = broadcast::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let recovery = Arc::new(MockRecovery::default());
+        let silence_timeout = Duration::from_secs(60);
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                CancellationToken::new(),
+                silence_timeout,
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        for attempt in 0..MAX_CLOSED_RECOVERIES_PER_WINDOW {
+            notify_tx
+                .send(relay_message(RelayMessage::closed(
+                    SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                    "rate-limited: slow down",
+                )))
+                .expect("send CLOSED");
+            tokio::task::yield_now().await;
+            advance(RATE_LIMIT_RECOVERY_BACKOFF).await;
+            tokio::task::yield_now().await;
+            assert_eq!(recovery.calls.load(Ordering::SeqCst), attempt + 1);
+
+            notify_tx
+                .send(live_event(&Keys::generate(), "trickle traffic"))
+                .expect("send trickle event");
+            event_rx.recv().await.expect("forward trickle event");
+            advance(CLOSED_RECOVERY_GRACE).await;
+        }
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "rate-limited: slow down",
+            )))
+            .expect("send one closure beyond the recovery budget");
+
+        let error = loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect_err("repeated CLOSED recovery must fail listener health");
+        assert!(error.to_string().contains("3 recoveries within 60s"));
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            MAX_CLOSED_RECOVERIES_PER_WINDOW,
+            "the over-budget closure must fail before another replay"
+        );
+    }
+
+    /// The budget only trips on closures bunched inside one window. Recoveries
+    /// spaced further apart than the window are the ordinary "isolated relay
+    /// restart" case and must keep recovering: each earlier attempt ages out of
+    /// the window before the next closure arrives, so the count never builds up.
+    #[tokio::test(start_paused = true)]
+    async fn recoveries_spaced_beyond_the_window_do_not_fail_listener_health() {
+        let (notify_tx, notify_rx) = broadcast::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let recovery = Arc::new(MockRecovery::default());
+        let silence_timeout = Duration::from_secs(60);
+        let token = CancellationToken::new();
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                silence_timeout,
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        // More closures than the per-window budget, but each separated by more
+        // than one window. If aging were broken these would accumulate and the
+        // listener would fail health on the fourth; it must not.
+        let rounds = MAX_CLOSED_RECOVERIES_PER_WINDOW + 2;
+        for round in 0..rounds {
+            notify_tx
+                .send(relay_message(RelayMessage::closed(
+                    SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                    "rate-limited: slow down",
+                )))
+                .expect("send CLOSED");
+            tokio::task::yield_now().await;
+            advance(RATE_LIMIT_RECOVERY_BACKOFF).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                recovery.calls.load(Ordering::SeqCst),
+                round + 1,
+                "each aged-out closure must still recover"
+            );
+
+            // Healthy traffic resumes so the recovery grace clears and the next
+            // closure is treated as fresh rather than a repeat rejection.
+            notify_tx
+                .send(live_event(&Keys::generate(), "healthy traffic"))
+                .expect("send healthy event");
+            event_rx.recv().await.expect("forward healthy event");
+            advance(CLOSED_RECOVERY_GRACE).await;
+
+            // Let a full counting window elapse before the next closure, while
+            // steady events keep the silence watchdog satisfied so only the
+            // window ages out. Each advance stays under silence_timeout so the
+            // silence path never fires between the events.
+            let step = silence_timeout * 2 / 3;
+            for _ in 0..2 {
+                notify_tx
+                    .send(live_event(&Keys::generate(), "steady traffic"))
+                    .expect("send steady event");
+                event_rx.recv().await.expect("forward steady event");
+                advance(step).await;
+            }
+        }
+
+        assert_eq!(
+            recovery.calls.load(Ordering::SeqCst),
+            rounds,
+            "recoveries spaced beyond the window must not trip the budget"
+        );
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("aged-out recoveries must keep the listener healthy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_closure_backs_off_before_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+
+        notify_tx
+            .send(relay_message(RelayMessage::closed(
+                SubscriptionId::new(NOTIFICATION_SUBSCRIPTION_ID),
+                "rate-limited: slow down",
+            )))
+            .expect("send CLOSED");
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(60),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+        advance(RATE_LIMIT_RECOVERY_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+        advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_backpressure_does_not_trigger_recovery() {
+        let (notify_tx, notify_rx) = broadcast::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let recovery = Arc::new(MockRecovery::default());
+        let token = CancellationToken::new();
+        let keys = Keys::generate();
+        let queued = live_event(&keys, "already queued");
+        let RelayPoolNotification::Event { event, .. } = queued else {
+            unreachable!("live_event always constructs an event")
+        };
+        event_tx
+            .send((event, EventContext::Live))
+            .await
+            .expect("pre-fill event channel");
+
+        notify_tx
+            .send(live_event(&keys, "blocked by downstream"))
+            .expect("send live event");
+
+        let recovery_for_task = Arc::clone(&recovery);
+        let token_for_task = token.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_live_loop(
+                notify_rx,
+                event_tx,
+                Keys::generate().public_key(),
+                token_for_task,
+                Duration::from_secs(30),
+                recovery_for_task.as_ref(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(30)).await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+
+        event_rx.recv().await.expect("drain pre-filled event");
+        event_rx.recv().await.expect("forward blocked event");
+        advance(Duration::from_secs(29)).await;
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 0);
+
+        token.cancel();
+        loop_handle
+            .await
+            .expect("live loop panicked")
+            .expect("cancellation should stop cleanly");
+    }
+
+    #[test]
+    fn only_service_owned_subscription_ids_trigger_recovery() {
+        assert!(is_owned_subscription(&SubscriptionId::new(
+            NOTIFICATION_SUBSCRIPTION_ID
+        )));
+        assert!(is_owned_subscription(&SubscriptionId::new(
+            NOTIFY_LIST_SUBSCRIPTION_ID
+        )));
+        assert!(!is_owned_subscription(&SubscriptionId::new(
+            "another-component"
+        )));
     }
 }

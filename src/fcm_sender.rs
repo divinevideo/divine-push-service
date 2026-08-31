@@ -50,6 +50,7 @@ const FCM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// fires first and yields the more specific error; this is the backstop that
 /// bounds whatever else the function grows to do.
 const FCM_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 fn build_http_client() -> Result<reqwest::Client, FcmError> {
     build_http_client_with(FCM_REQUEST_TIMEOUT, FCM_CONNECT_TIMEOUT)
@@ -88,6 +89,23 @@ pub enum FcmError {
     InternalError,
     #[error("Unknown FCM error: code={code}, hint={hint:?}")]
     Unknown { code: u16, hint: Option<String> },
+}
+
+impl FcmError {
+    /// Stable, bounded reason used by the FCM failure metric.
+    pub fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::Initialization(_) => "initialization",
+            Self::InternalRequest(_) => "internal_request",
+            Self::InternalResponse(_) => "internal_response",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::TokenNotRegistered => "token_not_registered",
+            Self::RetryableInternal(_) => "retryable_internal",
+            Self::InternalError => "internal_error",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
 }
 
 /// The `errorCode` FCM returns in `error.details[]` for a token the device has
@@ -165,11 +183,15 @@ fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> FcmErr
     let message = extract_error_message(body);
     let error_code = extract_fcm_error_code(body);
 
-    if status.is_server_error() {
-        return match parse_retry_after(headers) {
-            Some(retry_after) => FcmError::RetryableInternal(retry_after),
-            None => FcmError::InternalError,
-        };
+    // 429 is FCM's explicit backpressure signal, and a large new-post fan-out is
+    // exactly where it shows up. It carries the same "retry later" meaning as a
+    // 5xx and honours the same `Retry-After`, so it must be retryable: a 429 that
+    // sent nothing is unambiguous, and treating it as permanent strands the whole
+    // page's watchers for the recipient-claim TTL.
+    if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+        return FcmError::RetryableInternal(
+            parse_retry_after(headers).unwrap_or(DEFAULT_RETRY_AFTER),
+        );
     }
 
     // Deliberately NOT keyed on the 404 status alone. `TokenNotRegistered`
@@ -338,6 +360,23 @@ fn build_apns_config(payload: &FcmPayload) -> Option<serde_json::Value> {
     }))
 }
 
+/// Builds the `android` block for user-visible FCM messages.
+///
+/// High priority may wake a device from Doze, so reserve it for payloads that
+/// contain notification copy and will produce a visible notification.
+fn build_android_config(payload: &FcmPayload) -> Option<serde_json::Value> {
+    let notification_has_alert = payload
+        .notification
+        .as_ref()
+        .is_some_and(|notification| notification.title.is_some() || notification.body.is_some());
+    let data_has_alert = payload
+        .data
+        .as_ref()
+        .is_some_and(|data| data.contains_key("title") || data.contains_key("body"));
+
+    (notification_has_alert || data_has_alert).then(|| serde_json::json!({ "priority": "high" }))
+}
+
 fn json_object_from_data(
     data: impl Iterator<Item = (String, String)>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -380,6 +419,7 @@ impl RealFcmClient {
     ) -> std::result::Result<(), FcmError> {
         let prefix = token_prefix(token);
         let apns = build_apns_config(&payload);
+        let android = build_android_config(&payload);
 
         let mut message = serde_json::Map::new();
         message.insert(
@@ -406,6 +446,9 @@ impl RealFcmClient {
         }
         if let Some(apns) = apns {
             message.insert("apns".to_string(), apns);
+        }
+        if let Some(android) = android {
+            message.insert("android".to_string(), android);
         }
 
         let access_token =
@@ -483,6 +526,7 @@ impl FcmClient {
             .map(|token| {
                 let payload = payload.clone();
                 async move {
+                    crate::metrics::fcm_send_attempted();
                     // Defence in depth, retained from #42. The specific panic it
                     // was written for is gone — `firebase-messaging-rs` read the
                     // `Retry-After` header via `HeaderName::from_static`, which
@@ -503,6 +547,10 @@ impl FcmClient {
                                 "FCM send panicked while handling the response".to_string(),
                             ))
                         });
+                    match &result {
+                        Ok(()) => crate::metrics::fcm_send_succeeded(),
+                        Err(error) => crate::metrics::fcm_send_failed(error.metric_reason()),
+                    }
                     (token, result)
                 }
             })
@@ -637,6 +685,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_fcm_sender_batch_send() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         // Ensure FcmPayload derives PartialEq and Clone
         let mock_sender = MockFcmSender::new(); // Create instance directly
                                                 // Pass a boxed clone to the client
@@ -673,6 +724,21 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "token1");
         assert_eq!(sent[0].1, payload);
+
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("push_fcm_sends_attempted_total 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("push_fcm_sends_succeeded_total 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_fcm_sends_failed_total{reason="token_not_registered"} 1"#),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -839,13 +905,43 @@ mod tests {
     }
 
     #[test]
-    fn server_error_without_retry_after_is_internal() {
+    fn server_error_without_retry_after_uses_default_retry_delay() {
         let error = classify_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &header_map(&[]),
             r#"{"error":{"code":500,"message":"Internal error"}}"#,
         );
-        assert!(matches!(error, FcmError::InternalError));
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == DEFAULT_RETRY_AFTER));
+    }
+
+    #[test]
+    fn too_many_requests_is_retryable_and_honors_retry_after() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "12")]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn too_many_requests_preserves_an_hour_retry_after() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[("Retry-After", "3600")]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn too_many_requests_without_retry_after_uses_default_retry_delay() {
+        let error = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &header_map(&[]),
+            r#"{"error":{"code":429,"message":"Quota exceeded."}}"#,
+        );
+        assert!(matches!(error, FcmError::RetryableInternal(d) if d == DEFAULT_RETRY_AFTER));
     }
 
     #[test]
@@ -942,16 +1038,18 @@ mod tests {
 
     #[test]
     fn client_error_body_is_preserved_rather_than_discarded() {
-        // The old library collapsed every non-400 4xx to "Unknown invalid
-        // request (no details provided)", losing the reason entirely.
+        // The old library collapsed every non-retryable 4xx to "Unknown invalid
+        // request (no details provided)", losing the reason entirely. (429 is no
+        // longer an example here: it is now retryable backpressure, not a
+        // permanent client error.)
         let error = classify_error(
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_REQUEST,
             &header_map(&[]),
-            r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Send requests'"}}"#,
+            r#"{"error":{"code":400,"message":"Invalid value at 'message.token'","status":"INVALID_ARGUMENT"}}"#,
         );
         match error {
             FcmError::InvalidRequest(message) => {
-                assert!(message.contains("Quota exceeded"), "got: {message}")
+                assert!(message.contains("Invalid value"), "got: {message}")
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
@@ -1072,14 +1170,13 @@ mod tests {
         (client, captured)
     }
 
-    fn alert_payload() -> FcmPayload {
+    fn social_payload() -> FcmPayload {
         let mut data = std::collections::HashMap::new();
         data.insert("eventId".to_string(), "abc123".to_string());
+        data.insert("title".to_string(), "New like".to_string());
+        data.insert("body".to_string(), "Alice liked your post".to_string());
         FcmPayload {
-            notification: Some(FcmNotification {
-                title: Some("New like".to_string()),
-                body: Some("Alice liked your post".to_string()),
-            }),
+            notification: None,
             data: Some(data),
             android: None,
             webpush: None,
@@ -1088,12 +1185,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_single_posts_a_well_formed_authenticated_message() {
+    async fn send_single_posts_a_high_priority_data_only_social_message() {
         let (client, captured) =
             stub_fcm(200, &[], r#"{"name":"projects/test-project/messages/1"}"#).await;
 
         client
-            .send_single("device-token-1", alert_payload())
+            .send_single("device-token-1", social_payload())
             .await
             .expect("send should succeed");
 
@@ -1103,8 +1200,10 @@ mod tests {
 
         assert_eq!(auth.as_deref(), Some("Bearer stub-access-token"));
         assert_eq!(body["message"]["token"], "device-token-1");
-        assert_eq!(body["message"]["notification"]["title"], "New like");
+        assert!(body["message"].get("notification").is_none());
+        assert_eq!(body["message"]["android"]["priority"], "high");
         assert_eq!(body["message"]["data"]["eventId"], "abc123");
+        assert_eq!(body["message"]["data"]["title"], "New like");
         assert_eq!(
             body["message"]["apns"]["headers"]["apns-push-type"],
             "alert"
@@ -1113,6 +1212,65 @@ mod tests {
         assert!(body["message"]["apns"]["payload"]["aps"]
             .get("content-available")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn send_single_does_not_use_high_priority_for_silent_data() {
+        let (client, captured) =
+            stub_fcm(200, &[], r#"{"name":"projects/test-project/messages/1"}"#).await;
+        let payload = FcmPayload {
+            notification: None,
+            data: Some(std::collections::HashMap::from([(
+                "eventId".to_string(),
+                "abc123".to_string(),
+            )])),
+            android: None,
+            webpush: None,
+            apns: None,
+        };
+
+        client
+            .send_single("device-token-1", payload)
+            .await
+            .expect("send should succeed");
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let (body, _) = &requests[0];
+
+        assert!(body["message"].get("android").is_none());
+        assert_eq!(
+            body["message"]["apns"]["headers"]["apns-push-type"],
+            "background"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_single_preserves_notification_payload() {
+        let (client, captured) =
+            stub_fcm(200, &[], r#"{"name":"projects/test-project/messages/1"}"#).await;
+        let payload = FcmPayload {
+            notification: Some(FcmNotification {
+                title: Some("New like".to_string()),
+                body: Some("Alice liked your post".to_string()),
+            }),
+            data: None,
+            android: None,
+            webpush: None,
+            apns: None,
+        };
+
+        client
+            .send_single("device-token-1", payload)
+            .await
+            .expect("send should succeed");
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let (body, _) = &requests[0];
+
+        assert_eq!(body["message"]["notification"]["title"], "New like");
+        assert_eq!(body["message"]["android"]["priority"], "high");
     }
 
     /// The exact production failure: FCM returns 503 with a `Retry-After`
@@ -1126,7 +1284,7 @@ mod tests {
         )
         .await;
 
-        let result = client.send_single("device-token-1", alert_payload()).await;
+        let result = client.send_single("device-token-1", social_payload()).await;
 
         match result {
             Err(FcmError::RetryableInternal(delay)) => {
@@ -1162,7 +1320,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            client.send_single("device-token-1", alert_payload()),
+            client.send_single("device-token-1", social_payload()),
         )
         .await;
 
@@ -1205,7 +1363,7 @@ mod tests {
         );
 
         // Paused clock: this advances virtual time, it does not really wait.
-        let result = client.send_single("device-token-1", alert_payload()).await;
+        let result = client.send_single("device-token-1", social_payload()).await;
 
         match result {
             Err(FcmError::InternalRequest(message)) => {
@@ -1240,7 +1398,7 @@ mod tests {
         )
         .await;
 
-        let result = client.send_single("dead-token", alert_payload()).await;
+        let result = client.send_single("dead-token", social_payload()).await;
         assert!(matches!(result, Err(FcmError::TokenNotRegistered)));
     }
 }

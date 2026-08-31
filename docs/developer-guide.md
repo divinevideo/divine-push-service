@@ -22,10 +22,10 @@ sequenceDiagram
     Push->>Redis: Store token for pubkey
 
     Note over App,Device: Notification Delivery
-    Relay->>Push: New event (like, comment, follow, etc.)
+    Relay->>Push: New event (like, comment, mention, etc.)
     Push->>Redis: Check recipient has registered token
-    Push->>Redis: Check dedup (SET NX EX)
     Push->>Redis: Check user preferences
+    Push->>Redis: Claim (event, recipient) (SET NX EX)
     Push->>FCM: Send data-only message
     FCM->>Device: Push notification
 ```
@@ -50,13 +50,10 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Like | 7 | Reaction to user's note (p-tag) |
 | Comment | 1 | Reply to user's note (p-tag, with e-tag reference) |
 | Comment | 1111 | NIP-22 comment on a user's video or article (notifies root author `P` and parent author `p`) |
-| Follow | 3 | New contact list including user (p-tag) |
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
 | NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
-
-> **Note:** Follow (kind 3) is defined but **not currently emitted** — the handler skips kind 3 because new-follow detection requires diffing contact-list state, which is not yet implemented. Likes, comments, mentions, reposts, and new posts are the types actually delivered today.
 
 > **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
 
@@ -64,7 +61,7 @@ The service watches for these event kinds and notifies the tagged recipient:
 
 The FCM message carries **no top-level `notification` field** — the `data` map below is always present and is identical in shape for every notification type (only the `title`/`body` strings differ); every `data` value is a string. Per-platform delivery then diverges so that **one incoming push produces exactly one visible banner**:
 
-- **Android** — data-only (`notification` and `android` unset). Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields.
+- **Android** — data-only (top-level `notification` unset) with `android.priority` set to `high`. Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields; high priority lets FCM wake an idle device promptly for this user-visible notification.
 - **iOS** — the service attaches an APNS override: `aps.alert` (title/body) + `mutable-content: 1`, push-type `alert`, priority 10. The OS presents the single banner; a Notification Service Extension (if shipped) uses `mutable-content` to *enrich* that same banner, never to create a second one. `content-available` is deliberately omitted — see [Avoiding duplicate banners](#avoiding-duplicate-banners).
 
 ```json
@@ -99,15 +96,15 @@ For a kind 34236 video mention, the triggering event is itself the addressable t
 
 > **Clients MUST NOT** synthesize a video coordinate by pairing `referencedDTag` (or any d-tag) with the *recipient's* pubkey. The recipient is not necessarily the video owner — e.g. a reply to another user's comment, or a mention — and doing so attributes the notification to the wrong (or a nonexistent) video. Use `referencedAuthorPubkey` / `referencedAddress` for ownership; fall back to `referencedEventId` when no coordinate is present.
 
-When the triggering event is not addressable and carries no addressable reference (a follow, a mention in a plain note, or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
+When the triggering event is not addressable and carries no addressable reference (a mention in a plain note or a like on a comment), the `referenced*` video fields are omitted and the client falls back to `referencedEventId`, then to the actor's profile.
 
 #### Authoritative (routing / attribution)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `like`, `comment`, `follow`, `mention`, `repost`, or `newPost`. Match the exact string: the first five are lowercase, `newPost` is camelCase |
-| `eventId` | hex | The Nostr event that triggered the notification (the like/comment/repost/follow event itself); stable id for dedup and a routing fallback |
-| `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes follows and otherwise-unresolved taps |
+| `type` | string | `like`, `comment`, `mention`, `repost`, or `newPost`. Match the exact string: the first four are lowercase, `newPost` is camelCase |
+| `eventId` | hex | The Nostr event that triggered the notification (the like/comment/mention/repost/video event itself); stable id for dedup and a routing fallback |
+| `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
 | `referencedEventId` | hex | (optional) Target event. For a direct kind 34236 trigger this is the video event's own id. Otherwise it is root-aware: the NIP-22 uppercase `E` root scope when present, else the lowercase `e` tag — so comments anchor to the root video, not the parent comment |
 | `referencedAddress` | string | (optional) Authoritative addressable target coordinate `kind:pubkey:d-tag`. Built from a direct kind 34236 trigger's own identity, or taken from the event's `A` (NIP-22 root) or `a` tag for an indirect reference |
@@ -126,7 +123,7 @@ When the triggering event is not addressable and carries no addressable referenc
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
 | `timestamp` | string | Unix timestamp of the triggering event as a string |
 
-The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and follows/plain-note mentions omit them.
+The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 
 ### iOS APNS shape
 
@@ -173,7 +170,7 @@ GET /health
 {
   "status": "ok",
   "pubkey": "abc123...",
-  "tasks": { "nostr_listener": true, "event_handler": true }
+  "tasks": { "nostr_listener": true, "event_handler": true, "new_post_fanout": true }
 }
 ```
 
@@ -182,25 +179,33 @@ Clients use this pubkey to:
 - Encrypt the NIP-44 content to the service's key
 
 The same endpoint is both Kubernetes probes. It returns `503` with
-`"status": "degraded"` when the Nostr listener or the event handler has died,
+`"status": "degraded"` when the Nostr listener, event handler, or durable
+new-post fan-out worker has died,
 so a pod that can no longer deliver is restarted instead of staying in service.
 The `pubkey` field is present either way.
 
 ## Deduplication
 
-The service uses atomic Redis `SET NX EX` per-event keys to prevent duplicate notifications across multiple replicas. Each event that sends a push is claimed exactly once with a 7-day TTL.
+The service uses atomic Redis `SET NX EX` keys per `(event_id, recipient)` to
+prevent duplicate notifications across replicas. The claim is taken only after
+token, preference, coordinate, and rate-limit gates pass. A confirmed retryable
+FCM failure releases that recipient's claim; any successful token retains it for
+the configured processed-event TTL. This lets a replay resume recipients after
+a partial failure without resending recipients that already succeeded.
 
-Notify lists (kind 30000, `d=notify`) are the exception: they send no push, and claiming them would strand a subscriber's bells for the TTL if the handler failed. See [Ingestion](#ingestion) for why the claim buys nothing there.
+Control events keep a coarse per-event claim because each mutates one
+event-scoped record. Notify lists (kind 30000, `d=notify`) are idempotent through
+their atomic replacement script and take no claim.
 
 ## User Preferences
 
 Users can optionally send a Kind 3083 event to control which notification types they receive. The decrypted content is:
 
 ```json
-{ "kinds": [1, 3, 7, 16] }
+{ "kinds": [1, 7, 16] }
 ```
 
-This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), follows (3), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236).
+This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236). Kind 3 contact lists are not notification triggers in this service.
 
 ## New-post subscriptions ("bells")
 
@@ -244,16 +249,11 @@ Two properties are load-bearing:
   `until`, using `notify_list_history_limit` as the per-page size valve.
   Without historical replay, a restart against a fresh Redis silently drops
   every bell until each user republishes.
-- **Notify lists are exempt from the event claim.** `run()` claims every other
-  event before routing it, so two replicas cannot send the same push twice.
-  Notify lists send nothing, and `replace_notify_subscriptions` already rejects
-  any list not strictly newer than the stored one, so the claim prevents nothing
-  here. It does cost something: the claim is taken before routing and never
-  released, so a transient Redis error inside the handler leaves it standing and
-  the replay on the next restart skips the event as already-claimed. That
-  subscriber's bells stay dark for the full `processed_event_ttl_secs`.
-  `requires_event_claim` scopes the exemption with `is_notify_list`, the same
-  kind-plus-`d`-tag check the horizon exemption uses.
+- **Notify lists are idempotent without an event claim.**
+  `replace_notify_subscriptions` already rejects stale list state and reapplies
+  an exact replay as repair. Content events use per-recipient delivery claims,
+  while registration, deregistration, and preference events retain coarse
+  per-event claims.
 - **An empty `p` list is legitimate**, not malformed. It means the user unbelled
   everyone, and it must clear the forward set and remove them from every reverse
   index.
@@ -350,13 +350,33 @@ When the rate limit suppresses a new-post push, the video-coordinate record is
 still written. That video has been intentionally dropped for that watcher, and a
 later NIP-33 edit should not re-announce it as a fresh post.
 
-New-post fan-out is paged by `new_post_fanout_page_size` and each page is
-delivered with at most `new_post_delivery_concurrency` concurrent recipient
-sends. This is separate from the notify-list write cap: one user's list cannot
-stall Redis on write, and one popular creator's audience cannot turn a single
-video into one unbounded Redis read or unbounded sequential delivery loop. The
-page size is not a recipient cap; the handler continues until Redis returns
-cursor 0.
+New-post fan-out is durable and runs outside the event-handler loop. After inline
+mention delivery, the handler atomically queues an initial Redis job containing
+the video and cursor 0. A supervised worker leases one job, reads one `SSCAN`
+page sized by `new_post_fanout_page_size`, and delivers with at most
+`new_post_delivery_concurrency` concurrent recipient sends. Completing the page
+atomically removes it and queues the next cursor. A crashed worker's page is
+eligible again after `new_post_fanout_lease_secs`; recoverable failures use
+exponential backoff from `new_post_fanout_retry_secs` up to five minutes, while
+an FCM `Retry-After` remains a floor even when it is longer, bounded by the job's
+remaining lifetime. A page is discarded after 12 total delivery attempts, which
+includes about 30 minutes of scheduled default backoff. When delivery already
+resolved a successor cursor, exhaustion queues that successor so one poison page
+does not drop every later watcher page. The successor inherits the exhausted
+page's delay so a provider-wide outage cannot immediately march through the
+remaining chain;
+`push_new_post_fanout_retries_total{reason,outcome}` exposes scheduled and
+exhausted retries, plus ownerless preservation after a Redis operation error.
+That preservation path keeps the known queue member rather than trusting a
+possibly completed attempt swap, so it does not advance the durable attempt
+counter. Jobs also expire after the processed-event TTL. Graceful
+shutdown releases the active page immediately; a crash relies on lease expiry.
+Successful per-recipient claims make these at-least-once page retries safe. The
+page size is not a recipient cap; jobs continue until Redis returns cursor 0.
+Operators tuning page size or delivery concurrency should retain a lease of at
+least `ceil(page_size / concurrency) * 45 seconds`, plus headroom for Redis and
+profile work. The shipped defaults use 900 seconds for the FCM ceiling and five
+minutes of headroom.
 
 The rate limit is push-only. The in-app feed shows every post from belled
 creators, so a user who receives one push for a six-post burst opens the app and
@@ -389,13 +409,19 @@ the fan-out follow-up rather than done by halves here.
 
 ## Redis Keys
 
+The canonical registration and removal rules live in the push specification's
+[Token lifecycle](nip-xx-push-notifications.md#token-lifecycle) section.
+
 | Key Pattern | Type | Description |
 |-------------|------|-------------|
 | `user_tokens:{pubkey}` | Set | FCM tokens registered for a pubkey |
 | `token_to_pubkey` | Hash | Reverse mapping from token to owner pubkey |
-| `stale_tokens` | Sorted Set | Token timestamps for cleanup |
-| `dedup:{event_id}` | String | Per-event processing claim with TTL. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
+| `stale_tokens` | Sorted Set | Last time each token was known good, for cleanup. Scored at registration and refreshed on every delivered push, so the sweep deletes devices that have gone quiet rather than devices that merely registered a long time ago. The refresh is `ZADD XX GT`: `XX` never re-creates a token deregistered between the send and the refresh, `GT` never lowers a score |
+| `dedup:{event_id}` | String | Per-event processing claim with TTL for registration, deregistration, and preference control events. Not taken for notify lists, which are idempotent by `created_at` and would be lost for the TTL if a failed handler left a claim standing |
+| `dedup:{event_id}:{recipient}` | String | Per-recipient content-delivery claim with TTL. Acquired before FCM, retained after any successful or ambiguous delivery, and released after confirmed retryable failure |
 | `dedup:34236:{type}:{owner}:{d-tag}:{recipient}` | String | Per-recipient video delivery decision, retained for the configured coordinate TTL (one year by default). `{type}` is the notification type (`newPost`, `mention`), so a bell and a mention for the same video coordinate keep independent records. A delivered mention writes both records, since naming the video already tells the recipient it exists; a delivered or rate-limited bell writes its own |
+| `fanout:enqueued:{event_id}` | String | Initial new-post fan-out enqueue marker with the processed-event TTL |
+| `new_post_fanout_jobs` | Sorted Set | Durable new-post page jobs. The score is the next availability time or active lease deadline |
 | `user_preferences:{pubkey}` | String | JSON notification preferences |
 | `notify_subs:{subscriber}` | Set | Creators this user has belled. Diffed against each incoming replacement list. |
 | `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. Exact-id replays apply idempotently for repair. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |

@@ -1,5 +1,6 @@
-# Builds once, pushes to all GCP Artifact Registry environments via docker-push-gcp.
-# Production push only on version tags (v*). Dispatch to IAC repo triggers ArgoCD sync.
+# Builds once, pushes to GCP Artifact Registry via docker-push-gcp, and dispatches
+# the matching environments to the IAC repo. Version tags and opted-in manual runs
+# include production as an intentional automatic promotion.
 #
 # Required GitHub Variables (repo-level):
 #   Per environment: WORKLOAD_IDENTITY_PROVIDER_{ENV}, SERVICE_ACCOUNT_{ENV}, GCP_PROJECT_ID_{ENV}
@@ -23,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       include_production:
-        description: 'Also push to production registry'
+        description: 'Also push and deploy production (version tags always include production)'
         required: false
         default: false
         type: boolean
@@ -52,6 +53,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Test deploy payload contract
+        run: scripts/deploy-payload-contract-test.sh
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -82,6 +86,8 @@ jobs:
       packages: write
     outputs:
       tags: ${{ steps.tags.outputs.tags }}
+      deploy_payload: ${{ steps.deploy-payload.outputs.payload }}
+      include_production: ${{ steps.deploy-payload.outputs.include_production }}
 
     steps:
       - uses: actions/checkout@v6
@@ -92,6 +98,25 @@ jobs:
       - name: Generate image tags
         id: tags
         uses: divinevideo/divine-github-actions/generate-docker-tags@v1
+
+      - name: Prepare deploy payload
+        id: deploy-payload
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INCLUDE_PRODUCTION_INPUT: ${{ inputs.include_production }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          payload="$(scripts/build-deploy-payload.sh \
+            "$EVENT_NAME" \
+            "$REF" \
+            "$INCLUDE_PRODUCTION_INPUT" \
+            "$GITHUB_SHA" \
+            "$GITHUB_REPOSITORY" \
+            "$REF_NAME")"
+          include_production="$(jq -r '.client_payload.environments | index("production") != null' <<<"$payload")"
+          echo "payload=$payload" >> "$GITHUB_OUTPUT"
+          echo "include_production=$include_production" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         uses: docker/build-push-action@v6
@@ -128,7 +153,7 @@ jobs:
           region: ${{ env.GCP_REGION }}
 
       - name: Push to Production
-        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_production)
+        if: steps.deploy-payload.outputs.include_production == 'true'
         uses: divinevideo/divine-github-actions/docker-push-gcp@v1
         with:
           image-name: divine-push-service:local
@@ -141,18 +166,23 @@ jobs:
           region: ${{ env.GCP_REGION }}
 
       - name: Summary
+        env:
+          INCLUDE_PRODUCTION: ${{ steps.deploy-payload.outputs.include_production }}
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** divine-push-service" >> $GITHUB_STEP_SUMMARY
-          echo "**Tags:** ${{ steps.tags.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Environments:**" >> $GITHUB_STEP_SUMMARY
-          echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Staging: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/containers-staging/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
-            echo "- Production: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_PRODUCTION }}/containers-production/divine-push-service\`" >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "### Docker Image Published"
+            echo ""
+            echo "**Image:** divine-push-service"
+            echo "**Tags:** $TAGS"
+            echo ""
+            echo "**Environments:**"
+            echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/divine-push-service\`"
+            echo "- Staging: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/containers-staging/divine-push-service\`"
+            if [[ "$INCLUDE_PRODUCTION" == "true" ]]; then
+              echo "- Production: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_PRODUCTION }}/containers-production/divine-push-service\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     name: Trigger Deploy
@@ -162,15 +192,6 @@ jobs:
     environment: staging
 
     steps:
-      - name: Determine environments
-        id: envs
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
-            echo 'environments=["poc","staging","production"]' >> $GITHUB_OUTPUT
-          else
-            echo 'environments=["poc","staging"]' >> $GITHUB_OUTPUT
-          fi
-
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -182,27 +203,29 @@ jobs:
 
       - name: Trigger image deploy
         env:
+          DISPATCH_PAYLOAD: ${{ needs.docker.outputs.deploy_payload }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          cat <<EOF | gh api repos/divinevideo/divine-iac-coreconfig/dispatches --input -
-          {
-            "event_type": "image-deploy",
-            "client_payload": {
-              "application": "divine-push-service",
-              "environments": ${{ steps.envs.outputs.environments }},
-              "images": [{"name": "divine-push-service", "tag": "${SHORT_SHA}"}],
-              "source_repo": "${{ github.repository }}",
-              "source_sha": "${{ github.sha }}",
-              "source_ref": "${{ github.ref_name }}"
-            }
-          }
-          EOF
+          if ! jq -e '
+            if (.client_payload.environments | index("production")) != null then
+              .client_payload.auto_promote == true
+            else
+              true
+            end
+          ' >/dev/null <<<"$DISPATCH_PAYLOAD"; then
+            echo "::error::Production deployment payload requires auto_promote: true"
+            exit 1
+          fi
 
-          echo "## Deploy Dispatched" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Application | divine-push-service |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environments | ${{ steps.envs.outputs.environments }} |" >> $GITHUB_STEP_SUMMARY
+          gh api repos/divinevideo/divine-iac-coreconfig/dispatches \
+            --input - <<<"$DISPATCH_PAYLOAD"
+
+          {
+            echo "## Deploy Dispatched"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Application | divine-push-service |"
+            echo "| Image Tag | \`$(jq -r '.client_payload.images[0].tag' <<<"$DISPATCH_PAYLOAD")\` |"
+            echo "| Environments | $(jq -c '.client_payload.environments' <<<"$DISPATCH_PAYLOAD") |"
+          } >> "$GITHUB_STEP_SUMMARY"
