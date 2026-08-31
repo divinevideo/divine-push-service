@@ -71,7 +71,6 @@ Each FCM message carries a stable `data` payload with routing and presentation f
 
 The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks and metrics, plus an optional campaign delivery collector (off by default; see below). Those tasks are supervised: if one ends unexpectedly, the others are cancelled and the process exits non-zero, so a pod whose delivery pipeline has died is restarted instead of staying in service. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
 
-
 ## Getting started
 
 ### Prerequisites
