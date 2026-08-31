@@ -81,6 +81,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `notify_subs_ts:{subscriber}` - `created_at:event_id` of the last applied notify list (out-of-order guard). The id resolves a `created_at` tie by NIP-01's lowest-id rule; a bare integer from an earlier build still reads as a timestamp with no known id
 - `notify_watchers:{creator}` - Subscribers watching this creator (hot read path)
 - `notify_rate:{subscriber}:{creator}` - New-post rate-limit window marker
+- `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
 
 ### Notification Types
 | Type | Kind | Description |
@@ -90,6 +91,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 | Mention | 1 | Notes mentioning user |
 | Repost | 16 | Reposts of user's notes |
 | NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
+| Campaign | n/a | Approved campaign notifications collected from the campaign tool. Not triggered by a Nostr event; off by default. |
 
 ## Unblocking Workflow
 

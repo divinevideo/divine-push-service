@@ -69,7 +69,7 @@ Each FCM message carries a stable `data` payload with routing and presentation f
 4. For each match it checks dedup and the recipient's preferences, then sends a data message to Firebase FCM.
 5. Firebase delivers the notification to the device.
 
-The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks and metrics. Those tasks are supervised: if one ends unexpectedly, the others are cancelled and the process exits non-zero, so a pod whose delivery pipeline has died is restarted instead of staying in service. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
+The service is a single async binary running four cooperating tasks: a Nostr listener, an event handler, the token-cleanup service, and an HTTP server for health checks and metrics, plus an optional campaign delivery collector (off by default; see below). Those tasks are supervised: if one ends unexpectedly, the others are cancelled and the process exits non-zero, so a pod whose delivery pipeline has died is restarted instead of staying in service. It is single-app — one Firebase project, one relay — built with `axum`, `tokio`, `nostr-sdk`, and `redis`.
 
 ## Getting started
 
@@ -124,7 +124,13 @@ Configuration is layered: a YAML file selected by `APP_ENV`, then environment va
 - `APP_ENV=production` loads `config/settings.yaml`.
 - Any other value loads `config/settings.<APP_ENV>.yaml`.
 
-These files set the relay (`wss://relay.divine.video`), profile relays, notification kinds, cleanup schedule, the Firebase project, and the listen address (`0.0.0.0:8000`).
+These files set the relay (`wss://relay.divine.video`), profile relays, notification kinds, cleanup schedule, the Firebase project, the listen address (`0.0.0.0:8000`), and campaign delivery collection (off by default; see below).
+
+### Campaign delivery collection
+
+Optional. When enabled, the service polls the campaign tool's internal delivery API for approved campaign notifications and delivers them over the existing FCM path, reporting each outcome back.
+
+It is off by default, and even when enabled it does not poll unless `api_base_url` and both Access credentials are set. Even when running, it delivers nothing until `allow_unverified_consent` is `true` — this service cannot yet evaluate marketing consent or recipient-local quiet hours, so every delivery is suppressed as `consent_not_verifiable` until an operator asserts the audience opted in out of band.
 
 ### Environment variables
 
@@ -136,6 +142,11 @@ Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nes
 | `NOSTR_PUSH__REDIS__URL` | No | Redis connection URL (overrides the config file) |
 | `NOSTR_PUSH__NOSTR__RELAY_URL` | No | Nostr relay to subscribe to |
 | `NOSTR_PUSH__NOSTR__EVENT_SILENCE_TIMEOUT_SECS` | No | Quiet period before the listener resubscribes, and the window after any resubscribe before it fails health (default `300`) |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ENABLED` | No | Turns campaign delivery collection on (default `false`) |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__API_BASE_URL` | No | Base URL of the campaign tool's delivery API. Must be `https`. |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_ID` | No | Cloudflare Access service token client id |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_SECRET` | No | Cloudflare Access service token secret |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ALLOW_UNVERIFIED_CONSENT` | No | Must be `true` before any campaign is delivered (default `false`) |
 | `APP_ENV` | No | Selects the config file (default `development`) |
 | `RUST_LOG` | No | Log level (default `info`) |
 

@@ -1,6 +1,7 @@
 //! diVine Push Service Library Crate
 
 // Declare modules as public to be accessible from the binary crate and integration tests
+pub mod campaign_delivery;
 pub mod cleanup_service;
 pub mod config;
 pub mod crypto;
