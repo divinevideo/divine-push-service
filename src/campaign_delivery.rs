@@ -258,11 +258,11 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
     let payload = campaign_payload(delivery, &recipient);
     let outcomes = state.fcm_client.send_batch(&tokens, payload).await;
 
-    let mut accepted = false;
+    let mut delivered_tokens = Vec::new();
     let mut retryable = false;
     for (token, outcome) in outcomes {
         match outcome {
-            Ok(()) => accepted = true,
+            Ok(()) => delivered_tokens.push(token),
             Err(FcmError::TokenNotRegistered) => {
                 // The device is gone. Drop the token so the next campaign does
                 // not pay for it again.
@@ -279,6 +279,30 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
         }
     }
 
+    // A delivered campaign push is the same proof of life a delivered social
+    // one is, so it has to move the token away from the staleness sweep.
+    // `cleanup_stale_tokens` deletes on that score alone and nothing else
+    // writes it after registration, so without this a device whose only traffic
+    // is campaigns gets deregistered while it is actively receiving them —
+    // silently, which is the failure `refresh_token_activity` was added for.
+    //
+    // Logged rather than propagated, matching the social path: the push has
+    // already shipped, and failing here would report a delivered notification
+    // as failed and skip the claim promotion below.
+    if !delivered_tokens.is_empty() {
+        if let Err(e) =
+            redis_store::refresh_token_activity(&state.redis_pool, &delivered_tokens).await
+        {
+            error!(
+                error = %e,
+                key = %delivery.idempotency_key,
+                "Failed to refresh token activity after a delivered campaign push; the sweep may \
+                 deregister a live device"
+            );
+        }
+    }
+
+    let accepted = !delivered_tokens.is_empty();
     if accepted {
         // A push landed, so the claim becomes the durable record of it and has
         // to outlive any re-offer.
@@ -1128,6 +1152,69 @@ mod tests {
         assert!(
             repeat.get_sent_messages().is_empty(),
             "a re-offered delivered key must not reach FCM again"
+        );
+
+        delete_claim(&pool, &claim).await;
+    }
+
+    /// The `stale_tokens` score for a token, or `None` when it is not tracked.
+    async fn stale_score(pool: &redis_store::RedisPool, token: &str) -> Option<f64> {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZSCORE")
+            .arg("stale_tokens")
+            .arg(token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// Backdates a token's staleness score so a refresh has something to move.
+    ///
+    /// `XX` without `GT`, so this can move the score down where
+    /// `refresh_token_activity` deliberately cannot.
+    async fn backdate_stale_score(pool: &redis_store::RedisPool, token: &str, score: i64) {
+        let mut conn = pool.get().await.unwrap();
+        let _: i64 = redis::cmd("ZADD")
+            .arg("stale_tokens")
+            .arg("XX")
+            .arg("CH")
+            .arg(score)
+            .arg(token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_delivered_campaign_push_keeps_the_device_off_the_sweep() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, token) = registered_delivery(&pool, "activity").await;
+        let claim = dedup_key(&pending.idempotency_key);
+
+        // Registration wrote today's score. Age it past any plausible sweep
+        // window so that a refresh is the only thing that can bring it back.
+        backdate_stale_score(&pool, &token, 1_000).await;
+        assert_eq!(stale_score(&pool, &token).await, Some(1_000.0));
+
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &pending,
+            1_800_000_000,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+
+        // Without the refresh the score stays where it was backdated to, and
+        // cleanup_stale_tokens deregisters a device that just took a push.
+        let score = stale_score(&pool, &token)
+            .await
+            .expect("a delivered token must stay tracked");
+        assert!(
+            score > 1_000.0,
+            "a delivered campaign push must move its token off the staleness \
+             sweep; score was still {score}"
         );
 
         delete_claim(&pool, &claim).await;
