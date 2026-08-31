@@ -123,6 +123,19 @@ async fn release_claim(state: &AppState, claim: &str, owner: &str, idempotency_k
     }
 }
 
+/// Counts a device token dropped because FCM said it was gone.
+///
+/// Only a confirmed removal counts. `remove_token` returns false when the token
+/// had already been dropped or belonged to another pubkey, and counting those
+/// would inflate the metric with no-ops. Same reason label as the social path,
+/// so `push_tokens_pruned_total{reason="invalid"}` stays one number across both
+/// delivery paths rather than silently omitting campaigns.
+fn record_invalid_token_pruned(removed: bool) {
+    if removed {
+        crate::metrics::tokens_pruned("invalid", 1);
+    }
+}
+
 /// The error body, bounded for a log line.
 ///
 /// `divine-engagement` distinguishes failures its status codes do not — three
@@ -266,10 +279,11 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
             Err(FcmError::TokenNotRegistered) => {
                 // The device is gone. Drop the token so the next campaign does
                 // not pay for it again.
-                if let Err(e) =
-                    redis_store::remove_token(&state.redis_pool, &recipient, &token).await
-                {
-                    warn!(error = %e, key = %delivery.idempotency_key, "Failed to remove unregistered token");
+                match redis_store::remove_token(&state.redis_pool, &recipient, &token).await {
+                    Ok(removed) => record_invalid_token_pruned(removed),
+                    Err(e) => {
+                        warn!(error = %e, key = %delivery.idempotency_key, "Failed to remove unregistered token")
+                    }
                 }
             }
             Err(e) => {
@@ -1155,6 +1169,27 @@ mod tests {
         );
 
         delete_claim(&pool, &claim).await;
+    }
+
+    #[test]
+    fn test_a_pruned_campaign_token_is_counted_once_and_only_when_removed() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            record_invalid_token_pruned(true);
+            record_invalid_token_pruned(false);
+        });
+
+        handle.run_upkeep();
+        let rendered = handle.render();
+        // The same series the social path writes. A campaign prune that landed
+        // on its own label, or on none, would leave the sweep's own accounting
+        // reading low with nothing to say so.
+        assert!(
+            rendered.contains(r#"push_tokens_pruned_total{reason="invalid"} 1"#),
+            "{rendered}"
+        );
     }
 
     /// The `stale_tokens` score for a token, or `None` when it is not tracked.
