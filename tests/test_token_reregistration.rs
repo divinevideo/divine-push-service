@@ -79,6 +79,19 @@ async fn test_token_reregistration_by_different_pubkey() {
         "User 1 should no longer have the token"
     );
 
+    // The previous owner cannot deregister a token after ownership transfers.
+    let removed = redis_store::remove_token(&pool, &user1_pubkey, token)
+        .await
+        .unwrap();
+    assert!(!removed, "User 1 should not remove User 2's token");
+    let user2_tokens = redis_store::get_tokens_for_pubkey(&pool, &user2_pubkey)
+        .await
+        .unwrap();
+    assert!(
+        user2_tokens.contains(&token.to_string()),
+        "User 2 should keep the token after User 1's rejected deregistration"
+    );
+
     // Clean up
     let _ = redis_store::remove_token(&pool, &user2_pubkey, token).await;
 
