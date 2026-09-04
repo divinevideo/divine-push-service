@@ -43,7 +43,8 @@ See [NIP-XX Push Notifications](nip-xx-push-notifications.md) for the full proto
 
 ## Notification Types
 
-The service watches for these event kinds and notifies the tagged recipient:
+The service supports these notification types. Direct messages enter through an
+authenticated internal hook; all other rows are watched in production config.
 
 | Type | Event Kind | Trigger |
 |------|-----------|---------|
@@ -53,13 +54,19 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
+| DirectMessage | 1059 | Triggered only by the authenticated internal hook. The relay listener deliberately does not ingest gift wraps because a raw wrap does not reveal whether it is chat, a sender self-copy, a reaction, or a file message |
 | NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
 
 > **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
 
 ## FCM Payload Format
 
-The FCM message carries **no top-level `notification` field** — the `data` map below is always present and is identical in shape for every notification type (only the `title`/`body` strings differ); every `data` value is a string. Per-platform delivery then diverges so that **one incoming push produces exactly one visible banner**:
+The FCM message carries **no top-level `notification` field**. The `data` map
+below is always present and every value is a string. Direct-message payloads are
+the privacy-preserving exception to the social-notification shape: they omit
+`senderPubkey`, `senderName`, `timestamp`, and all `referenced*` fields because a
+gift wrap reveals no real sender or inner event. Per-platform delivery then
+diverges so that **one incoming push produces exactly one visible banner**:
 
 - **Android** — data-only (top-level `notification` unset) with `android.priority` set to `high`. Android does not auto-display data messages, so the app renders the single banner itself from the `data` fields; high priority lets FCM wake an idle device promptly for this user-visible notification.
 - **iOS** — the service attaches an APNS override: `aps.alert` (title/body) + `mutable-content: 1`, push-type `alert`, priority 10. The OS presents the single banner; a Notification Service Extension (if shipped) uses `mutable-content` to *enrich* that same banner, never to create a second one. `content-available` is deliberately omitted — see [Avoiding duplicate banners](#avoiding-duplicate-banners).
@@ -102,9 +109,9 @@ When the triggering event is not addressable and carries no addressable referenc
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `like`, `comment`, `mention`, `repost`, or `newPost`. Match the exact string: the first four are lowercase, `newPost` is camelCase |
+| `type` | string | `like`, `comment`, `mention`, `repost`, `directMessage`, or `newPost`. Match the exact camelCase strings |
 | `eventId` | hex | The Nostr event that triggered the notification (the like/comment/mention/repost/video event itself); stable id for dedup and a routing fallback |
-| `senderPubkey` | hex | Pubkey of the actor who triggered the event; routes otherwise-unresolved taps |
+| `senderPubkey` | hex | (omitted for `directMessage`) Pubkey of the actor who triggered the event; routes otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
 | `referencedEventId` | hex | (optional) Target event. For a direct kind 34236 trigger this is the video event's own id. Otherwise it is root-aware: the NIP-22 uppercase `E` root scope when present, else the lowercase `e` tag — so comments anchor to the root video, not the parent comment |
 | `referencedAddress` | string | (optional) Authoritative addressable target coordinate `kind:pubkey:d-tag`. Built from a direct kind 34236 trigger's own identity, or taken from the event's `A` (NIP-22 root) or `a` tag for an indirect reference |
@@ -118,10 +125,48 @@ When the triggering event is not addressable and carries no addressable referenc
 |-------|------|-------------|
 | `title` | string | Human-readable title (e.g. "New like") |
 | `body` | string | Human-readable body (e.g. "Alice liked your post") |
-| `senderName` | string | Display name or truncated npub of the sender |
+| `senderName` | string | (omitted for `directMessage`) Display name or truncated npub of the sender |
 | `receiverNpub` | bech32 | Bech32-encoded npub of the recipient |
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
-| `timestamp` | string | Unix timestamp of the triggering event as a string |
+| `timestamp` | string | (omitted for `directMessage`) Unix timestamp of the triggering event as a string |
+
+### Internal direct-message hook
+
+Trusted senders request a generic direct-message push with
+`POST /internal/v1/direct-message` and the bearer token configured through
+`NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN`. The endpoint is unavailable when the
+token is unset.
+
+```json
+{
+  "eventId": "<gift-wrap event id>",
+  "recipientPubkey": "<recipient hex pubkey>",
+  "messageType": "moderation_notice"
+}
+```
+
+`messageType` accepts `moderation_notice` and `report_outcome`. This explicit
+classification is the reason the hook can trigger a message push while the raw
+kind-1059 relay stream cannot. The event id supplies replay deduplication; none
+of the request fields add sender or content metadata to the FCM payload.
+
+This initial contract covers automated moderation notices and report outcomes.
+Manual moderator replies and automated community warnings remain outside the
+classified hook until their message classes are added to both services.
+
+Do not configure callers until Divine Mobile can publish kind 1059 in its
+notification preferences, has bumped its published-kinds schema version, and
+routes `directMessage` notification taps to the message inbox. Older clients
+replace the server's stored kind list without 1059, which leaves direct-message
+pushes disabled for that user. The mobile schema bump marks existing preferences
+dirty and republishes the expanded list during rollout.
+
+A `204` means the request was processed, not that FCM reached a device. Missing
+tokens, disabled preferences, an existing delivery claim, and terminal FCM
+failures are successful no-op outcomes under the existing delivery contract.
+An all-token retryable FCM failure releases the claim and returns `5xx`, but the
+moderation caller is deliberately best-effort and does not retry; push failure
+must never delay or fail the moderation action.
 
 The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 

@@ -3,7 +3,8 @@
 //! Handles Nostr events and routes them to appropriate notification handlers.
 //! Supports:
 //! - Token registration/deregistration (kinds 3079/3080)
-//! - Notification types: likes, comments, mentions, reposts, and new posts
+//! - Notification types: likes, comments, mentions, reposts, direct messages,
+//!   and new posts
 
 use crate::{
     crypto::CryptoService,
@@ -1137,6 +1138,35 @@ struct NotificationTarget {
     notification_type: NotificationType,
 }
 
+/// Source data needed by the common recipient-delivery path.
+enum DeliveryTrigger<'a> {
+    Nostr(&'a Event),
+    DirectMessage(EventId),
+}
+
+impl DeliveryTrigger<'_> {
+    fn event_id(&self) -> EventId {
+        match self {
+            Self::Nostr(event) => event.id,
+            Self::DirectMessage(event_id) => *event_id,
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Nostr(event) => event.kind,
+            Self::DirectMessage(_) => Kind::from(1059),
+        }
+    }
+
+    fn nostr_event(&self) -> Option<&Event> {
+        match self {
+            Self::Nostr(event) => Some(event),
+            Self::DirectMessage(_) => None,
+        }
+    }
+}
+
 /// Drop targets that are the event's own author.
 ///
 /// An event that `p`-tags its own sender — a self-reaction, a self-repost —
@@ -1198,8 +1228,15 @@ struct EventScopedCopy {
 fn renders_event_content(notification_type: NotificationType) -> bool {
     match notification_type {
         NotificationType::Comment | NotificationType::Mention => true,
-        NotificationType::Like | NotificationType::Repost | NotificationType::NewPost => false,
+        NotificationType::Like
+        | NotificationType::Repost
+        | NotificationType::DirectMessage
+        | NotificationType::NewPost => false,
     }
+}
+
+fn renders_sender(notification_type: NotificationType) -> bool {
+    !matches!(notification_type, NotificationType::DirectMessage)
 }
 
 /// The event-scoped copy, resolved at most once and only if it is needed.
@@ -1240,6 +1277,8 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
 /// notifications.
 struct LazyEventCopy {
     cell: tokio::sync::OnceCell<EventScopedCopy>,
+    /// Whether any target renders the event author.
+    needs_sender: bool,
     /// Whether any target renders the event body, decided over the whole target
     /// list rather than the one recipient that happens to resolve it first.
     needs_content: bool,
@@ -1249,6 +1288,9 @@ impl LazyEventCopy {
     fn for_targets(targets: &[NotificationTarget]) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
+            needs_sender: targets
+                .iter()
+                .any(|target| renders_sender(target.notification_type)),
             needs_content: targets
                 .iter()
                 .any(|target| renders_event_content(target.notification_type)),
@@ -1259,13 +1301,17 @@ impl LazyEventCopy {
     fn resolved(copy: EventScopedCopy) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new_with(Some(copy)),
+            needs_sender: false,
             needs_content: false,
         }
     }
 
-    async fn get(&self, state: &AppState, event: &Event) -> &EventScopedCopy {
+    async fn get(&self, state: &AppState, event: Option<&Event>) -> &EventScopedCopy {
         self.cell
-            .get_or_init(|| resolve_event_scoped_copy(state, event, self.needs_content))
+            .get_or_init(|| {
+                let event = event.expect("only pre-resolved copies omit a Nostr event");
+                resolve_event_scoped_copy(state, event, self.needs_sender, self.needs_content)
+            })
             .await
     }
 }
@@ -1277,8 +1323,16 @@ impl LazyEventCopy {
 async fn resolve_event_scoped_copy(
     state: &AppState,
     event: &Event,
+    needs_sender: bool,
     needs_content: bool,
 ) -> EventScopedCopy {
+    if !needs_sender && !needs_content {
+        return EventScopedCopy {
+            sender_name: String::new(),
+            formatted_content: None,
+        };
+    }
+
     let Some(mention_parser) = state.mention_parser_service.as_ref() else {
         return EventScopedCopy {
             sender_name: format_short_npub(&event.pubkey),
@@ -1594,7 +1648,51 @@ async fn send_notification_to_user(
     copy: &LazyEventCopy,
     token: CancellationToken,
 ) -> Result<()> {
-    let event_id = event.id;
+    send_notification_trigger_to_user(
+        state,
+        DeliveryTrigger::Nostr(event),
+        target_pubkey,
+        notification_type,
+        copy,
+        token,
+    )
+    .await
+}
+
+/// Deliver a classified direct-message push from a trusted internal caller.
+///
+/// The caller supplies the published gift-wrap id for replay deduplication. No
+/// wrapped content or sender metadata enters the push payload.
+pub async fn send_direct_message_notification(
+    state: &AppState,
+    event_id: EventId,
+    target_pubkey: &PublicKey,
+    token: CancellationToken,
+) -> Result<()> {
+    let copy = LazyEventCopy::resolved(EventScopedCopy {
+        sender_name: String::new(),
+        formatted_content: None,
+    });
+    send_notification_trigger_to_user(
+        state,
+        DeliveryTrigger::DirectMessage(event_id),
+        target_pubkey,
+        NotificationType::DirectMessage,
+        &copy,
+        token,
+    )
+    .await
+}
+
+async fn send_notification_trigger_to_user(
+    state: &AppState,
+    trigger: DeliveryTrigger<'_>,
+    target_pubkey: &PublicKey,
+    notification_type: NotificationType,
+    copy: &LazyEventCopy,
+    token: CancellationToken,
+) -> Result<()> {
+    let event_id = trigger.event_id();
     let pubkey_hex = target_pubkey.to_hex();
 
     // Check pubkey allowlist (for non-production environments)
@@ -1639,10 +1737,13 @@ async fn send_notification_to_user(
 
     let mut delivery_type = notification_type;
     if !delivery_type.is_enabled(&prefs) {
-        let can_fall_back_to_bell = if event.kind.as_u16() == KIND_VIDEO
+        let can_fall_back_to_bell = if trigger.kind().as_u16() == KIND_VIDEO
             && delivery_type == NotificationType::Mention
             && NotificationType::NewPost.is_enabled(&prefs)
         {
+            let event = trigger
+                .nostr_event()
+                .expect("video notifications always originate from a Nostr event");
             match redis_store::is_notify_watcher(&state.redis_pool, &event.pubkey, target_pubkey)
                 .await
             {
@@ -1680,18 +1781,24 @@ async fn send_notification_to_user(
         }
     }
 
-    if event.kind.as_u16() == KIND_VIDEO
-        && has_video_claim(state, event, target_pubkey, delivery_type, &token).await?
-    {
-        trace!(
-            event_id = %event_id,
-            target_pubkey = %target_pubkey,
-            "Skipping video recipient already notified for this coordinate"
-        );
-        return Ok(());
+    if trigger.kind().as_u16() == KIND_VIDEO {
+        let event = trigger
+            .nostr_event()
+            .expect("video notifications always originate from a Nostr event");
+        if has_video_claim(state, event, target_pubkey, delivery_type, &token).await? {
+            trace!(
+                event_id = %event_id,
+                target_pubkey = %target_pubkey,
+                "Skipping video recipient already notified for this coordinate"
+            );
+            return Ok(());
+        }
     }
 
     if delivery_type == NotificationType::NewPost {
+        let event = trigger
+            .nostr_event()
+            .expect("new-post notifications always originate from a Nostr event");
         let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
         let within_window = tokio::select! {
             biased;
@@ -1766,11 +1873,14 @@ async fn send_notification_to_user(
             }
             return Err(crate::error::ServiceError::Cancelled);
         }
-        resolved = copy.get(state, event) => resolved
+        resolved = copy.get(state, trigger.nostr_event()) => resolved
     };
 
     // Create FCM payload
-    let payload = create_fcm_payload(event, target_pubkey, delivery_type, copy);
+    let payload = match trigger.nostr_event() {
+        Some(event) => create_fcm_payload(event, target_pubkey, delivery_type, copy),
+        None => create_direct_message_payload(event_id, target_pubkey),
+    };
 
     // Send to all tokens
     info!(
@@ -1889,6 +1999,9 @@ async fn send_notification_to_user(
     // bounded, and low-harm; silently eating an hour of notifications on an FCM
     // blip is worse. Do not "fix" this into `SET NX EX`.
     if delivery_type == NotificationType::NewPost && success_count > 0 {
+        let event = trigger
+            .nostr_event()
+            .expect("new-post notifications always originate from a Nostr event");
         let rate_key = redis_store::build_notify_rate_key(target_pubkey, &event.pubkey);
         // Log and continue rather than `?`. Everything from here down is
         // bookkeeping about a push that has already shipped, so propagating
@@ -1917,14 +2030,16 @@ async fn send_notification_to_user(
         // here: `satisfied_video_claims` can yield two records, and `?` on
         // the first left the second unwritten. That is exactly the
         // half-written state the type-scoped claim exists to prevent.
-        record_video_claims(
-            state,
-            event,
-            target_pubkey,
-            delivery_type,
-            "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify",
-        )
-        .await;
+        if let Some(event) = trigger.nostr_event() {
+            record_video_claims(
+                state,
+                event,
+                target_pubkey,
+                delivery_type,
+                "Failed to record a video-coordinate claim after a delivered push; an edit may re-notify",
+            )
+            .await;
+        }
     }
 
     // Remove invalid tokens
@@ -2031,6 +2146,9 @@ fn create_fcm_payload(
             let body = format!("{} reposted your post", sender_name);
             (title, body)
         }
+        NotificationType::DirectMessage => {
+            return create_direct_message_payload(event.id, target_pubkey);
+        }
         NotificationType::NewPost => {
             // Provisional copy. divine-mobile/brand-guidelines/TONE_OF_VOICE.md
             // governs user-facing strings; confirm before release.
@@ -2046,27 +2164,54 @@ fn create_fcm_payload(
     data.insert("eventId".to_string(), event.id.to_hex());
     data.insert("title".to_string(), title.clone());
     data.insert("body".to_string(), body.clone());
-    data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
-    data.insert("senderName".to_string(), sender_name);
     data.insert("receiverPubkey".to_string(), target_pubkey.to_hex());
     data.insert(
         "receiverNpub".to_string(),
         target_pubkey.to_bech32().unwrap_or_default(),
     );
     data.insert("eventKind".to_string(), event.kind.as_u16().to_string());
+    data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
+    data.insert("senderName".to_string(), sender_name);
     data.insert(
         "timestamp".to_string(),
         event.created_at.as_secs().to_string(),
     );
 
-    // Add authoritative routing/attribution target fields: the referenced event
-    // id and, for addressable targets (e.g. kind 34236 videos), the signed
-    // coordinate (`referencedAddress` + components) so the client never has to
-    // guess the target's owner.
+    // Add authoritative routing/attribution target fields: the referenced
+    // event id and, for addressable targets (e.g. kind 34236 videos), the
+    // signed coordinate so the client never has to guess the target owner.
     insert_trigger_reference_fields(&mut data, event);
 
     FcmPayload {
         notification: None, // Data-only message for better client control
+        data: Some(data),
+        android: None,
+        webpush: None,
+        apns: None,
+    }
+}
+
+fn create_direct_message_payload(event_id: EventId, target_pubkey: &PublicKey) -> FcmPayload {
+    let mut data = std::collections::HashMap::new();
+    data.insert(
+        "type".to_string(),
+        NotificationType::DirectMessage.display_name().to_string(),
+    );
+    data.insert("eventId".to_string(), event_id.to_hex());
+    data.insert("title".to_string(), "New message".to_string());
+    data.insert("body".to_string(), "You have a new message".to_string());
+    data.insert("receiverPubkey".to_string(), target_pubkey.to_hex());
+    data.insert(
+        "receiverNpub".to_string(),
+        target_pubkey.to_bech32().unwrap_or_default(),
+    );
+    data.insert(
+        "eventKind".to_string(),
+        NotificationType::DirectMessage.kind().to_string(),
+    );
+
+    FcmPayload {
+        notification: None,
         data: Some(data),
         android: None,
         webpush: None,
@@ -2595,7 +2740,20 @@ mod tests {
 
         assert!(!renders_event_content(NotificationType::Like));
         assert!(!renders_event_content(NotificationType::Repost));
+        assert!(!renders_event_content(NotificationType::DirectMessage));
         assert!(!renders_event_content(NotificationType::NewPost));
+    }
+
+    #[test]
+    fn test_direct_messages_need_neither_sender_nor_content() {
+        assert!(!renders_sender(NotificationType::DirectMessage));
+
+        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
+            recipient: Keys::generate().public_key(),
+            notification_type: NotificationType::DirectMessage,
+        }]);
+        assert!(!copy.needs_sender);
+        assert!(!copy.needs_content);
     }
 
     #[test]
@@ -2911,6 +3069,67 @@ mod tests {
             data.get("body"),
             Some(&"Alice posted a new vine".to_string())
         );
+    }
+
+    #[test]
+    fn test_direct_message_payload_is_contentless_and_senderless() {
+        let wrapper = Keys::generate();
+        let recipient = Keys::generate().public_key();
+        let encrypted_content = "private-ciphertext-must-not-leak";
+        let event = EventBuilder::new(Kind::from(1059), encrypted_content)
+            .tag(Tag::public_key(recipient))
+            .sign_with_keys(&wrapper)
+            .unwrap();
+        let copy = EventScopedCopy {
+            sender_name: "ephemeral wrapper author".to_string(),
+            formatted_content: Some(encrypted_content.to_string()),
+        };
+
+        let payload =
+            create_fcm_payload(&event, &recipient, NotificationType::DirectMessage, &copy);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(data.get("type"), Some(&"directMessage".to_string()));
+        assert_eq!(data.get("title"), Some(&"New message".to_string()));
+        assert_eq!(
+            data.get("body"),
+            Some(&"You have a new message".to_string())
+        );
+        assert!(!data.contains_key("senderPubkey"));
+        assert!(!data.contains_key("senderName"));
+        assert!(!data.contains_key("timestamp"));
+        assert!(!data.values().any(|value| value.contains(encrypted_content)));
+        assert!(!data
+            .values()
+            .any(|value| value.contains(&event.pubkey.to_hex())));
+    }
+
+    #[test]
+    fn test_internal_direct_message_payload_matches_the_documented_contract() {
+        let recipient = Keys::generate().public_key();
+        let event_id =
+            EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+
+        let payload = create_direct_message_payload(event_id, &recipient);
+        let data = payload.data.expect("data-only payload");
+
+        assert_eq!(data.get("type"), Some(&"directMessage".to_string()));
+        assert_eq!(data.get("eventId"), Some(&event_id.to_hex()));
+        assert_eq!(data.get("eventKind"), Some(&"1059".to_string()));
+        assert_eq!(data.get("receiverPubkey"), Some(&recipient.to_hex()));
+        for omitted in [
+            "senderPubkey",
+            "senderName",
+            "timestamp",
+            "referencedEventId",
+            "referencedAddress",
+            "referencedKind",
+            "referencedAuthorPubkey",
+            "referencedDTag",
+        ] {
+            assert!(!data.contains_key(omitted), "{omitted} must stay omitted");
+        }
     }
 
     #[test]
