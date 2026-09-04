@@ -372,11 +372,8 @@ async fn handle_deregistration(state: &AppState, event: &Event) -> Result<()> {
         );
     }
 
-    // Clean up user preferences when they deregister
-    let pubkey_hex = event.pubkey.to_hex();
-    if let Err(e) = preferences::delete_user_preferences(&state.redis_pool, &pubkey_hex).await {
-        warn!(event_id = %event.id, pubkey = %event.pubkey, error = %e, "Failed to delete user preferences");
-    }
+    // Preferences are identity-scoped, while deregistration removes one device token.
+    // Keep the account's choices so signing out or switching accounts cannot reset them.
 
     Ok(())
 }
@@ -2273,6 +2270,137 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[24..].copy_from_slice(&seed.to_be_bytes());
         EventId::from_slice(&bytes).expect("32 bytes is a valid event id")
+    }
+
+    fn encrypted_deregistration_event(user_keys: &Keys, service_keys: &Keys, token: &str) -> Event {
+        let payload = serde_json::json!({ "token": token }).to_string();
+        let encrypted = nostr_sdk::nips::nip44::encrypt(
+            user_keys.secret_key(),
+            &service_keys.public_key(),
+            payload,
+            nostr_sdk::nips::nip44::Version::V2,
+        )
+        .expect("test token should encrypt");
+
+        EventBuilder::new(Kind::from(KIND_DEREGISTRATION), encrypted)
+            .tag(Tag::public_key(service_keys.public_key()))
+            .sign_with_keys(user_keys)
+            .expect("test deregistration should sign")
+    }
+
+    #[tokio::test]
+    async fn deregistration_keeps_the_account_preferences() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let user = Keys::generate();
+        let service_keys = Keys::generate();
+        let token = format!("deregistration-owner-{}", user.public_key().to_hex());
+        let expected_preferences = preferences::UserPreferences { kinds: vec![7] };
+        let settings = crate::config::Settings::new().unwrap();
+
+        redis_store::add_or_update_token(&pool, &user.public_key(), &token)
+            .await
+            .unwrap();
+        preferences::set_user_preferences(
+            &pool,
+            &user.public_key().to_hex(),
+            &expected_preferences,
+        )
+        .await
+        .unwrap();
+
+        let mut state = test_app_state(
+            settings.clone(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.service_keys = Some(service_keys.clone());
+        state.crypto_service = Some(CryptoService::new(service_keys.clone()));
+        let event = encrypted_deregistration_event(&user, &service_keys, &token);
+
+        handle_deregistration(&state, &event).await.unwrap();
+
+        assert!(
+            redis_store::get_tokens_for_pubkey(&pool, &user.public_key())
+                .await
+                .unwrap()
+                .is_empty(),
+            "deregistration should remove the owned token"
+        );
+        let stored_preferences = preferences::get_user_preferences(
+            &pool,
+            &user.public_key().to_hex(),
+            &settings.notification.default_preferences,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_preferences, expected_preferences);
+
+        preferences::delete_user_preferences(&pool, &user.public_key().to_hex())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_deregistration_keeps_both_the_token_and_the_preferences() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let first_user = Keys::generate();
+        let current_owner = Keys::generate();
+        let service_keys = Keys::generate();
+        let token = format!(
+            "deregistration-transfer-{}",
+            first_user.public_key().to_hex()
+        );
+        let expected_preferences = preferences::UserPreferences { kinds: vec![16] };
+        let settings = crate::config::Settings::new().unwrap();
+
+        redis_store::add_or_update_token(&pool, &first_user.public_key(), &token)
+            .await
+            .unwrap();
+        preferences::set_user_preferences(
+            &pool,
+            &first_user.public_key().to_hex(),
+            &expected_preferences,
+        )
+        .await
+        .unwrap();
+        redis_store::add_or_update_token(&pool, &current_owner.public_key(), &token)
+            .await
+            .unwrap();
+
+        let mut state = test_app_state(
+            settings.clone(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.service_keys = Some(service_keys.clone());
+        state.crypto_service = Some(CryptoService::new(service_keys.clone()));
+        let event = encrypted_deregistration_event(&first_user, &service_keys, &token);
+
+        handle_deregistration(&state, &event).await.unwrap();
+
+        let owner_tokens = redis_store::get_tokens_for_pubkey(&pool, &current_owner.public_key())
+            .await
+            .unwrap();
+        assert_eq!(owner_tokens, vec![token.clone()]);
+        let stored_preferences = preferences::get_user_preferences(
+            &pool,
+            &first_user.public_key().to_hex(),
+            &settings.notification.default_preferences,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_preferences, expected_preferences);
+
+        redis_store::remove_token(&pool, &current_owner.public_key(), &token)
+            .await
+            .unwrap();
+        preferences::delete_user_preferences(&pool, &first_user.public_key().to_hex())
+            .await
+            .unwrap();
     }
 
     #[test]

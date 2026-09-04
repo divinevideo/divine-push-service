@@ -162,7 +162,7 @@ pub async fn set_user_preferences(
     Ok(())
 }
 
-/// Delete user preferences from Redis (called on deregistration)
+/// Delete user preferences from Redis for explicit cleanup operations.
 pub async fn delete_user_preferences(pool: &RedisPool, pubkey: &str) -> Result<()> {
     use redis::AsyncCommands;
 
