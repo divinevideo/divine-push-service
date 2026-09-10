@@ -20,7 +20,7 @@ impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             kinds: vec![
-                1,     // Text notes (comments, mentions)
+                1,     // Comment/mention category
                 7,     // Reactions/likes
                 16,    // Reposts
                 30023, // Long-form content
