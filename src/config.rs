@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn test_default_preferences() {
         let prefs = DefaultPreferences::default();
-        assert!(prefs.kinds.contains(&1)); // Text notes
+        assert!(prefs.kinds.contains(&1)); // Comment/mention category
         assert!(!prefs.kinds.contains(&3)); // Contact lists are not notification triggers
         assert!(prefs.kinds.contains(&7)); // Likes
         assert!(prefs.kinds.contains(&16)); // Reposts

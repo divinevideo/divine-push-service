@@ -236,7 +236,7 @@ await relay.publish(await signEvent(event, myPriv));
 ### Update preferences
 
 ```javascript
-const prefsPayload = { kinds: [1, 7, 16] }; // only replies, likes, reposts
+const prefsPayload = { kinds: [1, 7, 16] }; // comments/mentions, likes, reposts
 
 const event = {
   kind: 3083,
