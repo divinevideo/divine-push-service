@@ -99,6 +99,8 @@ even when the provider has not reported it invalid.
 
 Clients MAY send a preferences event to control which notification types they receive. Without this, the service sends all notification types it supports.
 
+Preferences are keyed by the user's pubkey and persist when individual device tokens are deregistered.
+
 ```json
 {
   "kind": 3083,
