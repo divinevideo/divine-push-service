@@ -166,7 +166,11 @@ tokens, disabled preferences, an existing delivery claim, and terminal FCM
 failures are successful no-op outcomes under the existing delivery contract.
 An all-token retryable FCM failure releases the claim and returns `5xx`, but the
 moderation caller is deliberately best-effort and does not retry; push failure
-must never delay or fail the moderation action.
+must never delay or fail the moderation action. The endpoint waits for delivery
+before responding, and one FCM operation can take up to 45 seconds (plus Redis
+work). The moderation service must therefore dispatch this request outside the
+moderation action's critical path or enforce a short caller-side timeout; it
+must not await the endpoint without an independent bound.
 
 The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
 

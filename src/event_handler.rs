@@ -1232,10 +1232,6 @@ fn renders_event_content(notification_type: NotificationType) -> bool {
     }
 }
 
-fn renders_sender(notification_type: NotificationType) -> bool {
-    !matches!(notification_type, NotificationType::DirectMessage)
-}
-
 /// The event-scoped copy, resolved at most once and only if it is needed.
 ///
 /// Resolving once per event rather than once per recipient is the point of the
@@ -1274,8 +1270,6 @@ fn renders_sender(notification_type: NotificationType) -> bool {
 /// notifications.
 struct LazyEventCopy {
     cell: tokio::sync::OnceCell<EventScopedCopy>,
-    /// Whether any target renders the event author.
-    needs_sender: bool,
     /// Whether any target renders the event body, decided over the whole target
     /// list rather than the one recipient that happens to resolve it first.
     needs_content: bool,
@@ -1285,9 +1279,6 @@ impl LazyEventCopy {
     fn for_targets(targets: &[NotificationTarget]) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            needs_sender: targets
-                .iter()
-                .any(|target| renders_sender(target.notification_type)),
             needs_content: targets
                 .iter()
                 .any(|target| renders_event_content(target.notification_type)),
@@ -1298,7 +1289,6 @@ impl LazyEventCopy {
     fn resolved(copy: EventScopedCopy) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new_with(Some(copy)),
-            needs_sender: false,
             needs_content: false,
         }
     }
@@ -1307,7 +1297,7 @@ impl LazyEventCopy {
         self.cell
             .get_or_init(|| {
                 let event = event.expect("only pre-resolved copies omit a Nostr event");
-                resolve_event_scoped_copy(state, event, self.needs_sender, self.needs_content)
+                resolve_event_scoped_copy(state, event, self.needs_content)
             })
             .await
     }
@@ -1320,16 +1310,8 @@ impl LazyEventCopy {
 async fn resolve_event_scoped_copy(
     state: &AppState,
     event: &Event,
-    needs_sender: bool,
     needs_content: bool,
 ) -> EventScopedCopy {
-    if !needs_sender && !needs_content {
-        return EventScopedCopy {
-            sender_name: String::new(),
-            formatted_content: None,
-        };
-    }
-
     let Some(mention_parser) = state.mention_parser_service.as_ref() else {
         return EventScopedCopy {
             sender_name: format_short_npub(&event.pubkey),
@@ -2161,22 +2143,23 @@ fn create_fcm_payload(
     data.insert("eventId".to_string(), event.id.to_hex());
     data.insert("title".to_string(), title.clone());
     data.insert("body".to_string(), body.clone());
+    data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
+    data.insert("senderName".to_string(), sender_name);
     data.insert("receiverPubkey".to_string(), target_pubkey.to_hex());
     data.insert(
         "receiverNpub".to_string(),
         target_pubkey.to_bech32().unwrap_or_default(),
     );
     data.insert("eventKind".to_string(), event.kind.as_u16().to_string());
-    data.insert("senderPubkey".to_string(), event.pubkey.to_hex());
-    data.insert("senderName".to_string(), sender_name);
     data.insert(
         "timestamp".to_string(),
         event.created_at.as_secs().to_string(),
     );
 
-    // Add authoritative routing/attribution target fields: the referenced
-    // event id and, for addressable targets (e.g. kind 34236 videos), the
-    // signed coordinate so the client never has to guess the target owner.
+    // Add authoritative routing/attribution target fields: the referenced event
+    // id and, for addressable targets (e.g. kind 34236 videos), the signed
+    // coordinate (`referencedAddress` + components) so the client never has to
+    // guess the target's owner.
     insert_trigger_reference_fields(&mut data, event);
 
     FcmPayload {
@@ -2873,18 +2856,6 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_messages_need_neither_sender_nor_content() {
-        assert!(!renders_sender(NotificationType::DirectMessage));
-
-        let copy = LazyEventCopy::for_targets(&[NotificationTarget {
-            recipient: Keys::generate().public_key(),
-            notification_type: NotificationType::DirectMessage,
-        }]);
-        assert!(!copy.needs_sender);
-        assert!(!copy.needs_content);
-    }
-
-    #[test]
     fn test_needs_content_is_decided_over_the_whole_target_list() {
         // The copy resolves on whichever recipient clears the gates first, which
         // need not be one that renders the body. Deciding `needs_content` from
@@ -3258,6 +3229,177 @@ mod tests {
         ] {
             assert!(!data.contains_key(omitted), "{omitted} must stay omitted");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_message_delivery_uses_preferences_and_recipient_dedup() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let recipient = Keys::generate().public_key();
+        let event_id = test_event_id(10_591);
+        let fcm_token = format!("direct-message-{}", recipient.to_hex());
+        redis_store::add_or_update_token(&pool, &recipient, &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        send_direct_message_notification(&state, event_id, &recipient, CancellationToken::new())
+            .await
+            .unwrap();
+        send_direct_message_notification(&state, event_id, &recipient, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let messages = mock_sender.get_sent_messages();
+        assert_eq!(messages.len(), 1, "a replay must not send twice");
+        let data = messages[0].1.data.as_ref().expect("data-only payload");
+        assert_eq!(data.get("type"), Some(&"directMessage".to_string()));
+        assert!(!data.contains_key("senderPubkey"));
+        assert!(!data.contains_key("senderName"));
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!(
+                "dedup:{}:{}",
+                event_id.to_hex(),
+                recipient.to_hex()
+            ))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &recipient, &fcm_token)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_direct_messages_are_skipped() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let recipient = Keys::generate().public_key();
+        let event_id = test_event_id(10_592);
+        let fcm_token = format!("direct-message-disabled-{}", recipient.to_hex());
+        redis_store::add_or_update_token(&pool, &recipient, &fcm_token)
+            .await
+            .unwrap();
+        preferences::set_user_preferences(
+            &pool,
+            &recipient.to_hex(),
+            &UserPreferences { kinds: vec![7] },
+        )
+        .await
+        .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+        send_direct_message_notification(&state, event_id, &recipient, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(mock_sender.get_sent_messages().is_empty());
+        preferences::delete_user_preferences(&pool, &recipient.to_hex())
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &recipient, &fcm_token)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_message_without_registered_tokens_is_a_successful_no_op() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let recipient = Keys::generate().public_key();
+        let mock_sender = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool,
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        send_direct_message_notification(
+            &state,
+            test_event_id(10_594),
+            &recipient,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(mock_sender.get_sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retryable_direct_message_failure_releases_the_claim() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let recipient = Keys::generate().public_key();
+        let event_id = test_event_id(10_593);
+        let fcm_token = format!("direct-message-retry-{}", recipient.to_hex());
+        redis_store::add_or_update_token(&pool, &recipient, &fcm_token)
+            .await
+            .unwrap();
+
+        let mock_sender = MockFcmSender::new();
+        mock_sender.set_error_for_token(
+            &fcm_token,
+            FcmError::RetryableInternal(Duration::from_secs(1)),
+        );
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock_sender.clone())),
+        );
+
+        let first = send_direct_message_notification(
+            &state,
+            event_id,
+            &recipient,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(
+            first,
+            Err(crate::error::ServiceError::RetryableDelivery(_))
+        ));
+
+        mock_sender.clear();
+        send_direct_message_notification(&state, event_id, &recipient, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            mock_sender.get_sent_messages().len(),
+            1,
+            "the released claim must allow the caller to retry"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!(
+                "dedup:{}:{}",
+                event_id.to_hex(),
+                recipient.to_hex()
+            ))
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &recipient, &fcm_token)
+            .await
+            .unwrap();
     }
 
     #[test]

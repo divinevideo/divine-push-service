@@ -438,6 +438,14 @@ impl Settings {
 mod tests {
     use super::*;
 
+    struct EnvVarGuard(&'static str);
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
     fn load_runtime_settings(filename: &str) -> Settings {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("config")
@@ -459,6 +467,20 @@ mod tests {
         assert!(prefs.kinds.contains(&16)); // Reposts
         assert!(prefs.kinds.contains(&1059)); // Classified direct messages
         assert!(prefs.kinds.contains(&30023)); // Long-form
+    }
+
+    #[test]
+    fn internal_api_token_accepts_the_documented_environment_override() {
+        const NAME: &str = "NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN";
+        let _guard = EnvVarGuard(NAME);
+        std::env::set_var(NAME, "environment-token");
+
+        let settings = Settings::new().unwrap();
+
+        assert_eq!(
+            settings.server.internal_api_token.as_deref(),
+            Some("environment-token")
+        );
     }
 
     #[test]
