@@ -48,14 +48,13 @@ The service watches for these event kinds and notifies the tagged recipient:
 | Type | Event Kind | Trigger |
 |------|-----------|---------|
 | Like | 7 | Reaction to user's note (p-tag) |
-| Comment | 1 | Reply to user's note (p-tag, with e-tag reference) |
 | Comment | 1111 | NIP-22 comment on a user's video or article (notifies root author `P` and parent author `p`) |
-| Mention | 1 | Note mentioning user (p-tag, no e-tag reference) |
+| Mention | 30023 | Long-form content mentioning user (p-tag) |
 | Mention | 34236 | Addressable video tagging user (p-tag) |
 | Repost | 16 | Repost of user's note (p-tag) |
 | NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
 
-> **Note:** diVine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one.
+> **Note:** Divine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one. The service does not subscribe to kind-1 text notes because Divine does not surface them in the notification Inbox.
 
 ## FCM Payload Format
 
@@ -123,7 +122,7 @@ When the triggering event is not addressable and carries no addressable referenc
 | `eventKind` | string | Triggering Nostr event kind as a string (e.g. "7") |
 | `timestamp` | string | Unix timestamp of the triggering event as a string |
 
-The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and plain-note mentions omit them.
+The `referenced*` coordinate fields are emitted when the triggering event is a kind 34236 addressable video, or when it references an addressable event via `a`/`A` — currently videos referenced by likes, reposts, and NIP-22 comments (kind 1111). Likes/reposts/comments on non-addressable targets and long-form mentions omit them.
 
 ### iOS APNS shape
 
@@ -205,7 +204,7 @@ Users can optionally send a Kind 3083 event to control which notification types 
 { "kinds": [1, 7, 16] }
 ```
 
-This is a list of event kinds the user wants notifications for. If no preferences are set, the service uses defaults: text notes (1), reactions (7), reposts (16), long-form content (30023), and videos from subscribed creators (34236). Kind 3 contact lists are not notification triggers in this service.
+These values are notification preference categories, not necessarily trigger event kinds. Category `1` controls comments and mentions triggered by supported kinds such as 1111, 30023, and 34236; it does not enable kind-1 text-note pushes. If no preferences are set, the service uses `[1, 7, 16, 30023, 34236]`. Kind 3 contact lists are not notification triggers in this service.
 
 ## New-post subscriptions ("bells")
 

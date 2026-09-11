@@ -35,10 +35,11 @@ The service subscribes to trigger events on its relay and notifies the tagged re
 |------|-----------|---------|
 | Like | 7 | Reaction to a user's note (NIP-25) |
 | Comment | 1111 | NIP-22 comment on a user's video or article |
-| Reply | 1 | Reply to a user's note |
-| Mention | 1 | Note mentioning a user |
+| Mention | 30023, 34236 | Long-form content or video mentioning a user |
 | Repost | 16 | Repost of a user's note (NIP-18) |
 | New post | 34236 | A creator the user subscribed to ("belled") published a video |
+
+Preference category `1` controls comment and mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes because Divine does not surface them in the notification Inbox.
 
 New-post notifications are the one type not anchored to a `p` tag on the trigger event. Recipients come from the subscriber's own NIP-51 list (kind 30000, `d=notify`), so the service resolves them from a Redis reverse index rather than from the video. They are rate-limited to one push per (subscriber, creator) per hour, and fan-out is paged and delivered with bounded concurrency so one popular creator cannot force one unbounded Redis read or sequential delivery loop. The in-app feed is not throttled. See [the protocol doc](docs/nip-xx-push-notifications.md) for the list shape.
 

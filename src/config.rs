@@ -249,7 +249,6 @@ pub struct NotificationSettings {
 
 fn default_event_kinds() -> Vec<u64> {
     vec![
-        1,     // Text notes (comments, mentions)
         7,     // Reactions/likes (NIP-25)
         16,    // Generic reposts (NIP-18)
         1111,  // NIP-22 comments
@@ -268,7 +267,7 @@ pub struct DefaultPreferences {
 
 fn default_preference_kinds() -> Vec<u16> {
     vec![
-        1,     // Text notes (comments, mentions)
+        1,     // Comment/mention category (triggered by kinds 1111, 30023, or 34236)
         7,     // Reactions/likes
         16,    // Reposts
         30023, // Long-form content
@@ -435,7 +434,7 @@ mod tests {
     #[test]
     fn test_default_preferences() {
         let prefs = DefaultPreferences::default();
-        assert!(prefs.kinds.contains(&1)); // Text notes
+        assert!(prefs.kinds.contains(&1)); // Comment/mention category
         assert!(!prefs.kinds.contains(&3)); // Contact lists are not notification triggers
         assert!(prefs.kinds.contains(&7)); // Likes
         assert!(prefs.kinds.contains(&16)); // Reposts
@@ -445,7 +444,7 @@ mod tests {
     #[test]
     fn test_default_event_kinds() {
         let kinds = default_event_kinds();
-        assert!(kinds.contains(&1)); // Text notes
+        assert!(!kinds.contains(&1)); // Text notes have no durable Inbox record
         assert!(!kinds.contains(&3)); // Contact lists are not notification triggers
         assert!(kinds.contains(&7)); // Reactions
         assert!(kinds.contains(&16)); // Reposts

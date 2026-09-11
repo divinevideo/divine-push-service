@@ -20,7 +20,7 @@ impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             kinds: vec![
-                1,     // Text notes (comments, mentions)
+                1,     // Comment/mention category
                 7,     // Reactions/likes
                 16,    // Reposts
                 30023, // Long-form content
@@ -65,8 +65,9 @@ impl NotificationType {
     pub fn kind(&self) -> u16 {
         match self {
             NotificationType::Like => 7,
-            NotificationType::Comment => 1,
-            NotificationType::Mention => 1, // Same as Comment - both are kind 1
+            // Kind 1 is the shared preference category for comments and mentions,
+            // including notifications triggered by kinds 1111, 30023, and 34236.
+            NotificationType::Comment | NotificationType::Mention => 1,
             NotificationType::Repost => 16,
             // Distinct from Mention's kind 1 even though video mentions also
             // arrive on kind 34236 events, so the two toggle independently.

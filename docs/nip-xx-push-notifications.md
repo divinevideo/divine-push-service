@@ -114,7 +114,7 @@ Preferences are keyed by the user's pubkey and persist when individual device to
 }
 ```
 
-The decrypted content is a JSON object with a `kinds` array listing the event kinds the user wants notifications for:
+The decrypted content is a JSON object with a `kinds` array listing service-defined notification categories. Category values do not have to match trigger event kinds. In this service, category `1` controls Comment and Mention notifications triggered by supported kinds such as 1111, 30023, and 34236; the service does not subscribe to kind-1 text notes.
 ```json
 { "kinds": [1, 3, 7, 16] }
 ```
@@ -236,7 +236,7 @@ await relay.publish(await signEvent(event, myPriv));
 ### Update preferences
 
 ```javascript
-const prefsPayload = { kinds: [1, 7, 16] }; // only replies, likes, reposts
+const prefsPayload = { kinds: [1, 7, 16] }; // comments/mentions, likes, reposts
 
 const event = {
   kind: 3083,
