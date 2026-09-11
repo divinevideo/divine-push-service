@@ -1,18 +1,48 @@
 //! HTTP server exposing health and Prometheus metrics.
 
+use async_trait::async_trait;
 use axum::{
-    extract::State,
-    http::{header, StatusCode},
-    routing::get,
+    extract::{Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
     Json, Router,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
+use nostr_sdk::{EventId, PublicKey};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::{Result, ServiceError};
+use crate::event_handler;
 use crate::health::{CriticalTask, TaskHealth};
 use crate::state::AppState;
+
+#[async_trait]
+trait DirectMessageDelivery: Send + Sync {
+    async fn deliver(&self, event_id: EventId, recipient: PublicKey) -> Result<()>;
+}
+
+struct AppDirectMessageDelivery {
+    app_state: Arc<AppState>,
+    token: CancellationToken,
+}
+
+#[async_trait]
+impl DirectMessageDelivery for AppDirectMessageDelivery {
+    async fn deliver(&self, event_id: EventId, recipient: PublicKey) -> Result<()> {
+        event_handler::send_direct_message_notification(
+            &self.app_state,
+            event_id,
+            &recipient,
+            self.token.clone(),
+        )
+        .await
+    }
+}
 
 /// Router state: the health endpoint reports both service identity and the
 /// liveness of the delivery tasks.
@@ -21,20 +51,40 @@ pub struct ServerState {
     service_pubkey: Option<String>,
     health: Arc<TaskHealth>,
     metrics: PrometheusHandle,
+    internal_api_token: Option<String>,
+    direct_message_delivery: Arc<dyn DirectMessageDelivery>,
 }
 
 impl ServerState {
     pub fn new(
-        service_pubkey: Option<String>,
+        app_state: Arc<AppState>,
         health: Arc<TaskHealth>,
         metrics: PrometheusHandle,
+        token: CancellationToken,
     ) -> Self {
         Self {
-            service_pubkey,
+            service_pubkey: app_state.service_pubkey_hex(),
             health,
             metrics,
+            internal_api_token: app_state.settings.server.internal_api_token.clone(),
+            direct_message_delivery: Arc::new(AppDirectMessageDelivery { app_state, token }),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectMessageRequest {
+    event_id: String,
+    recipient_pubkey: String,
+    message_type: DirectMessageType,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectMessageType {
+    ModerationNotice,
+    ReportOutcome,
 }
 
 /// Reports `503` when any critical task has died, so a pod whose delivery
@@ -78,10 +128,101 @@ async fn metrics(
     )
 }
 
+async fn direct_message(
+    State(state): State<ServerState>,
+    Json(request): Json<DirectMessageRequest>,
+) -> Response {
+    let event_id = match EventId::from_hex(&request.event_id) {
+        Ok(event_id) => event_id,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid eventId"),
+    };
+    let recipient = match PublicKey::from_hex(&request.recipient_pubkey) {
+        Ok(recipient) => recipient,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid recipientPubkey"),
+    };
+
+    tracing::info!(
+        event_id = %event_id,
+        recipient = %recipient,
+        message_type = ?request.message_type,
+        "Processing trusted direct-message push request"
+    );
+
+    match state
+        .direct_message_delivery
+        .deliver(event_id, recipient)
+        .await
+    {
+        Ok(()) => {
+            crate::metrics::internal_dm_request("processed");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(event_id = %event_id, error = %error, "Direct-message push request failed");
+            let (status, outcome) = match error {
+                ServiceError::Cancelled | ServiceError::RetryableDelivery(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "retryable_failure")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_failure"),
+            };
+            crate::metrics::internal_dm_request(outcome);
+            error_response(status, "Direct-message push request failed")
+        }
+    }
+}
+
+async fn require_internal_api_token(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected_token) = state.internal_api_token.as_deref() else {
+        crate::metrics::internal_dm_request("disabled");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Internal push endpoint is not configured",
+        );
+    };
+
+    if !has_bearer_token(request.headers(), expected_token) {
+        crate::metrics::internal_dm_request("unauthorized");
+        return error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+
+    next.run(request).await
+}
+
+fn has_bearer_token(headers: &HeaderMap, expected_token: &str) -> bool {
+    let Some((scheme, provided_token)) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+    else {
+        return false;
+    };
+
+    if !scheme.eq_ignore_ascii_case("Bearer") || provided_token.is_empty() {
+        return false;
+    }
+
+    blake3::hash(provided_token.as_bytes()) == blake3::hash(expected_token.as_bytes())
+}
+
+fn error_response(status: StatusCode, message: &'static str) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/metrics", get(metrics))
+        .route(
+            "/internal/v1/direct-message",
+            post(direct_message).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_internal_api_token,
+            )),
+        )
         .with_state(state)
 }
 
@@ -92,9 +233,10 @@ pub async fn run_server(
     token: CancellationToken,
 ) {
     let app = router(ServerState::new(
-        app_state.service_pubkey_hex(),
+        Arc::clone(&app_state),
         health,
         metrics,
+        token.clone(),
     ));
 
     // Failure paths below deliberately just return. Cancelling the token here
@@ -143,11 +285,75 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use nostr_sdk::Client;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    #[derive(Default)]
+    struct MockDelivery {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DirectMessageDelivery for MockDelivery {
+        async fn deliver(&self, _event_id: EventId, _recipient: PublicKey) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct FailingDelivery(ServiceError);
+
+    #[async_trait]
+    impl DirectMessageDelivery for FailingDelivery {
+        async fn deliver(&self, _event_id: EventId, _recipient: PublicKey) -> Result<()> {
+            Err(match &self.0 {
+                ServiceError::Cancelled => ServiceError::Cancelled,
+                ServiceError::Internal(message) => ServiceError::Internal(message.clone()),
+                _ => unreachable!("test only uses supported errors"),
+            })
+        }
+    }
 
     fn server_state(health: Arc<TaskHealth>) -> ServerState {
         let metrics = PrometheusBuilder::new().build_recorder().handle();
-        ServerState::new(Some("pubkey-hex".to_string()), health, metrics)
+        ServerState {
+            service_pubkey: Some("pubkey-hex".to_string()),
+            health,
+            metrics,
+            internal_api_token: Some("test-token".to_string()),
+            direct_message_delivery: Arc::new(MockDelivery::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_state_uses_the_runtime_internal_api_token() {
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.server.internal_api_token = Some("runtime-token".to_string());
+        let redis_pool = crate::redis_store::create_pool(&settings.redis.url, 1)
+            .await
+            .unwrap();
+        let app_state = Arc::new(AppState {
+            settings,
+            redis_pool,
+            fcm_client: Arc::new(crate::fcm_sender::FcmClient::new_with_impl(Box::new(
+                crate::fcm_sender::MockFcmSender::new(),
+            ))),
+            service_keys: None,
+            crypto_service: None,
+            nostr_client: Arc::new(Client::default()),
+            profile_client: Arc::new(Client::default()),
+            mention_parser_service: None,
+        });
+
+        let state = ServerState::new(
+            app_state,
+            Arc::new(TaskHealth::new()),
+            PrometheusBuilder::new().build_recorder().handle(),
+            CancellationToken::new(),
+        );
+
+        assert_eq!(state.internal_api_token.as_deref(), Some("runtime-token"));
     }
 
     async fn get_health(health: Arc<TaskHealth>) -> (StatusCode, serde_json::Value) {
@@ -233,11 +439,13 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         ::metrics::with_local_recorder(&recorder, crate::metrics::event_received);
-        let response = router(ServerState::new(
-            Some("pubkey-hex".to_string()),
-            Arc::new(TaskHealth::new()),
-            handle,
-        ))
+        let response = router(ServerState {
+            service_pubkey: Some("pubkey-hex".to_string()),
+            health: Arc::new(TaskHealth::new()),
+            metrics: handle,
+            internal_api_token: Some("test-token".to_string()),
+            direct_message_delivery: Arc::new(MockDelivery::default()),
+        })
         .oneshot(
             Request::builder()
                 .uri("/metrics")
@@ -255,5 +463,157 @@ mod tests {
         assert!(String::from_utf8(body.to_vec())
             .unwrap()
             .contains("push_events_received_total 1"));
+    }
+
+    fn direct_message_request(token: Option<&str>, body: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/direct-message")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_message_requires_the_internal_bearer_token() {
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(direct_message_request(
+                Some("wrong-token"),
+                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn direct_message_is_unavailable_without_a_configured_token() {
+        let mut state = server_state(Arc::new(TaskHealth::new()));
+        state.internal_api_token = None;
+        let response = router(state)
+            .oneshot(direct_message_request(
+                None,
+                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn direct_message_accepts_a_case_insensitive_bearer_scheme() {
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/direct-message")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "bearer test-token")
+                    .body(Body::from(r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn direct_message_authenticates_before_parsing_the_body() {
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(direct_message_request(
+                Some("wrong-token"),
+                r#"{"messageType":"reaction"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn direct_message_rejects_unclassified_messages() {
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(direct_message_request(
+                Some("test-token"),
+                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"reaction"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn direct_message_delivers_a_valid_classified_request() {
+        let delivery = Arc::new(MockDelivery::default());
+        let state = ServerState {
+            service_pubkey: Some("pubkey-hex".to_string()),
+            health: Arc::new(TaskHealth::new()),
+            metrics: PrometheusBuilder::new().build_recorder().handle(),
+            internal_api_token: Some("test-token".to_string()),
+            direct_message_delivery: delivery.clone(),
+        };
+        let response = router(state)
+            .oneshot(direct_message_request(
+                Some("test-token"),
+                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(delivery.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_message_hides_internal_error_details() {
+        let state = ServerState {
+            service_pubkey: Some("pubkey-hex".to_string()),
+            health: Arc::new(TaskHealth::new()),
+            metrics: PrometheusBuilder::new().build_recorder().handle(),
+            internal_api_token: Some("test-token".to_string()),
+            direct_message_delivery: Arc::new(FailingDelivery(ServiceError::Internal(
+                "private Redis host".to_string(),
+            ))),
+        };
+        let response = router(state)
+            .oneshot(direct_message_request(
+                Some("test-token"),
+                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("private Redis host"));
+    }
+
+    #[tokio::test]
+    async fn direct_message_reports_shutdown_as_retryable() {
+        let state = ServerState {
+            service_pubkey: Some("pubkey-hex".to_string()),
+            health: Arc::new(TaskHealth::new()),
+            metrics: PrometheusBuilder::new().build_recorder().handle(),
+            internal_api_token: Some("test-token".to_string()),
+            direct_message_delivery: Arc::new(FailingDelivery(ServiceError::Cancelled)),
+        };
+        let response = router(state)
+            .oneshot(direct_message_request(
+                Some("test-token"),
+                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

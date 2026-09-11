@@ -9,6 +9,7 @@ pub const FCM_SENDS_ATTEMPTED_TOTAL: &str = "push_fcm_sends_attempted_total";
 pub const FCM_SENDS_SUCCEEDED_TOTAL: &str = "push_fcm_sends_succeeded_total";
 pub const FCM_SENDS_FAILED_TOTAL: &str = "push_fcm_sends_failed_total";
 pub const NEW_POST_FANOUT_RETRIES_TOTAL: &str = "push_new_post_fanout_retries_total";
+pub const INTERNAL_DM_REQUESTS_TOTAL: &str = "push_internal_dm_requests_total";
 pub const TOKENS_PRUNED_TOTAL: &str = "push_tokens_pruned_total";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
@@ -42,6 +43,10 @@ pub fn init() -> PrometheusHandle {
     metrics::describe_counter!(
         NEW_POST_FANOUT_RETRIES_TOTAL,
         "Durable new-post fan-out retries and terminal expiry, counted by bounded reason and outcome"
+    );
+    metrics::describe_counter!(
+        INTERNAL_DM_REQUESTS_TOTAL,
+        "Internal direct-message requests, counted by bounded outcome"
     );
     metrics::describe_counter!(
         TOKENS_PRUNED_TOTAL,
@@ -87,6 +92,10 @@ pub fn new_post_fanout_retry(reason: &'static str, outcome: &'static str) {
     .increment(1);
 }
 
+pub fn internal_dm_request(outcome: &'static str) {
+    metrics::counter!(INTERNAL_DM_REQUESTS_TOTAL, "outcome" => outcome).increment(1);
+}
+
 pub fn tokens_pruned(reason: &'static str, count: u64) {
     metrics::counter!(TOKENS_PRUNED_TOTAL, "reason" => reason).increment(count);
 }
@@ -111,6 +120,7 @@ mod tests {
             fcm_send_succeeded();
             fcm_send_failed("unauthorized");
             new_post_fanout_retry("delivery", "scheduled");
+            internal_dm_request("unauthorized");
             tokens_pruned("invalid", 1);
         });
 
@@ -140,6 +150,10 @@ mod tests {
             rendered.contains(
                 r#"push_new_post_fanout_retries_total{reason="delivery",outcome="scheduled"} 1"#
             ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_internal_dm_requests_total{outcome="unauthorized"} 1"#),
             "{rendered}"
         );
         assert!(

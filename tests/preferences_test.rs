@@ -139,6 +139,7 @@ async fn test_notification_type_filtering_with_kinds() {
     assert!(!NotificationType::Comment.is_enabled(&prefs)); // kind 1 ✗
     assert!(!NotificationType::Mention.is_enabled(&prefs)); // kind 1 ✗
     assert!(NotificationType::Repost.is_enabled(&prefs)); // kind 16 ✓
+    assert!(!NotificationType::DirectMessage.is_enabled(&prefs)); // kind 1059 ✗
 }
 
 #[tokio::test]
@@ -211,6 +212,10 @@ fn test_notification_type_display_names() {
     assert_eq!(NotificationType::Comment.display_name(), "comment");
     assert_eq!(NotificationType::Mention.display_name(), "mention");
     assert_eq!(NotificationType::Repost.display_name(), "repost");
+    assert_eq!(
+        NotificationType::DirectMessage.display_name(),
+        "directMessage"
+    );
 }
 
 #[test]
@@ -219,6 +224,7 @@ fn test_notification_type_kind_values() {
     assert_eq!(NotificationType::Comment.kind(), 1);
     assert_eq!(NotificationType::Mention.kind(), 1); // Same as Comment
     assert_eq!(NotificationType::Repost.kind(), 16);
+    assert_eq!(NotificationType::DirectMessage.kind(), 1059);
 }
 
 #[test]
@@ -243,6 +249,7 @@ fn test_empty_preferences_disables_all() {
     assert!(!NotificationType::Comment.is_enabled(&prefs));
     assert!(!NotificationType::Mention.is_enabled(&prefs));
     assert!(!NotificationType::Repost.is_enabled(&prefs));
+    assert!(!NotificationType::DirectMessage.is_enabled(&prefs));
 }
 
 #[test]

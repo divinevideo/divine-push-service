@@ -23,6 +23,7 @@ impl Default for UserPreferences {
                 1,     // Comment/mention category
                 7,     // Reactions/likes
                 16,    // Reposts
+                1059,  // Direct messages from classified internal hooks
                 30023, // Long-form content
                 34236, // Videos from subscribed creators (new-post "bells")
             ],
@@ -52,6 +53,12 @@ pub enum NotificationType {
     Comment,
     Mention,
     Repost,
+    /// A NIP-17 gift wrap addressed to the recipient.
+    ///
+    /// The wrapper reveals neither the real sender nor the message, so its push
+    /// copy must remain generic.
+    // Routed only from authenticated, classified internal delivery requests.
+    DirectMessage,
     /// A creator the recipient subscribed to published a new video.
     ///
     /// Unlike every other variant this is not triggered by someone acting on the
@@ -69,6 +76,7 @@ impl NotificationType {
             // including notifications triggered by kinds 1111, 30023, and 34236.
             NotificationType::Comment | NotificationType::Mention => 1,
             NotificationType::Repost => 16,
+            NotificationType::DirectMessage => 1059,
             // Distinct from Mention's kind 1 even though video mentions also
             // arrive on kind 34236 events, so the two toggle independently.
             NotificationType::NewPost => 34236,
@@ -87,6 +95,7 @@ impl NotificationType {
             NotificationType::Comment => "comment",
             NotificationType::Mention => "mention",
             NotificationType::Repost => "repost",
+            NotificationType::DirectMessage => "directMessage",
             NotificationType::NewPost => "newPost",
         }
     }
@@ -189,6 +198,7 @@ mod tests {
         assert!(!prefs.kinds.contains(&3));
         assert!(prefs.kinds.contains(&7));
         assert!(prefs.kinds.contains(&16));
+        assert!(prefs.kinds.contains(&1059));
         assert!(prefs.kinds.contains(&30023));
     }
 
@@ -198,6 +208,7 @@ mod tests {
         assert_eq!(NotificationType::Comment.kind(), 1);
         assert_eq!(NotificationType::Mention.kind(), 1);
         assert_eq!(NotificationType::Repost.kind(), 16);
+        assert_eq!(NotificationType::DirectMessage.kind(), 1059);
     }
 
     #[test]
@@ -207,12 +218,14 @@ mod tests {
         assert!(NotificationType::Like.is_enabled(&prefs));
         assert!(NotificationType::Comment.is_enabled(&prefs));
         assert!(NotificationType::Mention.is_enabled(&prefs));
+        assert!(NotificationType::DirectMessage.is_enabled(&prefs));
 
         // Only kind 7 enabled
         let prefs = UserPreferences { kinds: vec![7] };
         assert!(NotificationType::Like.is_enabled(&prefs));
         assert!(!NotificationType::Comment.is_enabled(&prefs));
         assert!(!NotificationType::Mention.is_enabled(&prefs));
+        assert!(!NotificationType::DirectMessage.is_enabled(&prefs));
     }
 
     #[test]
@@ -230,6 +243,21 @@ mod tests {
     #[test]
     fn test_new_post_kind_is_video_kind() {
         assert_eq!(NotificationType::NewPost.kind(), 34236);
+    }
+
+    #[test]
+    fn test_direct_message_preference_uses_gift_wrap_kind() {
+        let enabled = UserPreferences { kinds: vec![1059] };
+        let disabled = UserPreferences {
+            kinds: vec![1, 7, 16],
+        };
+
+        assert!(NotificationType::DirectMessage.is_enabled(&enabled));
+        assert!(!NotificationType::DirectMessage.is_enabled(&disabled));
+        assert_eq!(
+            NotificationType::DirectMessage.display_name(),
+            "directMessage"
+        );
     }
 
     #[test]

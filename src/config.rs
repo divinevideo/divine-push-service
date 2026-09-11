@@ -224,11 +224,17 @@ fn default_token_max_age() -> i64 {
 pub struct ServerSettings {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
+    /// Bearer token for trusted internal notification requests.
+    ///
+    /// The internal endpoint is unavailable when this is unset.
+    #[serde(default)]
+    pub internal_api_token: Option<String>,
 }
 
 fn default_server_settings() -> ServerSettings {
     ServerSettings {
         listen_addr: default_listen_addr(),
+        internal_api_token: None,
     }
 }
 
@@ -270,6 +276,7 @@ fn default_preference_kinds() -> Vec<u16> {
         1,     // Comment/mention category (triggered by kinds 1111, 30023, or 34236)
         7,     // Reactions/likes
         16,    // Reposts
+        1059,  // Direct messages from classified internal hooks
         30023, // Long-form content
         34236, // Videos from subscribed creators (new-post "bells")
     ]
@@ -404,6 +411,17 @@ impl Settings {
             }
         }
 
+        if self
+            .server
+            .internal_api_token
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(ConfigError::Message(
+                "server.internal_api_token must not be empty when configured".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -418,6 +436,14 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvVarGuard(&'static str);
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
 
     fn load_runtime_settings(filename: &str) -> Settings {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -438,7 +464,22 @@ mod tests {
         assert!(!prefs.kinds.contains(&3)); // Contact lists are not notification triggers
         assert!(prefs.kinds.contains(&7)); // Likes
         assert!(prefs.kinds.contains(&16)); // Reposts
+        assert!(prefs.kinds.contains(&1059)); // Classified direct messages
         assert!(prefs.kinds.contains(&30023)); // Long-form
+    }
+
+    #[test]
+    fn internal_api_token_accepts_the_documented_environment_override() {
+        const NAME: &str = "NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN";
+        let _guard = EnvVarGuard(NAME);
+        std::env::set_var(NAME, "environment-token");
+
+        let settings = Settings::new().unwrap();
+
+        assert_eq!(
+            settings.server.internal_api_token.as_deref(),
+            Some("environment-token")
+        );
     }
 
     #[test]
@@ -556,6 +597,17 @@ mod tests {
                 "video-coordinate delivery records must outlive event-id claims"
             );
         }
+    }
+
+    #[test]
+    fn test_empty_internal_api_token_is_rejected() {
+        let mut settings = load_runtime_settings("settings.yaml");
+        settings.server.internal_api_token = Some(String::new());
+
+        let error = settings
+            .validate()
+            .expect_err("empty token must be rejected");
+        assert!(error.to_string().contains("server.internal_api_token"));
     }
 
     #[test]
