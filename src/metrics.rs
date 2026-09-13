@@ -14,6 +14,9 @@ pub const TOKENS_PRUNED_TOTAL: &str = "push_tokens_pruned_total";
 pub const COALESCED_SENDS_TOTAL: &str = "push_coalesced_sends_total";
 pub const COALESCE_OLDEST_DUE_AGE_SECONDS: &str = "push_coalesce_oldest_due_age_seconds";
 pub const THROTTLED_RECIPIENTS_TOTAL: &str = "push_throttled_recipients_total";
+pub const COALESCE_SKIPPED_TOTAL: &str = "push_coalesce_skipped_total";
+pub const COALESCE_DEFERRED_TOTAL: &str = "push_coalesce_deferred_total";
+pub const COALESCE_FLUSH_FAILURES_TOTAL: &str = "push_coalesce_flush_failures_total";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
 
@@ -61,11 +64,23 @@ pub fn init() -> PrometheusHandle {
     );
     metrics::describe_gauge!(
         COALESCE_OLDEST_DUE_AGE_SECONDS,
-        "Age of the claimed coalescing group's bucket deadline at claim time"
+        "Age in seconds of the oldest coalescing group that is due now, measured against the Redis server clock and sampled on every worker pass"
     );
     metrics::describe_counter!(
         THROTTLED_RECIPIENTS_TOTAL,
         "Would-be immediate like/repost pushes demoted into the coalescing bucket by the per-recipient throttle"
+    );
+    metrics::describe_counter!(
+        COALESCE_SKIPPED_TOTAL,
+        "Coalescing work that reached a non-delivery terminal outcome, counted by bounded reason (including logical expiry and dangling due members)"
+    );
+    metrics::describe_counter!(
+        COALESCE_DEFERRED_TOTAL,
+        "Coalescing flushes deferred without consuming an attempt, counted by bounded reason"
+    );
+    metrics::describe_counter!(
+        COALESCE_FLUSH_FAILURES_TOTAL,
+        "Coalescing flushes that failed before a terminal outcome, counted by bounded reason"
     );
     metrics::describe_gauge!(
         LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS,
@@ -127,6 +142,18 @@ pub fn throttled_recipient(notification_type: &'static str) {
     metrics::counter!(THROTTLED_RECIPIENTS_TOTAL, "type" => notification_type).increment(1);
 }
 
+pub fn coalesce_skipped(reason: &'static str, count: u64) {
+    metrics::counter!(COALESCE_SKIPPED_TOTAL, "reason" => reason).increment(count);
+}
+
+pub fn coalesce_deferred(reason: &'static str, count: u64) {
+    metrics::counter!(COALESCE_DEFERRED_TOTAL, "reason" => reason).increment(count);
+}
+
+pub fn coalesce_flush_failure(reason: &'static str, count: u64) {
+    metrics::counter!(COALESCE_FLUSH_FAILURES_TOTAL, "reason" => reason).increment(count);
+}
+
 fn set_last_event_processed_timestamp(timestamp: f64) {
     metrics::gauge!(LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS).set(timestamp);
 }
@@ -152,6 +179,10 @@ mod tests {
             coalesced_send("like");
             coalesce_oldest_due_age(12.0);
             throttled_recipient("repost");
+            coalesce_skipped("expired", 1);
+            coalesce_skipped("dangling_due", 2);
+            coalesce_deferred("recipient_throttled", 1);
+            coalesce_flush_failure("timeout", 1);
         });
 
         handle.run_upkeep();
@@ -200,6 +231,22 @@ mod tests {
         );
         assert!(
             rendered.contains(r#"push_throttled_recipients_total{type="repost"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="expired"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="dangling_due"} 2"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_deferred_total{reason="recipient_throttled"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_flush_failures_total{reason="timeout"} 1"#),
             "{rendered}"
         );
         assert!(

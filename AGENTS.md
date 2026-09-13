@@ -91,12 +91,12 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `notify_subs_ts:{subscriber}` - `created_at:event_id` of the last applied notify list (out-of-order guard). The id resolves a `created_at` tie by NIP-01's lowest-id rule; a bare integer from an earlier build still reads as a timestamp with no known id
 - `notify_watchers:{creator}` - Subscribers watching this creator (hot read path)
 - `notify_rate:{subscriber}:{creator}` - New-post rate-limit window marker
-- `coalesce:g:{type}:{owner}:{target}:{bucket}` - Like/repost bucket group (pending/immediate counts, first actor, routing fields, flush lease). TTL `coalesce_window_secs + coalesce_logical_expiry_grace_secs`
+- `coalesce:g:{type}:{owner}:{target}:{bucket}` - Like/repost bucket group (pending/immediate counts, first actor, routing fields, flush lease, absolute `expires_at`). Physical TTL `coalesce_group_ttl_secs + coalesce_logical_expiry_grace_secs`; the flush and retry paths delete and count it at `expires_at` while it is still readable
 - `coalesce:hll:{type}:{owner}:{target}:{bucket}` - HyperLogLog of distinct buffered actors for one group
 - `coalesce:disp:{event_id}:{recipient}` - Per-event ingest disposition (`i:` immediate / `b:` buffered), so a replay reproduces the original decision and collapse id
 - `coalesce:due` - Sorted set of groups due for flush, scored by bucket deadline
 - `coalesce:leases` - Sorted set of groups owned by an in-flight flush, scored by lease expiry; reconciliation never re-adds a group with nothing pending
-- `coalesce:throttle:{owner}` - Per-recipient token bucket for immediate like/repost pushes
+- `coalesce:throttle:{owner}` - Per-recipient token bucket shared by immediate like/repost pushes and summary flushes: a summary with an empty bucket defers to the next refill instead of sending
 
 ### Notification Types
 | Type | Trigger Kind | Description |

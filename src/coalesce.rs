@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nostr_sdk::{PublicKey, Timestamp, ToBech32};
+use nostr_sdk::{PublicKey, ToBech32};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -117,11 +117,14 @@ pub struct Ingest<'a> {
     pub target: &'a CoalesceTarget,
 }
 
-/// A claim on one due group. `token` is this worker's ownership proof.
+/// A claim on one due group. `token` is this worker's ownership proof;
+/// `claimed_at` is the Redis server time the claim was granted, which the
+/// logical-expiry checks compare against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupClaim {
     pub group_id: String,
     pub token: String,
+    pub claimed_at: u64,
 }
 
 /// The buffered state of one group, read after its deadline.
@@ -132,6 +135,9 @@ pub struct GroupSnapshot {
     pub owner: String,
     pub target: String,
     pub due: u64,
+    /// Absolute logical lifetime, from the Redis server clock. 0 on a legacy
+    /// group that predates the field; such a group is flushed, never dropped.
+    pub expires_at: u64,
     pub pending: u64,
     /// Immediate sends already spent in this bucket.
     pub immediate: u64,
@@ -161,6 +167,76 @@ fn disposition_key(event_id: &str, recipient: &PublicKey) -> String {
     format!("{DISP_PREFIX}{event_id}:{}", recipient.to_hex())
 }
 
+/// TTL for the per-recipient token bucket.
+///
+/// The bucket has refilled to capacity after `capacity * refill_secs`, so a
+/// fully idle bucket is indistinguishable from an absent one; the
+/// window-plus-grace floor keeps it alive at least as long as the groups it
+/// defers.
+fn throttle_key_ttl(settings: &ServiceSettings) -> u64 {
+    let disp_ttl = settings
+        .coalesce_window_secs
+        .saturating_add(settings.coalesce_logical_expiry_grace_secs);
+    settings
+        .recipient_throttle_capacity
+        .saturating_mul(settings.recipient_throttle_refill_secs)
+        .saturating_mul(2)
+        .max(disp_ttl)
+}
+
+/// Spend one token from a recipient's bucket, refilling lazily.
+///
+/// The immediate path spends a token inside the ingest script. The flush path
+/// spends one here, so a summary is an emitted notification sharing the same
+/// per-recipient budget: a boundary burst of summaries cannot exceed the
+/// bucket, and the remainder defers to a refill.
+pub async fn consume_recipient_token(
+    pool: &RedisPool,
+    owner_hex: &str,
+    settings: &ServiceSettings,
+) -> Result<bool> {
+    const TOKEN_SCRIPT: &str = r#"
+        local tkey = KEYS[1]
+        local capacity = tonumber(ARGV[1])
+        local refill_secs = tonumber(ARGV[2])
+        local throttle_ttl = tonumber(ARGV[3])
+
+        local now_ms = tonumber(redis.call('TIME')[1]) * 1000
+        local tokens = tonumber(redis.call('HGET', tkey, 'tokens'))
+        local ts = tonumber(redis.call('HGET', tkey, 'ts'))
+        if tokens == nil then tokens = capacity end
+        if ts == nil then ts = now_ms end
+        local elapsed = now_ms - ts
+        if elapsed < 0 then elapsed = 0 end
+        tokens = math.min(capacity, tokens + elapsed / (refill_secs * 1000))
+        if tokens >= 1 then
+          tokens = tokens - 1
+          redis.call('HSET', tkey, 'tokens', tokens, 'ts', now_ms)
+          redis.call('EXPIRE', tkey, throttle_ttl)
+          return 1
+        end
+        redis.call('HSET', tkey, 'tokens', tokens, 'ts', now_ms)
+        redis.call('EXPIRE', tkey, throttle_ttl)
+        return 0
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+
+    let consumed: i64 = redis::Script::new(TOKEN_SCRIPT)
+        .key(format!("{THROTTLE_PREFIX}{owner_hex}"))
+        .arg(settings.recipient_throttle_capacity)
+        .arg(settings.recipient_throttle_refill_secs)
+        .arg(throttle_key_ttl(settings))
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(consumed == 1)
+}
+
 /// Decide and record one like/repost ingest atomically.
 ///
 /// Returns the stored decision on a replay. Callers must hold the
@@ -179,6 +255,9 @@ pub async fn ingest(
 
         local window = tonumber(ARGV[1])
         local limit = tonumber(ARGV[2])
+        -- Physical TTL: the logical lifetime plus the cleanup grace. The
+        -- dropping paths delete and count at the logical lifetime, while this
+        -- longer TTL only reclaims genuinely abandoned state.
         local ttl = tonumber(ARGV[3])
         local capacity = tonumber(ARGV[4])
         local refill_secs = tonumber(ARGV[5])
@@ -198,6 +277,8 @@ pub async fn ingest(
         local ref_kind = ARGV[19]
         local ref_author = ARGV[20]
         local ref_dtag = ARGV[21]
+        local logical_ttl = tonumber(ARGV[22])
+        local disp_ttl = tonumber(ARGV[23])
 
         -- Replay: the same decision and therefore the same collapse id.
         local stored = redis.call('GET', disp_key)
@@ -238,6 +319,7 @@ pub async fn ingest(
         end
 
         redis.call('HSETNX', gkey, 'due', due_at)
+        redis.call('HSETNX', gkey, 'expires_at', now + logical_ttl)
         redis.call('HSETNX', gkey, 'owner', owner)
         redis.call('HSETNX', gkey, 'type', ntype)
         redis.call('HSETNX', gkey, 'target', target)
@@ -255,7 +337,7 @@ pub async fn ingest(
         if send_immediately then
           redis.call('HINCRBY', gkey, 'immediate', 1)
           redis.call('EXPIRE', gkey, ttl)
-          redis.call('SET', disp_key, 'i:' .. gid, 'EX', ttl)
+          redis.call('SET', disp_key, 'i:' .. gid, 'EX', disp_ttl)
           return {1, gid}
         end
 
@@ -270,7 +352,7 @@ pub async fn ingest(
         redis.call('EXPIRE', gkey, ttl)
         redis.call('EXPIRE', hll_prefix .. gid, ttl)
         redis.call('ZADD', due_key, 'NX', due_at, gid)
-        redis.call('SET', disp_key, 'b:' .. gid, 'EX', ttl)
+        redis.call('SET', disp_key, 'b:' .. gid, 'EX', disp_ttl)
         if throttled then
           return {3, gid}
         end
@@ -283,14 +365,14 @@ pub async fn ingest(
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
 
     let window = settings.coalesce_window_secs;
-    let ttl = window.saturating_add(settings.coalesce_logical_expiry_grace_secs);
-    // One full refill cycle on each side, so the bucket survives idle gaps
-    // between pushes without lingering forever.
-    let throttle_ttl = settings
-        .recipient_throttle_capacity
-        .saturating_mul(settings.recipient_throttle_refill_secs)
-        .saturating_mul(2)
-        .max(ttl);
+    let grace = settings.coalesce_logical_expiry_grace_secs;
+    // Two lifetimes: the logical one the dropping paths count while the group
+    // is still readable, and the longer physical TTL that only reclaims
+    // genuinely abandoned state.
+    let logical_ttl = settings.coalesce_group_ttl_secs;
+    let physical_ttl = logical_ttl.saturating_add(grace);
+    let disp_ttl = window.saturating_add(grace);
+    let throttle_ttl = throttle_key_ttl(settings);
 
     let ref_event_id = ingest.target.event_id.clone().unwrap_or_default();
     let (ref_address, ref_kind, ref_author, ref_dtag) = match &ingest.target.address {
@@ -308,7 +390,7 @@ pub async fn ingest(
         .key(DUE_KEY)
         .arg(window)
         .arg(settings.coalesce_immediate_limit)
-        .arg(ttl)
+        .arg(physical_ttl)
         .arg(settings.recipient_throttle_capacity)
         .arg(settings.recipient_throttle_refill_secs)
         .arg(throttle_ttl)
@@ -327,6 +409,8 @@ pub async fn ingest(
         .arg(ref_kind)
         .arg(ref_author)
         .arg(ref_dtag)
+        .arg(logical_ttl)
+        .arg(disp_ttl)
         .invoke_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
@@ -369,6 +453,8 @@ pub async fn claim_due_group(pool: &RedisPool, lease_secs: u64) -> Result<Option
         local max_dangling = tonumber(ARGV[6])
 
         local now = tonumber(redis.call('TIME')[1])
+        local expired_drops = 0
+        local dangling_drops = 0
 
         -- Reconcile expired leases before taking new work.
         local expired = redis.call('ZRANGEBYSCORE', leases_key, '-inf', now, 'LIMIT', 0, max_recovery)
@@ -377,12 +463,20 @@ pub async fn claim_due_group(pool: &RedisPool, lease_secs: u64) -> Result<Option
           local pending = tonumber(redis.call('HGET', gkey, 'pending') or '0')
           redis.call('ZREM', leases_key, gid)
           if pending > 0 then
-            -- Only expired entries are iterated, so no live flush owns this
-            -- group; `due` is the index that can still hold a competing live
-            -- entry, and re-adding must be skipped when it does. The `leases`
-            -- predicate always reads false at this point (the expired member
-            -- was removed above) and is kept as a defensive assertion only.
-            if redis.call('ZSCORE', due_key, gid) == false and redis.call('ZSCORE', leases_key, gid) == false then
+            local expires_at = tonumber(redis.call('HGET', gkey, 'expires_at') or '0')
+            if expires_at > 0 and now >= expires_at then
+              -- Reached its logical lifetime while queued: drop it here, while
+              -- the hash still names the work, rather than letting the physical
+              -- TTL erase the evidence silently. Counted by the caller.
+              redis.call('DEL', gkey)
+              redis.call('DEL', hll_prefix .. gid)
+              expired_drops = expired_drops + 1
+            elseif redis.call('ZSCORE', due_key, gid) == false and redis.call('ZSCORE', leases_key, gid) == false then
+              -- Only expired entries are iterated, so no live flush owns this
+              -- group; `due` is the index that can still hold a competing live
+              -- entry, and re-adding must be skipped when it does. The `leases`
+              -- predicate always reads false at this point (the expired member
+              -- was removed above) and is kept as a defensive assertion only.
               local due_at = tonumber(redis.call('HGET', gkey, 'due') or '0')
               if due_at <= 0 then due_at = now end
               redis.call('ZADD', due_key, due_at, gid)
@@ -399,16 +493,18 @@ pub async fn claim_due_group(pool: &RedisPool, lease_secs: u64) -> Result<Option
         for _, gid in ipairs(candidates) do
           local gkey = group_prefix .. gid
           if redis.call('EXISTS', gkey) == 0 then
-            -- The group hash expired while queued; drop the dangling member.
+            -- Defensive: physical TTL, eviction, or a legacy build removed the
+            -- group under a due member. Counted by the caller.
             redis.call('ZREM', due_key, gid)
+            dangling_drops = dangling_drops + 1
           else
             redis.call('ZREM', due_key, gid)
             redis.call('ZADD', leases_key, now + lease_secs, gid)
             redis.call('HSET', gkey, 'lease', token)
-            return gid
+            return {gid, expired_drops, dangling_drops, now}
           end
         end
-        return false
+        return {'', expired_drops, dangling_drops, now}
     "#;
 
     let mut conn = pool
@@ -417,31 +513,70 @@ pub async fn claim_due_group(pool: &RedisPool, lease_secs: u64) -> Result<Option
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
     let token = Uuid::new_v4().to_string();
 
-    let claimed: Option<String> = redis::Script::new(CLAIM_SCRIPT)
-        .key(DUE_KEY)
-        .key(LEASES_KEY)
-        .arg(GROUP_PREFIX)
-        .arg(HLL_PREFIX)
-        .arg(lease_secs)
-        .arg(MAX_RECOVERY_PER_CLAIM)
-        .arg(&token)
-        .arg(MAX_DANGLING_SKIPS)
-        .invoke_async(&mut *conn)
-        .await
-        .map_err(ServiceError::Redis)?;
+    let (claimed_id, expired_drops, dangling_drops, now): (String, u64, u64, u64) =
+        redis::Script::new(CLAIM_SCRIPT)
+            .key(DUE_KEY)
+            .key(LEASES_KEY)
+            .arg(GROUP_PREFIX)
+            .arg(HLL_PREFIX)
+            .arg(lease_secs)
+            .arg(MAX_RECOVERY_PER_CLAIM)
+            .arg(&token)
+            .arg(MAX_DANGLING_SKIPS)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(ServiceError::Redis)?;
 
-    Ok(claimed.map(|group_id| GroupClaim { group_id, token }))
+    if expired_drops > 0 {
+        crate::metrics::coalesce_skipped("expired", expired_drops);
+        warn!(
+            count = expired_drops,
+            "Dropped coalescing groups that reached their logical expiry before a flush"
+        );
+    }
+    if dangling_drops > 0 {
+        crate::metrics::coalesce_skipped("dangling_due", dangling_drops);
+        warn!(
+            count = dangling_drops,
+            "Removed dangling coalescing due members whose group hash was already gone"
+        );
+    }
+
+    if claimed_id.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(GroupClaim {
+        group_id: claimed_id,
+        token,
+        claimed_at: now,
+    }))
+}
+
+/// What one completion attempt did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    /// Finished or dropped; the group and its actor count are deleted.
+    Completed,
+    /// Returned to the due queue for a later attempt.
+    Requeued,
+    /// Crossing its logical expiry; deleted and counted instead of requeued.
+    Expired,
+    /// Another worker's lease owns the group now; nothing was mutated.
+    NotOwner,
 }
 
 /// Complete a claimed group under its ownership token.
 ///
 /// `requeue_after_secs` is `None` for a finished group (deleted) and
-/// `Some(delay)` to return it to the due queue for a later retry.
+/// `Some(delay)` to return it to the due queue for a later retry. A requeue
+/// that would cross the group's `expires_at` deletes and counts it instead,
+/// while the hash still names the recipient, type, and target.
 pub async fn complete_group(
     pool: &RedisPool,
     claim: &GroupClaim,
     requeue_after_secs: Option<u64>,
-) -> Result<bool> {
+) -> Result<CompleteOutcome> {
     const COMPLETE_SCRIPT: &str = r#"
         local leases_key = KEYS[1]
         local due_key = KEYS[2]
@@ -457,10 +592,17 @@ pub async fn complete_group(
           return 0
         end
         redis.call('ZREM', leases_key, gid)
+        local now = tonumber(redis.call('TIME')[1])
         if requeue_after ~= '' then
-          local now = tonumber(redis.call('TIME')[1])
+          local expires_at = tonumber(redis.call('HGET', gkey, 'expires_at') or '0')
+          local next_score = now + tonumber(requeue_after)
           redis.call('HDEL', gkey, 'lease')
-          redis.call('ZADD', due_key, now + tonumber(requeue_after), gid)
+          if expires_at > 0 and next_score >= expires_at then
+            redis.call('DEL', gkey)
+            redis.call('DEL', hll_prefix .. gid)
+            return 3
+          end
+          redis.call('ZADD', due_key, next_score, gid)
           return 2
         end
         redis.call('DEL', gkey)
@@ -487,7 +629,12 @@ pub async fn complete_group(
         .await
         .map_err(ServiceError::Redis)?;
 
-    Ok(outcome == 1)
+    Ok(match outcome {
+        1 => CompleteOutcome::Completed,
+        2 => CompleteOutcome::Requeued,
+        3 => CompleteOutcome::Expired,
+        _ => CompleteOutcome::NotOwner,
+    })
 }
 
 /// Age in seconds of the oldest bucket group that is due now.
@@ -497,12 +644,19 @@ pub async fn complete_group(
 /// the worker falls behind and returns to zero once the queue is drained. A
 /// dead worker is covered by `coalesce_flush` in `/health`, since a gauge
 /// cannot update itself after the process stops.
+///
+/// The age is computed from the Redis server clock, the same clock that wrote
+/// the due scores, so pod clock skew cannot shift it.
 pub async fn oldest_due_age_seconds(pool: &RedisPool) -> Result<u64> {
-    let now = Timestamp::now().as_secs();
     let mut conn = pool
         .get()
         .await
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let now: u64 = redis::cmd("TIME")
+        .query_async::<(u64, u64)>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?
+        .0;
     let head: Vec<(String, u64)> = redis::cmd("ZRANGEBYSCORE")
         .arg(DUE_KEY)
         .arg("-inf")
@@ -563,6 +717,7 @@ pub async fn load_group(pool: &RedisPool, group_id: &str) -> Result<Option<Group
         owner: get("owner").unwrap_or_default(),
         target: get("target").unwrap_or_default(),
         due: number("due"),
+        expires_at: number("expires_at"),
         pending: number("pending"),
         immediate: number("immediate"),
         first_actor: get("first_actor"),
@@ -713,11 +868,74 @@ pub enum FlushOutcome {
         failed: usize,
         actor_count: u64,
     },
+    /// All-token retryable failure; back in the due queue.
     RetryQueued,
+    /// Recipient bucket empty; back in the due queue at the refill time.
+    Throttled,
+    /// Crossed its logical lifetime; deleted and counted instead of sent.
+    Expired,
     Suppressed {
         reason: &'static str,
     },
-    Empty,
+    Empty {
+        reason: &'static str,
+    },
+}
+
+/// Delete a group that crossed its logical lifetime, naming it in the log and
+/// counting the loss so it is attributable rather than a silent expiry.
+async fn drop_expired_group(
+    state: &AppState,
+    claim: &GroupClaim,
+    snapshot: &GroupSnapshot,
+) -> Result<()> {
+    match complete_group(&state.redis_pool, claim, None).await? {
+        CompleteOutcome::Completed => {
+            crate::metrics::coalesce_skipped("expired", 1);
+            warn!(
+                group_id = %claim.group_id,
+                owner = %snapshot.owner,
+                ntype = %snapshot.notification_type,
+                target = %snapshot.target,
+                pending = snapshot.pending,
+                "Dropped a coalesced group at its logical expiry without sending a summary"
+            );
+            Ok(())
+        }
+        outcome => Err(ServiceError::Internal(format!(
+            "expired coalescing group completion was not owned by this worker: {outcome:?}"
+        ))),
+    }
+}
+
+/// Return a claimed group to the due queue, or drop it when the retry would
+/// cross its logical lifetime. A drop is logged with the work it names and
+/// counted; a requeue reports `requeue_outcome`.
+async fn requeue_or_expire(
+    state: &AppState,
+    claim: &GroupClaim,
+    snapshot: &GroupSnapshot,
+    requeue_outcome: FlushOutcome,
+    delay_secs: u64,
+) -> Result<FlushOutcome> {
+    match complete_group(&state.redis_pool, claim, Some(delay_secs)).await? {
+        CompleteOutcome::Requeued => Ok(requeue_outcome),
+        CompleteOutcome::Expired => {
+            crate::metrics::coalesce_skipped("expired", 1);
+            warn!(
+                group_id = %claim.group_id,
+                owner = %snapshot.owner,
+                ntype = %snapshot.notification_type,
+                target = %snapshot.target,
+                pending = snapshot.pending,
+                "Dropped a coalesced group at its logical expiry instead of requeueing it"
+            );
+            Ok(FlushOutcome::Expired)
+        }
+        outcome => Err(ServiceError::Internal(format!(
+            "coalescing requeue was not owned by this worker: {outcome:?}"
+        ))),
+    }
 }
 
 /// Process one claimed group. Always attempts to complete the claim; an error
@@ -729,8 +947,23 @@ pub(crate) async fn flush_group(
 ) -> Result<FlushOutcome> {
     let Some(snapshot) = load_group(&state.redis_pool, &claim.group_id).await? else {
         complete_group(&state.redis_pool, claim, None).await?;
-        return Ok(FlushOutcome::Empty);
+        crate::metrics::coalesce_skipped("missing_group", 1);
+        info!(
+            group_id = %claim.group_id,
+            "Coalesced group hash was already gone when its flush ran"
+        );
+        return Ok(FlushOutcome::Empty {
+            reason: "missing_group",
+        });
     };
+
+    // The logical lifetime is where a backlog or a permanent throttle is
+    // declared lost. Do it here, where the hash still names the work, rather
+    // than letting the physical TTL erase the evidence.
+    if snapshot.expires_at > 0 && snapshot.expires_at <= claim.claimed_at {
+        drop_expired_group(state, claim, &snapshot).await?;
+        return Ok(FlushOutcome::Expired);
+    }
 
     let Some(notification_type) = NotificationType::from_display_name(&snapshot.notification_type)
     else {
@@ -740,12 +973,20 @@ pub(crate) async fn flush_group(
             "Discarding coalesced group with an unknown notification type"
         );
         complete_group(&state.redis_pool, claim, None).await?;
-        return Ok(FlushOutcome::Empty);
+        crate::metrics::coalesce_skipped("unknown_type", 1);
+        return Ok(FlushOutcome::Empty {
+            reason: "unknown_type",
+        });
     };
 
     if snapshot.pending == 0 {
+        // Routine reconciliation: every event was sent immediately, or the
+        // buffered set was already flushed before this claim landed.
         complete_group(&state.redis_pool, claim, None).await?;
-        return Ok(FlushOutcome::Empty);
+        crate::metrics::coalesce_skipped("no_pending", 1);
+        return Ok(FlushOutcome::Empty {
+            reason: "no_pending",
+        });
     }
     if snapshot.actor_count == 0 {
         // The hyperloglog is written and expired with the group, so this means
@@ -757,7 +998,10 @@ pub(crate) async fn flush_group(
             "Discarding coalesced group whose actor counter is missing"
         );
         complete_group(&state.redis_pool, claim, None).await?;
-        return Ok(FlushOutcome::Empty);
+        crate::metrics::coalesce_skipped("missing_actor_count", 1);
+        return Ok(FlushOutcome::Empty {
+            reason: "missing_actor_count",
+        });
     }
 
     let owner = match PublicKey::from_hex(&snapshot.owner) {
@@ -765,15 +1009,25 @@ pub(crate) async fn flush_group(
         Err(e) => {
             warn!(group_id = %claim.group_id, error = %e, "Discarding coalesced group with an unparseable owner");
             complete_group(&state.redis_pool, claim, None).await?;
-            return Ok(FlushOutcome::Empty);
+            crate::metrics::coalesce_skipped("unparseable_owner", 1);
+            return Ok(FlushOutcome::Empty {
+                reason: "unparseable_owner",
+            });
         }
     };
 
     // Revalidate every gate the immediate path applies, because all of them can
-    // have changed since the event was buffered.
+    // have changed since the event was buffered. Each drop is counted so the
+    // suppression is attributable.
     let allowed = &state.settings.service.allowed_pubkeys;
     if !allowed.is_empty() && !allowed.contains(&snapshot.owner) {
         complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("not_allowlisted", 1);
+        info!(
+            group_id = %claim.group_id,
+            owner = %snapshot.owner,
+            "Suppressed a coalesced summary; the recipient is not allowlisted"
+        );
         return Ok(FlushOutcome::Suppressed {
             reason: "not_allowlisted",
         });
@@ -782,6 +1036,12 @@ pub(crate) async fn flush_group(
     let tokens = redis_store::get_tokens_for_pubkey(&state.redis_pool, &owner).await?;
     if tokens.is_empty() {
         complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("no_tokens", 1);
+        info!(
+            group_id = %claim.group_id,
+            owner = %snapshot.owner,
+            "Suppressed a coalesced summary; the recipient has no registered tokens"
+        );
         return Ok(FlushOutcome::Suppressed {
             reason: "no_tokens",
         });
@@ -795,6 +1055,13 @@ pub(crate) async fn flush_group(
     .await?;
     if !notification_type.is_enabled(&prefs) {
         complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("preference_disabled", 1);
+        info!(
+            group_id = %claim.group_id,
+            owner = %snapshot.owner,
+            ntype = %snapshot.notification_type,
+            "Suppressed a coalesced summary; the recipient disabled this type"
+        );
         return Ok(FlushOutcome::Suppressed {
             reason: "preference_disabled",
         });
@@ -802,6 +1069,31 @@ pub(crate) async fn flush_group(
 
     if token.is_cancelled() {
         return Err(ServiceError::Cancelled);
+    }
+
+    // A summary is an emitted notification, so it spends the same
+    // per-recipient token the immediate path spends. That is what bounds a
+    // boundary burst of summaries: the bucket absorbs the burst, and the rest
+    // defer a refill at a time instead of arriving at once. A deferral is not
+    // a failure and does not touch the retry path.
+    let recipient = snapshot.owner.clone();
+    if !consume_recipient_token(&state.redis_pool, &recipient, &state.settings.service).await? {
+        crate::metrics::coalesce_deferred("recipient_throttled", 1);
+        info!(
+            group_id = %claim.group_id,
+            owner = %snapshot.owner,
+            ntype = %snapshot.notification_type,
+            refill_secs = state.settings.service.recipient_throttle_refill_secs,
+            "Deferring a coalesced summary; the recipient throttle is empty"
+        );
+        return requeue_or_expire(
+            state,
+            claim,
+            &snapshot,
+            FlushOutcome::Throttled,
+            state.settings.service.recipient_throttle_refill_secs,
+        )
+        .await;
     }
 
     let sample_name = match (&state.mention_parser_service, &snapshot.first_actor) {
@@ -879,13 +1171,14 @@ pub(crate) async fn flush_group(
 
     if delivered.is_empty() {
         if retryable_failure.is_some() {
-            complete_group(
-                &state.redis_pool,
+            return requeue_or_expire(
+                state,
                 claim,
-                Some(state.settings.service.coalesce_retry_secs),
+                &snapshot,
+                FlushOutcome::RetryQueued,
+                state.settings.service.coalesce_retry_secs,
             )
-            .await?;
-            return Ok(FlushOutcome::RetryQueued);
+            .await;
         }
         complete_group(&state.redis_pool, claim, None).await?;
         return Ok(FlushOutcome::Sent {
@@ -934,8 +1227,23 @@ pub async fn run_coalesce_flush(state: Arc<AppState>, token: CancellationToken) 
 
         match claim {
             Ok(Some(claim)) => {
-                if let Err(e) = flush_group(&state, &claim, &token).await {
-                    if matches!(e, ServiceError::Cancelled) {
+                // Hard bound on one flush: a stalled profile lookup or FCM
+                // batch must not pin the drain behind this group. On timeout
+                // the lease is left in place, so expiry recovers the work.
+                let flush_timeout =
+                    Duration::from_secs(state.settings.service.coalesce_flush_timeout_secs);
+                let flushed =
+                    tokio::time::timeout(flush_timeout, flush_group(&state, &claim, &token)).await;
+
+                match flushed {
+                    Ok(Ok(outcome)) => {
+                        tracing::debug!(
+                            group_id = %claim.group_id,
+                            outcome = ?outcome,
+                            "Coalesced group flush finished"
+                        );
+                    }
+                    Ok(Err(ServiceError::Cancelled)) => {
                         if let Err(release_error) =
                             complete_group(&state.redis_pool, &claim, Some(0)).await
                         {
@@ -943,16 +1251,36 @@ pub async fn run_coalesce_flush(state: Arc<AppState>, token: CancellationToken) 
                         }
                         break;
                     }
-
-                    error!(error = %e, "Coalesced group flush failed; requeuing");
-                    if let Err(requeue_error) = complete_group(
-                        &state.redis_pool,
-                        &claim,
-                        Some(state.settings.service.coalesce_retry_secs),
-                    )
-                    .await
-                    {
-                        error!(error = %requeue_error, "Failed to requeue a coalesced group after a flush error; lease expiry will recover it");
+                    Ok(Err(e)) => {
+                        crate::metrics::coalesce_flush_failure("error", 1);
+                        error!(error = %e, "Coalesced group flush failed; requeuing");
+                        match complete_group(
+                            &state.redis_pool,
+                            &claim,
+                            Some(state.settings.service.coalesce_retry_secs),
+                        )
+                        .await
+                        {
+                            Ok(CompleteOutcome::Expired) => {
+                                crate::metrics::coalesce_skipped("expired", 1);
+                                warn!(
+                                    group_id = %claim.group_id,
+                                    "Dropped a coalesced group at its logical expiry after a flush error"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(requeue_error) => {
+                                error!(error = %requeue_error, "Failed to requeue a coalesced group after a flush error; lease expiry will recover it");
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        crate::metrics::coalesce_flush_failure("timeout", 1);
+                        error!(
+                            group_id = %claim.group_id,
+                            timeout_secs = state.settings.service.coalesce_flush_timeout_secs,
+                            "Coalesced group flush exceeded its timeout; lease expiry will recover it"
+                        );
                     }
                 }
             }
@@ -991,7 +1319,7 @@ mod tests {
     use crate::fcm_sender::{FcmClient, FcmSend};
     use crate::models::FcmPayload;
     use async_trait::async_trait;
-    use nostr_sdk::Keys;
+    use nostr_sdk::{Keys, Timestamp};
     use std::sync::Arc;
 
     async fn test_pool() -> Option<RedisPool> {
@@ -1188,6 +1516,7 @@ mod tests {
             owner: recipient.to_hex(),
             target: "e:target".to_string(),
             due: 1_700_000_000,
+            expires_at: 1_700_086_400,
             pending: 4,
             immediate: 3,
             first_actor: Some("a".repeat(64)),
@@ -1525,7 +1854,10 @@ mod tests {
             recovered.group_id, group_id,
             "recovery must not lose the buffered group"
         );
-        assert!(complete_group(&pool, &recovered, None).await.unwrap());
+        assert_eq!(
+            complete_group(&pool, &recovered, None).await.unwrap(),
+            CompleteOutcome::Completed
+        );
         assert!(load_group(&pool, &group_id).await.unwrap().is_none());
     }
 
@@ -1624,9 +1956,11 @@ mod tests {
         let impostor = GroupClaim {
             group_id: group_id.clone(),
             token: "not-the-lease".to_string(),
+            claimed_at: claim.claimed_at,
         };
-        assert!(
-            !complete_group(&pool, &impostor, None).await.unwrap(),
+        assert_eq!(
+            complete_group(&pool, &impostor, None).await.unwrap(),
+            CompleteOutcome::NotOwner,
             "a non-owner completion must be refused"
         );
         assert!(
@@ -1634,7 +1968,10 @@ mod tests {
             "a refused completion must leave the group intact"
         );
 
-        assert!(complete_group(&pool, &claim, None).await.unwrap());
+        assert_eq!(
+            complete_group(&pool, &claim, None).await.unwrap(),
+            CompleteOutcome::Completed
+        );
         assert!(load_group(&pool, &group_id).await.unwrap().is_none());
     }
 
@@ -1674,6 +2011,359 @@ mod tests {
             .await
             .unwrap();
         assert!(score.is_none(), "a dangling member must be removed");
+    }
+
+    /// Overwrite the per-recipient throttle bucket for a test. A `ts` in the
+    /// future makes the lazy refill clamp to zero elapsed time.
+    async fn set_throttle_state(pool: &RedisPool, owner: &PublicKey, tokens: f64, ts_ms: u64) {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("HSET")
+            .arg(format!("{THROTTLE_PREFIX}{}", owner.to_hex()))
+            .arg("tokens")
+            .arg(tokens)
+            .arg("ts")
+            .arg(ts_ms)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    fn never_panicking_sender() -> FcmClient {
+        FcmClient::new_with_impl(Box::new(PanickingFcmSender {
+            panic_on: "a token this test never registers".to_string(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn buffered_groups_carry_the_logical_lifetime() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 1;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+
+        let now = Timestamp::now().as_secs();
+        let snapshot = load_group(&pool, &group_id).await.unwrap().unwrap();
+        assert!(
+            snapshot.expires_at >= now + settings.coalesce_group_ttl_secs - 5
+                && snapshot.expires_at <= now + settings.coalesce_group_ttl_secs + 5,
+            "a buffered group must carry its logical expiry, got {}",
+            snapshot.expires_at
+        );
+
+        let physical = settings
+            .coalesce_group_ttl_secs
+            .saturating_add(settings.coalesce_logical_expiry_grace_secs);
+        let window_plus_grace = settings
+            .coalesce_window_secs
+            .saturating_add(settings.coalesce_logical_expiry_grace_secs);
+        let mut conn = pool.get().await.unwrap();
+        let group_ttl: i64 = redis::cmd("TTL")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let hll_ttl: i64 = redis::cmd("TTL")
+            .arg(format!("{HLL_PREFIX}{group_id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            group_ttl > window_plus_grace as i64,
+            "the physical TTL must outlive the window plus grace so a backlog cannot silently expire it, got {group_ttl}"
+        );
+        assert!(
+            group_ttl <= physical as i64 && group_ttl > physical as i64 - 10,
+            "the physical TTL is the logical lifetime plus grace, got {group_ttl}"
+        );
+        assert!(hll_ttl > 0, "the actor counter must share the lifetime");
+
+        cleanup_group(&pool, &group_id).await;
+    }
+
+    #[tokio::test]
+    async fn flush_drops_a_group_that_reached_its_logical_lifetime() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.coalesce_immediate_limit = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+        {
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("HSET")
+                .arg(format!("{GROUP_PREFIX}{group_id}"))
+                .arg("expires_at")
+                .arg(Timestamp::now().as_secs().saturating_sub(1))
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        let state = test_state(settings, pool.clone(), never_panicking_sender());
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        let outcome = flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FlushOutcome::Expired,
+            "an expired group is dropped, not sent"
+        );
+        assert!(
+            load_group(&pool, &group_id).await.unwrap().is_none(),
+            "the expired group must be deleted while it is still readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn requeue_across_the_logical_lifetime_drops_instead_of_requeueing() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 1;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        assert_eq!(
+            complete_group(&pool, &claim, Some(5)).await.unwrap(),
+            CompleteOutcome::Requeued,
+            "a retry that fits inside the lifetime returns to the due queue"
+        );
+
+        make_claimable(&pool, &group_id).await;
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the requeued group is claimable");
+        {
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("HSET")
+                .arg(format!("{GROUP_PREFIX}{group_id}"))
+                .arg("expires_at")
+                .arg(Timestamp::now().as_secs().saturating_add(1))
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            complete_group(&pool, &claim, Some(60)).await.unwrap(),
+            CompleteOutcome::Expired,
+            "a retry that would cross the lifetime is dropped instead of requeued"
+        );
+        assert!(load_group(&pool, &group_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_summary_throttled_at_flush_defers_to_the_refill_time() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.coalesce_immediate_limit = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        settings.service.recipient_throttle_refill_secs = 60;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+        redis_store::add_or_update_token(&pool, &owner, "coalesce-throttle-token")
+            .await
+            .unwrap();
+
+        // A `ts` in the future makes the lazy refill see zero elapsed time.
+        set_throttle_state(
+            &pool,
+            &owner,
+            0.0,
+            (Timestamp::now().as_secs() * 1000) + 60_000,
+        )
+        .await;
+
+        let state = test_state(settings, pool.clone(), never_panicking_sender());
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        let outcome = flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FlushOutcome::Throttled,
+            "an empty recipient bucket defers the summary rather than sending it"
+        );
+        assert!(
+            load_group(&pool, &group_id).await.unwrap().is_some(),
+            "the deferred group must survive"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        let score: Option<u64> = redis::cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(&group_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let now = Timestamp::now().as_secs();
+        assert!(
+            score.is_some_and(|score| score >= now + 55 && score <= now + 70),
+            "the group must return at the refill time, got {score:?}"
+        );
+
+        // A refilled bucket lets the same group send.
+        set_throttle_state(
+            &pool,
+            &owner,
+            1.0,
+            (Timestamp::now().as_secs() * 1000) + 60_000,
+        )
+        .await;
+        {
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("ZADD")
+                .arg(DUE_KEY)
+                .arg(Timestamp::now().as_secs())
+                .arg(&group_id)
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the refilled bucket group is claimable");
+        let outcome = flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FlushOutcome::Sent {
+                delivered: 1,
+                failed: 0,
+                actor_count: 1,
+            }
+        );
+
+        redis_store::remove_token(&pool, &owner, "coalesce-throttle-token")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

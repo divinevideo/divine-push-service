@@ -136,11 +136,28 @@ pub struct ServiceSettings {
     /// Idle poll interval for the coalescing flush worker.
     #[serde(default = "default_coalesce_poll")]
     pub coalesce_poll_millis: u64,
-    /// Grace added to the bucket window for coalescing group and disposition
-    /// key TTLs.
+    /// Absolute logical lifetime of a coalesced group, in seconds, measured
+    /// from its creation.
     ///
-    /// The TTL must outlive the bucket deadline so a group is still readable
-    /// when its flush runs, plus the flush worker's own downtime tolerance.
+    /// Buffered work is durable until this point. The flush and retry paths
+    /// delete and count a group that crosses it while the hash is still
+    /// readable, so a backlog cannot expire into a silent dangling index
+    /// member.
+    #[serde(default = "default_coalesce_group_ttl")]
+    pub coalesce_group_ttl_secs: u64,
+    /// Hard bound on one coalescing flush, in seconds.
+    ///
+    /// One flush resolves a display name and sends an FCM batch; both can
+    /// stall. The bound keeps the drain from pinning all due work behind one
+    /// group. A timed-out flush leaves its lease for expiry to recover.
+    #[serde(default = "default_coalesce_flush_timeout")]
+    pub coalesce_flush_timeout_secs: u64,
+    /// Cleanup grace added to the logical group lifetime for the physical
+    /// Redis TTL, and added to the bucket window for disposition-key TTLs.
+    ///
+    /// The physical TTL must outlive the logical expiry so the dropping path
+    /// can still read the group's recipient, type, and target when it counts
+    /// the loss.
     #[serde(default = "default_coalesce_grace")]
     pub coalesce_logical_expiry_grace_secs: u64,
     /// Per-recipient token-bucket capacity for like/repost immediate pushes.
@@ -231,9 +248,23 @@ fn default_coalesce_poll() -> u64 {
     250
 }
 
+fn default_coalesce_group_ttl() -> u64 {
+    // One day of durable deferral. After that a group is dropped loudly and
+    // counted rather than expiring into an unreadable dangling index member.
+    86_400
+}
+
+fn default_coalesce_flush_timeout() -> u64 {
+    // A flush includes a profile lookup bounded at five seconds and an FCM
+    // batch bounded at 45 seconds per token; two minutes covers a slow pass
+    // while leaving the five-minute lease above twice this bound.
+    120
+}
+
 fn default_coalesce_grace() -> u64 {
-    // The TTL must outlive the bucket deadline. One extra hour also covers a
-    // worker restarting before it drains the due queue.
+    // The physical TTL must outlive the logical lifetime so the dropping path
+    // can still name the recipient, type, and target it counted. One extra
+    // hour also covers a worker restarting before it drains the due queue.
     3600
 }
 
@@ -416,7 +447,7 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 20] = [
+        let must_be_positive: [(&str, u64, &str); 22] = [
             (
                 "nostr.event_silence_timeout_secs",
                 self.nostr.event_silence_timeout_secs,
@@ -503,9 +534,19 @@ impl Settings {
                 "an idle coalescing worker spins continuously against Redis",
             ),
             (
+                "service.coalesce_group_ttl_secs",
+                self.service.coalesce_group_ttl_secs,
+                "buffered work crosses its logical expiry in the same instant it is created",
+            ),
+            (
+                "service.coalesce_flush_timeout_secs",
+                self.service.coalesce_flush_timeout_secs,
+                "every coalescing flush times out before it can send",
+            ),
+            (
                 "service.coalesce_logical_expiry_grace_secs",
                 self.service.coalesce_logical_expiry_grace_secs,
-                "group keys expire at their bucket deadline, before the flush can read them",
+                "group keys are physically removed at their logical expiry, before the dropping path can count the loss",
             ),
             (
                 "service.recipient_throttle_capacity",
@@ -525,6 +566,29 @@ impl Settings {
                     "{name} must be greater than zero: at 0, {consequence}"
                 )));
             }
+        }
+
+        // Checked arithmetic: these values are environment-overridable, so a
+        // near-u64 value must saturate rather than wrap into a passing check.
+        if self.service.coalesce_group_ttl_secs
+            <= self
+                .service
+                .coalesce_window_secs
+                .saturating_add(self.service.coalesce_lease_secs)
+        {
+            return Err(ConfigError::Message(
+                "service.coalesce_group_ttl_secs must exceed coalesce_window_secs + coalesce_lease_secs: a group must stay durable past its bucket deadline and any live lease"
+                    .to_string(),
+            ));
+        }
+
+        if self.service.coalesce_lease_secs
+            <= self.service.coalesce_flush_timeout_secs.saturating_mul(2)
+        {
+            return Err(ConfigError::Message(
+                "service.coalesce_lease_secs must exceed twice coalesce_flush_timeout_secs: an expired lease must not be reclaimed while its flush can still be running"
+                    .to_string(),
+            ));
         }
 
         if self
@@ -647,7 +711,7 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 20] = [
+        let cases: [ZeroCase; 22] = [
             ("nostr.event_silence_timeout_secs", |s| {
                 s.nostr.event_silence_timeout_secs = 0
             }),
@@ -698,6 +762,12 @@ mod tests {
             }),
             ("service.coalesce_poll_millis", |s| {
                 s.service.coalesce_poll_millis = 0
+            }),
+            ("service.coalesce_group_ttl_secs", |s| {
+                s.service.coalesce_group_ttl_secs = 0
+            }),
+            ("service.coalesce_flush_timeout_secs", |s| {
+                s.service.coalesce_flush_timeout_secs = 0
             }),
             ("service.coalesce_logical_expiry_grace_secs", |s| {
                 s.service.coalesce_logical_expiry_grace_secs = 0
@@ -780,6 +850,8 @@ mod tests {
             "coalesce_lease_secs",
             "coalesce_retry_secs",
             "coalesce_poll_millis",
+            "coalesce_group_ttl_secs",
+            "coalesce_flush_timeout_secs",
             "coalesce_logical_expiry_grace_secs",
             "recipient_throttle_capacity",
             "recipient_throttle_refill_secs",
@@ -803,9 +875,31 @@ mod tests {
             assert_eq!(settings.service.coalesce_lease_secs, 300);
             assert_eq!(settings.service.coalesce_retry_secs, 5);
             assert_eq!(settings.service.coalesce_poll_millis, 250);
+            assert_eq!(settings.service.coalesce_group_ttl_secs, 86_400);
+            assert_eq!(settings.service.coalesce_flush_timeout_secs, 120);
             assert_eq!(settings.service.coalesce_logical_expiry_grace_secs, 3600);
             assert_eq!(settings.service.recipient_throttle_capacity, 60);
             assert_eq!(settings.service.recipient_throttle_refill_secs, 60);
         }
+    }
+
+    #[test]
+    fn test_coalescing_lifetime_bounds_are_relational() {
+        let mut settings = load_runtime_settings("settings.yaml");
+        settings.service.coalesce_group_ttl_secs = settings.service.coalesce_window_secs;
+        assert!(
+            settings.validate().is_err(),
+            "a group lifetime inside the window must be rejected"
+        );
+
+        settings.service.coalesce_group_ttl_secs = default_coalesce_group_ttl();
+        settings.service.coalesce_flush_timeout_secs = settings.service.coalesce_lease_secs;
+        assert!(
+            settings.validate().is_err(),
+            "a lease at or below twice the flush timeout must be rejected"
+        );
+
+        settings.service.coalesce_flush_timeout_secs = default_coalesce_flush_timeout();
+        assert!(settings.validate().is_ok());
     }
 }

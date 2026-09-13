@@ -44,7 +44,9 @@ service:
   coalesce_lease_secs: 300  # Flush lease for one claimed group
   coalesce_retry_secs: 5  # Requeue delay after an all-token retryable FCM failure
   coalesce_poll_millis: 250  # Idle flush-worker poll interval
-  coalesce_logical_expiry_grace_secs: 3600  # Added to the window for group/disposition TTLs
+  coalesce_group_ttl_secs: 86400  # Absolute logical lifetime of a buffered group
+  coalesce_flush_timeout_secs: 120  # Hard bound on one coalescing flush
+  coalesce_logical_expiry_grace_secs: 3600  # Physical-TTL grace past the logical lifetime
   recipient_throttle_capacity: 60  # Instant burst of immediate pushes per recipient
   recipient_throttle_refill_secs: 60  # Seconds per refilled immediate-push token
   # allowed_pubkeys: [] — empty means no restriction (production default)
