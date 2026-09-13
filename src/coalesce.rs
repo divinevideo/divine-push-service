@@ -169,10 +169,9 @@ fn disposition_key(event_id: &str, recipient: &PublicKey) -> String {
 
 /// TTL for the per-recipient token bucket.
 ///
-/// The bucket has refilled to capacity after `capacity * refill_secs`, so a
-/// fully idle bucket is indistinguishable from an absent one; the
-/// window-plus-grace floor keeps it alive at least as long as the groups it
-/// defers.
+/// The bucket has refilled to capacity after `capacity * refill_secs`, after
+/// which an absent key reads the same as a full one, so the TTL only needs the
+/// window-plus-grace floor to keep it alive around the boundary it defers.
 fn throttle_key_ttl(settings: &ServiceSettings) -> u64 {
     let disp_ttl = settings
         .coalesce_window_secs
@@ -235,6 +234,53 @@ pub async fn consume_recipient_token(
         .map_err(ServiceError::Redis)?;
 
     Ok(consumed == 1)
+}
+
+/// Return one token to a recipient's bucket after a flush that emitted nothing.
+///
+/// The bucket charges only for emitted notifications: a summary that failed
+/// retryably on every token never reached a device, so leaving the charge in
+/// place would let one stuck group drain each refill and starve the
+/// recipient's immediate like/repost pushes for as long as the group retries.
+pub async fn refund_recipient_token(
+    pool: &RedisPool,
+    owner_hex: &str,
+    settings: &ServiceSettings,
+) -> Result<()> {
+    const REFUND_SCRIPT: &str = r#"
+        local tkey = KEYS[1]
+        local capacity = tonumber(ARGV[1])
+        local refill_secs = tonumber(ARGV[2])
+        local throttle_ttl = tonumber(ARGV[3])
+
+        local now_ms = tonumber(redis.call('TIME')[1]) * 1000
+        local tokens = tonumber(redis.call('HGET', tkey, 'tokens'))
+        local ts = tonumber(redis.call('HGET', tkey, 'ts'))
+        if tokens == nil then tokens = capacity end
+        if ts == nil then ts = now_ms end
+        local elapsed = now_ms - ts
+        if elapsed < 0 then elapsed = 0 end
+        tokens = math.min(capacity, tokens + elapsed / (refill_secs * 1000) + 1)
+        redis.call('HSET', tkey, 'tokens', tokens, 'ts', now_ms)
+        redis.call('EXPIRE', tkey, throttle_ttl)
+        return 1
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+
+    let _: i64 = redis::Script::new(REFUND_SCRIPT)
+        .key(format!("{THROTTLE_PREFIX}{owner_hex}"))
+        .arg(settings.recipient_throttle_capacity)
+        .arg(settings.recipient_throttle_refill_secs)
+        .arg(throttle_key_ttl(settings))
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(())
 }
 
 /// Decide and record one like/repost ingest atomically.
@@ -336,7 +382,15 @@ pub async fn ingest(
 
         if send_immediately then
           redis.call('HINCRBY', gkey, 'immediate', 1)
-          redis.call('EXPIRE', gkey, ttl)
+          local pending = tonumber(redis.call('HGET', gkey, 'pending') or '0')
+          if pending > 0 then
+            redis.call('EXPIRE', gkey, ttl)
+          else
+            -- An immediate-only group is never claimed; it only needs to
+            -- outlive its bucket so a later buffered event in the same bucket
+            -- finds the immediate count and routing fields.
+            redis.call('EXPIRE', gkey, disp_ttl)
+          end
           redis.call('SET', disp_key, 'i:' .. gid, 'EX', disp_ttl)
           return {1, gid}
         end
@@ -1170,13 +1224,27 @@ pub(crate) async fn flush_group(
     }
 
     if delivered.is_empty() {
-        if retryable_failure.is_some() {
+        if let Some(delay) = retryable_failure {
+            // Nothing reached a device, so the emitted-notification charge is
+            // returned; otherwise one stuck group could hold the recipient's
+            // bucket empty for as long as it retries.
+            if let Err(e) =
+                refund_recipient_token(&state.redis_pool, &recipient, &state.settings.service).await
+            {
+                error!(group_id = %claim.group_id, error = %e, "Failed to refund the recipient throttle token after a retryable summary failure");
+            }
+            // FCM's Retry-After wins when it asks for more than the configured
+            // minimum. A requeue that would cross the logical lifetime drops
+            // the group instead.
+            let retry_secs = delay
+                .as_secs()
+                .max(state.settings.service.coalesce_retry_secs);
             return requeue_or_expire(
                 state,
                 claim,
                 &snapshot,
                 FlushOutcome::RetryQueued,
-                state.settings.service.coalesce_retry_secs,
+                retry_secs,
             )
             .await;
         }
@@ -2364,6 +2432,174 @@ mod tests {
         redis_store::remove_token(&pool, &owner, "coalesce-throttle-token")
             .await
             .unwrap();
+    }
+
+    struct RetryableFcmSender {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl FcmSend for RetryableFcmSender {
+        async fn send_single(
+            &self,
+            _token: &str,
+            _payload: FcmPayload,
+        ) -> std::result::Result<(), FcmError> {
+            Err(FcmError::RetryableInternal(self.delay))
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_only_groups_keep_the_short_ttl() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 3;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let decision = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Immediate { group_id, .. } = decision else {
+            panic!("the first interaction must send immediately");
+        };
+
+        let short = settings
+            .coalesce_window_secs
+            .saturating_add(settings.coalesce_logical_expiry_grace_secs);
+        let physical = settings
+            .coalesce_group_ttl_secs
+            .saturating_add(settings.coalesce_logical_expiry_grace_secs);
+        let mut conn = pool.get().await.unwrap();
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            ttl > 0 && ttl <= short as i64 + 2,
+            "an immediate-only group only needs to outlive its bucket, got {ttl}"
+        );
+        assert!(
+            ttl < physical as i64,
+            "an immediate-only group must not hold the buffered lifetime"
+        );
+
+        cleanup_group(&pool, &group_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_retryable_summary_failure_refunds_the_token_and_honours_retry_after() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.coalesce_immediate_limit = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        settings.service.recipient_throttle_refill_secs = 60;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+        redis_store::add_or_update_token(&pool, &owner, "coalesce-retry-token")
+            .await
+            .unwrap();
+
+        // Exactly one token, with no refill during the test.
+        set_throttle_state(
+            &pool,
+            &owner,
+            1.0,
+            (Timestamp::now().as_secs() * 1000) + 60_000,
+        )
+        .await;
+
+        let state = test_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(RetryableFcmSender {
+                delay: Duration::from_secs(600),
+            })),
+        );
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        let outcome = flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FlushOutcome::RetryQueued,
+            "an all-token retryable failure must requeue the group"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        let tokens: f64 = redis::cmd("HGET")
+            .arg(format!("{THROTTLE_PREFIX}{}", owner.to_hex()))
+            .arg("tokens")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            tokens >= 1.0,
+            "a flush that emitted nothing must refund its token, got {tokens}"
+        );
+
+        let score: Option<u64> = redis::cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(&group_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let now = Timestamp::now().as_secs();
+        assert!(
+            score.is_some_and(|score| score >= now + 590 && score <= now + 610),
+            "the requeue must honour FCM's Retry-After rather than the 5 s floor, got {score:?}"
+        );
+
+        redis_store::remove_token(&pool, &owner, "coalesce-retry-token")
+            .await
+            .unwrap();
+        cleanup_group(&pool, &group_id).await;
     }
 
     #[tokio::test]

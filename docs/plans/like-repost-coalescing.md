@@ -109,7 +109,7 @@ without re-reading the buffered set.
 
 | Key | Type | Purpose |
 |-----|------|---------|
-| `coalesce:g:{type}:{owner}:{target}:{bucket}` | Hash | Bucket group state: `due`, `expires_at`, `pending`, `immediate`, `first_actor`, `first_event`, `last_at`, `event_kind`, `owner`, `type`, `target`, reference fields, and the current `lease` token. Physical TTL `coalesce_group_ttl_secs + coalesce_logical_expiry_grace_secs` |
+| `coalesce:g:{type}:{owner}:{target}:{bucket}` | Hash | Bucket group state: `due`, `expires_at`, `pending`, `immediate`, `first_actor`, `first_event`, `last_at`, `event_kind`, `owner`, `type`, `target`, reference fields, and the current `lease` token. Physical TTL `coalesce_group_ttl_secs + coalesce_logical_expiry_grace_secs` once it has buffered work; window + grace while it has only immediate traffic |
 | `coalesce:hll:{type}:{owner}:{target}:{bucket}` | HyperLogLog | Distinct buffered actors. Same physical TTL |
 | `coalesce:disp:{event_id}:{recipient}` | String | Per-event disposition, `i:{gid}` or `b:{gid}`, so a replay reproduces the original decision and collapse id. TTL `coalesce_window_secs + coalesce_logical_expiry_grace_secs` |
 | `coalesce:due` | Sorted Set | Groups due for flush, scored by bucket deadline |
@@ -131,6 +131,12 @@ the hash, taking the recipient, type, and target with it, and the reconciler
 then sees only an index member whose key is gone. It cannot tell a deliberate
 loss from a backlog, a retry, or corruption.
 
+A group that has only immediate traffic is never claimed and is not durable
+work, so it keeps the shorter window-plus-grace TTL: it only needs to outlive
+its bucket for a later buffered event in the same bucket. The long lifetime
+applies once a group has buffered work, and an immediate event on such a group
+does not shorten it.
+
 So the ownership-checked flush and retry paths check `expires_at` and delete
 and count a group that crossed it while the evidence is still readable. The
 longer physical TTL only reclaims genuinely abandoned state. The counter and
@@ -139,7 +145,10 @@ against the Redis server clock, the clock that wrote it.
 
 A backlog, a repeatedly failing send, or a permanently throttled recipient can
 all reach the logical lifetime; that drop is an accepted loss below, and the
-difference from revision 9 is that it is attributable rather than silent.
+difference from revision 9 is that it is attributable rather than silent. The
+drain is serial per replica and each flush is timeout-bounded; the oldest-due
+gauge and its alert are the signal that a backlog is not clearing, and the
+lifetime is what bounds how long any item waits.
 
 ### Token bucket
 
@@ -147,6 +156,15 @@ Capacity `recipient_throttle_capacity`, refill one token per
 `recipient_throttle_refill_secs`. State is stored with millisecond timestamps;
 the bucket refills lazily on read and never exceeds capacity. The key expires
 after `max(2 * capacity * refill, window + grace)`.
+
+The bucket charges only for emitted notifications. The immediate path spends a
+token at ingest; the flush path spends one before sending. A summary that
+reached no device and failed retryably returns its token, so a stuck group
+cannot drain each refill and starve the recipient's immediate pushes. A
+deferral spends nothing. At the shipped defaults the bucket passes a 60-push
+burst and then ~1 push/min, so a recipient permanently over budget can still
+receive up to roughly 1,440 pushes a day, one refill at a time; that ceiling is
+what the product owner is being asked to accept or bound differently.
 
 ## Ingest
 
@@ -203,8 +221,10 @@ Processing a claimed group:
    the immediate path does;
 7. complete the group under the ownership check. A success (at least one
    delivered token) deletes the group and HLL. An all-token retryable failure
-   requeues the group after `coalesce_retry_secs`. A non-retryable failure is
-   logged and the group is completed.
+   refunds the token spent in step 4 and requeues the group after FCM's
+   `Retry-After` when it is larger than `coalesce_retry_secs` (`coalesce_retry_secs`
+   is a floor, not a ceiling; a delay that would cross `expires_at` drops the
+   group instead). A non-retryable failure is logged and the group is completed.
 
 The whole flush is bounded by `coalesce_flush_timeout_secs` (120 s). A timed-out
 flush leaves its lease in place; lease expiry recovers the work, and a summary
@@ -346,8 +366,9 @@ New `service` settings, each rejected at zero:
   it. Loud and counted.
 - **Redis footprint grows per interaction.** Every immediate like/repost also
   writes a group hash and a disposition string; every buffered one adds a
-  HyperLogLog and a `coalesce:due` member. Buffered groups and their HLLs now
-  live for the logical lifetime plus grace (25 h by default) instead of the
+  HyperLogLog and a `coalesce:due` member. An immediate-only group hash keeps
+  the window-plus-grace TTL, but a group with buffered work and its HLL live
+  for the logical lifetime plus grace (25 h by default) instead of the
   window-plus-grace three hours, on top of today's `dedup:` claim. The
   coordinate half of the target is attacker-chosen, exactly as the existing
   `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` key already is, but the
@@ -373,10 +394,13 @@ Committed regression tests:
 - throttle: a recipient at capacity has an immediate push demoted into the
   bucket, and the demoted event does not consume an immediate slot; a summary
   flush with an empty bucket is deferred to the refill time without sending,
-  keeps its buffered work, and sends once the bucket refills.
+  keeps its buffered work, and sends once the bucket refills; an all-token
+  retryable failure refunds the spent token and requeues at FCM's
+  `Retry-After` when it exceeds the configured floor.
 - durability: a buffered group carries `expires_at` and a physical TTL longer
-  than the window plus grace; a flush drops and deletes a group past its logical
-  lifetime; a requeue that would cross the lifetime drops instead of requeueing.
+  than the window plus grace; an immediate-only group keeps the short bucket
+  TTL; a flush drops and deletes a group past its logical lifetime; a requeue
+  that would cross the lifetime drops instead of requeueing.
 - claim/lease: an expired lease is reclaimed; an empty group is deleted rather
   than re-added; completion requires the lease token; a dangling index member
   is dropped and counted.
