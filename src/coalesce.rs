@@ -2502,6 +2502,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_immediate_event_does_not_shorten_a_buffered_group() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 3;
+        settings.recipient_throttle_capacity = 1;
+        settings.recipient_throttle_refill_secs = 3600;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        // The first interaction sends immediately and consumes the only token.
+        let first = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        assert!(matches!(first, CoalesceDecision::Immediate { .. }));
+
+        // The second is throttled into the bucket and makes the group durable.
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the throttled interaction must buffer");
+        };
+
+        // A refilled bucket lets a third interaction send immediately on the
+        // same buffered group; it must not shorten the group's lifetime.
+        set_throttle_state(
+            &pool,
+            &owner,
+            1.0,
+            (Timestamp::now().as_secs() * 1000) + 60_000,
+        )
+        .await;
+        let third = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Immediate {
+            group_id: third_gid,
+            ..
+        } = third
+        else {
+            panic!("a refilled bucket must allow an immediate push");
+        };
+        assert_eq!(
+            third_gid, group_id,
+            "the immediate event joins the same group"
+        );
+
+        let window_plus_grace = settings
+            .coalesce_window_secs
+            .saturating_add(settings.coalesce_logical_expiry_grace_secs);
+        let mut conn = pool.get().await.unwrap();
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            ttl > window_plus_grace as i64,
+            "an immediate event must not cut a buffered group back to the short TTL, got {ttl}"
+        );
+        let snapshot = load_group(&pool, &group_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.pending, 1, "the buffered work must survive");
+
+        cleanup_group(&pool, &group_id).await;
+    }
+
+    #[tokio::test]
     async fn a_retryable_summary_failure_refunds_the_token_and_honours_retry_after() {
         let _guard = test_lock().lock().await;
         let Some(pool) = test_pool().await else {

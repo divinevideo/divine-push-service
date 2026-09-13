@@ -147,8 +147,10 @@ A backlog, a repeatedly failing send, or a permanently throttled recipient can
 all reach the logical lifetime; that drop is an accepted loss below, and the
 difference from revision 9 is that it is attributable rather than silent. The
 drain is serial per replica and each flush is timeout-bounded; the oldest-due
-gauge and its alert are the signal that a backlog is not clearing, and the
-lifetime is what bounds how long any item waits.
+gauge is the signal that a backlog is not clearing (the alerting rule that
+watches it is the operator follow-up tracked with the Redis sizing in
+`divinevideo/divine-iac-coreconfig#1932`), and the lifetime is what bounds how
+long any item waits.
 
 ### Token bucket
 
