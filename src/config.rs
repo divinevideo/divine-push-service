@@ -768,4 +768,44 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_coalescing_shipped_values_are_present_and_bounded() {
+        // Every coalescing setting has a serde default, so a misspelled key in
+        // a shipped file would parse as the default and stay green. Assert the
+        // key text first, then the parsed value.
+        let keys = [
+            "coalesce_window_secs",
+            "coalesce_immediate_limit",
+            "coalesce_lease_secs",
+            "coalesce_retry_secs",
+            "coalesce_poll_millis",
+            "coalesce_logical_expiry_grace_secs",
+            "recipient_throttle_capacity",
+            "recipient_throttle_refill_secs",
+        ];
+
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("config")
+                .join(filename);
+            let raw = std::fs::read_to_string(&path).expect("shipped config is readable");
+            for key in keys {
+                assert!(
+                    raw.contains(&format!("{key}:")),
+                    "{filename} must carry {key}"
+                );
+            }
+
+            let settings = load_runtime_settings(filename);
+            assert_eq!(settings.service.coalesce_window_secs, 7200);
+            assert_eq!(settings.service.coalesce_immediate_limit, 3);
+            assert_eq!(settings.service.coalesce_lease_secs, 300);
+            assert_eq!(settings.service.coalesce_retry_secs, 5);
+            assert_eq!(settings.service.coalesce_poll_millis, 250);
+            assert_eq!(settings.service.coalesce_logical_expiry_grace_secs, 3600);
+            assert_eq!(settings.service.recipient_throttle_capacity, 60);
+            assert_eq!(settings.service.recipient_throttle_refill_secs, 60);
+        }
+    }
 }

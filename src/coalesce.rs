@@ -76,29 +76,6 @@ pub struct TargetAddress {
 }
 
 impl CoalesceTarget {
-    /// Build a target from an event's references.
-    ///
-    /// Both references are kept when the event carries both, because the
-    /// summary payload must reproduce the same routing fields the immediate
-    /// payload derives. The addressable coordinate wins the group key: it is
-    /// stable across edits, so likes on the same video group together even if
-    /// they cite different event ids.
-    pub fn new(event_id: Option<String>, address: Option<TargetAddress>) -> Option<Self> {
-        if let Some(address) = address {
-            let key = format!("a:{}", address.address);
-            return Some(Self {
-                key,
-                event_id,
-                address: Some(address),
-            });
-        }
-        event_id.map(|event_id| Self {
-            key: format!("e:{event_id}"),
-            event_id: Some(event_id),
-            address: None,
-        })
-    }
-
     pub fn event(event_id: impl Into<String>) -> Self {
         let event_id = event_id.into();
         Self {
@@ -400,8 +377,11 @@ pub async fn claim_due_group(pool: &RedisPool, lease_secs: u64) -> Result<Option
           local pending = tonumber(redis.call('HGET', gkey, 'pending') or '0')
           redis.call('ZREM', leases_key, gid)
           if pending > 0 then
-            -- Re-add only when absent from BOTH indexes; a live flush's entry
-            -- must never be duplicated by reconciliation.
+            -- Only expired entries are iterated, so no live flush owns this
+            -- group; `due` is the index that can still hold a competing live
+            -- entry, and re-adding must be skipped when it does. The `leases`
+            -- predicate always reads false at this point (the expired member
+            -- was removed above) and is kept as a defensive assertion only.
             if redis.call('ZSCORE', due_key, gid) == false and redis.call('ZSCORE', leases_key, gid) == false then
               local due_at = tonumber(redis.call('HGET', gkey, 'due') or '0')
               if due_at <= 0 then due_at = now end
@@ -510,6 +490,37 @@ pub async fn complete_group(
     Ok(outcome == 1)
 }
 
+/// Age in seconds of the oldest bucket group that is due now.
+///
+/// Sampled by the worker on every pass, not only when a group is claimed, so
+/// the gauge keeps telling the truth while the worker is alive: it rises when
+/// the worker falls behind and returns to zero once the queue is drained. A
+/// dead worker is covered by `coalesce_flush` in `/health`, since a gauge
+/// cannot update itself after the process stops.
+pub async fn oldest_due_age_seconds(pool: &RedisPool) -> Result<u64> {
+    let now = Timestamp::now().as_secs();
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let head: Vec<(String, u64)> = redis::cmd("ZRANGEBYSCORE")
+        .arg(DUE_KEY)
+        .arg("-inf")
+        .arg(now)
+        .arg("LIMIT")
+        .arg(0)
+        .arg(1)
+        .arg("WITHSCORES")
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(head
+        .first()
+        .map(|(_, score)| now.saturating_sub(*score))
+        .unwrap_or(0))
+}
+
 /// Read one group's buffered state plus its distinct-actor count.
 ///
 /// The two reads are not atomic, but a group cannot change after its bucket
@@ -567,6 +578,15 @@ pub async fn load_group(pool: &RedisPool, group_id: &str) -> Result<Option<Group
     }))
 }
 
+/// `N other(s)` for a summary of `distinct_actors`, which is at least two.
+fn others_phrase(distinct_actors: u64) -> String {
+    if distinct_actors == 2 {
+        "1 other".to_string()
+    } else {
+        format!("{} others", distinct_actors - 1)
+    }
+}
+
 /// Summary copy for one flush.
 ///
 /// The name is the first buffered actor; the count is distinct actors. A single
@@ -588,12 +608,12 @@ pub fn summary_copy(
         ),
         ("repost", count) => (
             "New reposts".to_string(),
-            format!("{name} and {} others reposted your post", count - 1),
+            format!("{name} and {} reposted your post", others_phrase(count)),
         ),
         (_, 0..=1) => ("New like".to_string(), format!("{name} liked your post")),
         (_, count) => (
             "New likes".to_string(),
-            format!("{name} and {} others liked your post", count - 1),
+            format!("{name} and {} liked your post", others_phrase(count)),
         ),
     }
 }
@@ -711,9 +731,6 @@ pub(crate) async fn flush_group(
         complete_group(&state.redis_pool, claim, None).await?;
         return Ok(FlushOutcome::Empty);
     };
-
-    let now = Timestamp::now().as_secs();
-    crate::metrics::coalesce_oldest_due_age(now.saturating_sub(snapshot.due) as f64);
 
     let Some(notification_type) = NotificationType::from_display_name(&snapshot.notification_type)
     else {
@@ -895,6 +912,15 @@ pub async fn run_coalesce_flush(state: Arc<AppState>, token: CancellationToken) 
     loop {
         if token.is_cancelled() {
             break;
+        }
+
+        // Sample the true head of the due queue on every pass so the gauge
+        // reports a growing backlog while this worker is alive but behind.
+        match oldest_due_age_seconds(&state.redis_pool).await {
+            Ok(age) => crate::metrics::coalesce_oldest_due_age(age as f64),
+            Err(e) => {
+                warn!(error = %e, "Failed to sample the oldest due coalescing group");
+            }
         }
 
         let claim = tokio::select! {
@@ -1100,25 +1126,6 @@ mod tests {
     }
 
     #[test]
-    fn target_keeps_both_references_and_groups_by_coordinate() {
-        let address = TargetAddress {
-            address: format!("34236:{}:vine", "a".repeat(64)),
-            kind: "34236".to_string(),
-            author_pubkey: "a".repeat(64),
-            d_tag: "vine".to_string(),
-        };
-        let target = CoalesceTarget::new(Some("b".repeat(64)), Some(address.clone()))
-            .expect("an addressable target");
-        assert_eq!(target.key, format!("a:{}", address.address));
-        assert_eq!(target.event_id, Some("b".repeat(64)));
-        assert_eq!(target.address, Some(address));
-
-        let event_only = CoalesceTarget::new(Some("c".repeat(64)), None).expect("an event target");
-        assert_eq!(event_only.key, format!("e:{}", "c".repeat(64)));
-        assert!(CoalesceTarget::new(None, None).is_none());
-    }
-
-    #[test]
     fn collapse_key_is_stable_and_within_the_apns_limit() {
         let group = "like:owner:target:42";
         let key = collapse_key_for_group(group);
@@ -1136,6 +1143,13 @@ mod tests {
             ("New like".to_string(), "alice liked your post".to_string())
         );
         assert_eq!(
+            summary_copy("like", "alice", 2),
+            (
+                "New likes".to_string(),
+                "alice and 1 other liked your post".to_string()
+            )
+        );
+        assert_eq!(
             summary_copy("like", "alice", 13),
             (
                 "New likes".to_string(),
@@ -1146,7 +1160,7 @@ mod tests {
             summary_copy("repost", "bob", 2),
             (
                 "New reposts".to_string(),
-                "bob and 1 others reposted your post".to_string()
+                "bob and 1 other reposted your post".to_string()
             )
         );
         assert_eq!(
@@ -1660,6 +1674,39 @@ mod tests {
             .await
             .unwrap();
         assert!(score.is_none(), "a dangling member must be removed");
+    }
+
+    #[tokio::test]
+    async fn oldest_due_age_tracks_the_head_of_the_queue() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        assert_eq!(
+            oldest_due_age_seconds(&pool).await.unwrap(),
+            0,
+            "an empty queue has no age"
+        );
+
+        let gid = format!("like:{}:e:{}:1", "a".repeat(64), Uuid::new_v4());
+        let score = Timestamp::now().as_secs().saturating_sub(100);
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZADD")
+            .arg(DUE_KEY)
+            .arg(score)
+            .arg(&gid)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let age = oldest_due_age_seconds(&pool).await.unwrap();
+        assert!(
+            age >= 100,
+            "the gauge must report the backdated head, got {age}"
+        );
+        cleanup_group(&pool, &gid).await;
     }
 
     struct PanickingFcmSender {

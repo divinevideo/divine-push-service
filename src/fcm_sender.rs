@@ -886,6 +886,59 @@ mod tests {
         assert_eq!(json, expected);
     }
 
+    #[test]
+    fn test_collapse_key_reaches_the_android_and_apns_transport_blocks() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("title".to_string(), "New likes".to_string());
+        data.insert(
+            "body".to_string(),
+            "alice and 2 others liked your post".to_string(),
+        );
+
+        let payload = FcmPayload {
+            notification: None,
+            data: Some(data),
+            android: None,
+            webpush: None,
+            apns: None,
+            collapse_key: Some("0123456789abcdef0123456789abcdef".to_string()),
+        };
+
+        let android = build_android_config(&payload).expect("android config should exist");
+        assert_eq!(android["priority"], "high");
+        assert_eq!(android["collapse_key"], "0123456789abcdef0123456789abcdef");
+
+        let apns = build_apns_config(&payload).expect("apns config should exist");
+        assert_eq!(apns["headers"]["apns-push-type"], "alert");
+        assert_eq!(
+            apns["headers"]["apns-collapse-id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn test_without_a_collapse_key_the_transport_blocks_are_unchanged() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("title".to_string(), "New like".to_string());
+        data.insert("body".to_string(), "Alice liked your post".to_string());
+
+        let payload = FcmPayload {
+            notification: None,
+            data: Some(data),
+            android: None,
+            webpush: None,
+            apns: None,
+            collapse_key: None,
+        };
+
+        let android = build_android_config(&payload).expect("android config should exist");
+        assert_eq!(android, serde_json::json!({ "priority": "high" }));
+        assert!(android.get("collapse_key").is_none());
+
+        let apns = build_apns_config(&payload).expect("apns config should exist");
+        assert!(apns["headers"].get("apns-collapse-id").is_none());
+    }
+
     // ---------------------------------------------------------------------
     // Error classification
     //

@@ -45,10 +45,13 @@ fixed `coalesce_window_secs` buckets aligned to the Redis server clock.
 - **The rest collect in the bucket** and flush once at the bucket boundary as a
   summary:
   - one buffered actor — title `New like`, body "`{name}` liked your post";
-  - more than one — title `New likes`, body
+  - two buffered actors — title `New likes`, body
+    "`{name}` and 1 other liked your post";
+  - more than two — title `New likes`, body
     "`{name}` and `{total - 1} others liked your post"`.
-  - Repost summary uses `New reposts` / "`{name}` and `{total - 1} others
-    reposted your post" / "`{name}` reposted your post".
+  - Repost summary uses `New reposts` / "`{name}` and 1 other
+    reposted your post" / "`{name}` and `{total - 1} others reposted your
+    post" / "`{name}` reposted your post".
 - The name in the summary is the first buffered actor, resolved at flush time;
   the count is the exact distinct-actor count of the buffered set.
 - Like and Repost groups are separate: a post with two likes and ten reposts
@@ -57,6 +60,11 @@ fixed `coalesce_window_secs` buckets aligned to the Redis server clock.
   addressable coordinate cannot be summarized ("others liked your post" would
   cross posts), so those events keep today's immediate path and are not
   coalesced.
+- Grouping follows the **directly acted-upon** reference: the lowercase `e`/`a`
+  tag. An uppercase NIP-22 `A` root is only a fallback, so a reaction that
+  carries its target's root coordinate does not merge with reactions on other
+  objects under the same root. The summary payload keeps the root-aware
+  reference fields the immediate payload uses, so routing is unchanged.
 
 The per-recipient token bucket demotes a would-be immediate push into the
 bucket instead of sending it. The immediate slot is not consumed by a
@@ -168,9 +176,11 @@ one atomic step:
   `pending == 0` (all of its events were sent immediately, or its buffered set
   was already flushed) is deleted, never re-added. This covers the case the
   revision-8 review flagged.
-- **Absence from both indexes.** A pending group is re-added to `coalesce:due`
-  only when it is absent from both `coalesce:due` and `coalesce:leases`. A live
-  flush's entry is never duplicated by reconciliation.
+- **No duplicate against a competing live entry.** Only expired entries are
+  iterated, so a live flush is never a reconciliation candidate. After the
+  expired member is removed, a pending group is re-added to `coalesce:due` only
+  when it is absent from `coalesce:due`; the `leases` predicate in the script is
+  a defensive assertion that reads false at that point by construction.
 - A dangling index member whose group key expired is removed and skipped.
 
 ## FCM collapse
@@ -180,8 +190,17 @@ one atomic step:
 - iOS gets `apns-collapse-id` in the `headers` block.
 - The key is derived from the group id: the first 16 bytes of its BLAKE3 digest,
   hex-encoded (32 characters, within APNs' 64-byte limit). Immediate and
-  buffered pushes for the same group share the key, so a summary replaces the
-  earlier banners for that group on the device.
+  buffered pushes for the same group share the key.
+- **What collapse does per platform.** `apns-collapse-id` replaces the
+  displayed banner in Notification Center, so on iOS the summary replaces the
+  earlier immediate banners. FCM's `android.collapse_key` coalesces messages
+  *queued while the device is offline*; it does not replace a notification the
+  app has already posted. Android data-only pushes are rendered by the app, and
+  the current client derives its local notification id from the message
+  timestamp rather than the collapse key, so on Android a burst still shows the
+  immediate banners plus the summary. Replacing them requires a client change
+  to key its local notification on the collapse key; that is out of scope here
+  and is listed as an accepted loss with the on-device verification gap.
 
 ## Configuration
 
@@ -203,7 +222,7 @@ New `service` settings, each rejected at zero:
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
 | `push_coalesced_sends_total` | Counter | `type` (`like`/`repost`) | Summary pushes sent |
-| `push_coalesce_oldest_due_age_seconds` | Gauge | — | Age of the claimed group's bucket deadline at claim time |
+| `push_coalesce_oldest_due_age_seconds` | Gauge | — | Age of the oldest group that is due now, sampled on every worker pass |
 | `push_throttled_recipients_total` | Counter | `type` | Would-be immediate pushes demoted by the token bucket |
 
 ## Accepted losses
@@ -211,10 +230,20 @@ New `service` settings, each rejected at zero:
 - **FCM's four-collapse-key-per-device limit.** A device tracking more than
   four groups at once can have older groups' collapse behavior degraded. The
   summary still delivers; only the replacement behavior is affected.
+- **Android banners are not replaced by the summary today.** FCM's
+  `android.collapse_key` coalesces messages queued while the device is offline;
+  it does not replace a notification the app already posted, and the current
+  client derives its local notification id from the timestamp. A burst on
+  Android therefore shows the immediate banners plus the summary. Replacing
+  them needs a client change to key the local notification on the collapse key.
+  The coalescing value — four banners instead of five hundred — stands either
+  way, and the key is already on the wire so the client change is not blocked
+  on a service deploy.
 - **Duplicate summaries after a crash.** A worker that sends and dies before
   completing leaves the group to be reclaimed after its lease expires, so the
-  summary can be sent twice. The collapse key makes the duplicate replace the
-  first banner rather than stack, and the individual likes remain in the inbox.
+  summary can be sent twice. On iOS the collapse id makes the duplicate replace
+  the first banner; on Android it is an extra banner until the client change
+  above. The individual likes remain in the inbox either way.
 - **Mixed-version rollout during the deploy that lands this change.** A replica
   still running the old build sends like/repost pushes immediately with no
   group or collapse key, and can process an event the new build already buffered
@@ -223,8 +252,17 @@ New `service` settings, each rejected at zero:
   the new build would have coalesced, and a summary may double-count an actor
   who was also sent immediately. Both are visible as extra banners, not lost
   notifications.
+- **Redis footprint grows per immediate interaction.** Every immediate
+  like/repost also writes a group hash and a disposition string; every buffered
+  one adds a HyperLogLog and a `coalesce:due` member, all on the window-plus-
+  grace TTL (three hours by default) on top of today's `dedup:` claim. The
+  coordinate half of the target is attacker-chosen, exactly as the existing
+  `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` key already is, but the
+  number of such keys is higher. The capacity sizing that gates allowlist
+  removal (`divinevideo/divine-iac-coreconfig#1932`) must account for this
+  schema.
 - **No client-side verification here.** On-device Android and iOS checks that
-  the data-only contract is intact and that collapse replaces banners are
+  the data-only contract is intact and that collapse behaves as documented are
   required by the issue but cannot run in this environment. They are recorded
   as an open verification gap.
 
@@ -232,16 +270,20 @@ New `service` settings, each rejected at zero:
 
 Committed regression tests:
 
-- config: every new setting rejected at zero; shipped configs load.
+- config: every new setting rejected at zero; shipped configs carry each new
+  key with its documented value.
 - ingest: first N immediate, the rest buffered; replay returns the original
   decision; bucket rollover resets the immediate budget and gives replay a
-  stable collapse id.
+  stable collapse id; grouping follows the direct reference rather than the
+  NIP-22 root.
 - throttle: a recipient at capacity has an immediate push demoted into the
   bucket, and the demoted event does not consume an immediate slot.
-- claim/lease: an expired lease is reclaimed; a live claim is not duplicated by
-  reconciliation; an empty group is deleted rather than re-added.
-- delivery: a flush sends one summary with the collapse key; a panicking FCM
-  send is contained and the group still completes; a malformed or dangling
-  group is discarded without stopping the worker.
+- claim/lease: an expired lease is reclaimed; an empty group is deleted rather
+  than re-added; completion requires the lease token; a dangling index member
+  is dropped.
+- metrics: the oldest-due-age sample reads the head of the due queue.
+- delivery: a flush sends one summary; a panicking FCM send is contained and
+  the group still completes; the collapse key reaches the Android and APNs
+  transport blocks on the wire.
 
 Open: on-device collapse behavior (above).

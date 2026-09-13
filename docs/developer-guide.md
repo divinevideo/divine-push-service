@@ -249,8 +249,11 @@ One popular post must not buzz its author once per like. Kinds 7 (Like) and 16
   would-be-immediate push into the bucket instead of dropping it.
 - Immediate and summary pushes for one group share an FCM collapse key derived
   from the group id: `android.collapse_key` for Android (which stays data-only)
-  and the `apns-collapse-id` header for iOS, so the summary replaces the
-  earlier banners.
+  and the `apns-collapse-id` header for iOS. On iOS the summary replaces the
+  earlier banner. On Android, FCM's collapse key only coalesces messages queued
+  while the device is offline; the app renders the banners itself and does not
+  key them on the collapse key yet, so a burst still shows the immediate
+  banners plus the summary until the client uses it.
 
 Comments, mentions, and new-post ("bell") notifications are deliberately not
 coalesced: they have no reliably retrievable durable inbox row, so collapsing

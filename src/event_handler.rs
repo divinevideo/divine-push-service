@@ -2346,12 +2346,16 @@ fn referenced_event_id(event: &Event) -> Option<String> {
 /// pubkey and d-tag). A d-tag may itself contain `:`, so only the first two
 /// separators are split.
 fn referenced_coordinate(event: &Event) -> Option<ReferencedCoordinate> {
-    let address = event
+    event
         .tags
         .find(TagKind::single_letter(Alphabet::A, true))
         .or_else(|| event.tags.find(TagKind::a()))
-        .and_then(|tag| tag.content())?;
+        .and_then(|tag| tag.content())
+        .and_then(parse_coordinate)
+}
 
+/// Parse one `kind:pubkey:d-tag` coordinate string.
+fn parse_coordinate(address: &str) -> Option<ReferencedCoordinate> {
     let mut parts = address.splitn(3, ':');
     let kind = parts.next()?;
     let author_pubkey = parts.next()?;
@@ -2374,9 +2378,14 @@ fn referenced_coordinate(event: &Event) -> Option<ReferencedCoordinate> {
 /// A summary groups interactions by the post they point at, so an event with
 /// neither an event reference nor an addressable coordinate cannot be
 /// coalesced without mixing posts in one count. Those events keep the
-/// immediate path. Both references are carried when present, so the summary
-/// reproduces the immediate payload's routing fields; the coordinate wins the
-/// group key because it is stable across edits.
+/// immediate path.
+///
+/// Grouping uses the *directly acted-upon* object — the lowercase `e`/`a`
+/// reference — not the NIP-22 root scope. A reaction that also carries an
+/// uppercase `A` root would otherwise group with every other reaction under
+/// that root, mixing likes on different comments into one summary. The
+/// payload reference fields keep the root-aware values the immediate payload
+/// uses, so routing is unchanged.
 fn coalesce_target(event: &Event) -> Option<coalesce::CoalesceTarget> {
     let event_id = referenced_event_id(event);
     let address = referenced_coordinate(event).map(|coordinate| coalesce::TargetAddress {
@@ -2386,7 +2395,34 @@ fn coalesce_target(event: &Event) -> Option<coalesce::CoalesceTarget> {
         d_tag: coordinate.d_tag,
     });
 
-    coalesce::CoalesceTarget::new(event_id, address)
+    let direct_event = event
+        .tags
+        .find(TagKind::e())
+        .and_then(|tag| tag.content())
+        .map(str::to_string);
+    let direct_address = event
+        .tags
+        .find(TagKind::a())
+        .and_then(|tag| tag.content())
+        .and_then(parse_coordinate);
+
+    let key = if let Some(direct_address) = &direct_address {
+        format!("a:{}", direct_address.address)
+    } else if let Some(direct_event) = &direct_event {
+        format!("e:{direct_event}")
+    } else if let Some(address) = &address {
+        format!("a:{}", address.address)
+    } else if let Some(event_id) = &event_id {
+        format!("e:{event_id}")
+    } else {
+        return None;
+    };
+
+    Some(coalesce::CoalesceTarget {
+        key,
+        event_id,
+        address,
+    })
 }
 
 /// Format a short version of an npub for display
@@ -5430,6 +5466,50 @@ mod tests {
         assert_eq!(data.get("referencedDTag"), Some(&"weird:d:tag".to_string()));
     }
 
+    #[test]
+    fn coalesce_target_groups_by_the_direct_reference() {
+        let actor = Keys::generate();
+        let comment_id = "c".repeat(64);
+        let comment_coordinate = format!("1111:{}:comment-1", "a".repeat(64));
+        let root_coordinate = format!("34236:{}:video-1", "b".repeat(64));
+
+        // A reaction that carries both the direct references and a NIP-22 root
+        // `A` tag: grouping must follow the comment, not the root video.
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["e", comment_id.as_str()]).unwrap())
+            .tag(Tag::parse(["a", comment_coordinate.as_str()]).unwrap())
+            .tag(Tag::parse(["A", root_coordinate.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let target = coalesce_target(&event).expect("direct references exist");
+        assert_eq!(target.key, format!("a:{comment_coordinate}"));
+        assert_eq!(target.event_id.as_deref(), Some(comment_id.as_str()));
+        assert_eq!(
+            target.address.as_ref().map(|a| a.address.as_str()),
+            Some(root_coordinate.as_str()),
+            "the payload keeps the root-aware coordinate the immediate push uses"
+        );
+    }
+
+    #[test]
+    fn coalesce_target_falls_back_to_the_root_and_accepts_none() {
+        let actor = Keys::generate();
+        let root_coordinate = format!("34236:{}:video-1", "b".repeat(64));
+
+        let root_only = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["A", root_coordinate.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+        let target = coalesce_target(&root_only).expect("a root reference is still a target");
+        assert_eq!(target.key, format!("a:{root_coordinate}"));
+
+        let bare = EventBuilder::new(Kind::Reaction, "+")
+            .sign_with_keys(&actor)
+            .unwrap();
+        assert!(coalesce_target(&bare).is_none());
+    }
+
     /// End to end for the coalescing contract: two immediate pushes, then a
     /// summary whose banner replaces theirs on the device via the collapse key.
     #[tokio::test]
@@ -5574,7 +5654,7 @@ mod tests {
         assert_eq!(data.get("type"), Some(&"like".to_string()));
         assert!(
             data.get("body")
-                .is_some_and(|body| body.contains("and 1 others liked your post")),
+                .is_some_and(|body| body.contains("and 1 other liked your post")),
             "summary body must carry the bucket's actor count: {data:?}"
         );
         assert_eq!(
