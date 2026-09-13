@@ -20,8 +20,9 @@ preference promise below.
   review and refreshes citations against current `main`. Architecture is
   unchanged.
   1. Reconciliation never re-adds a group with nothing pending.
-  2. Reconciliation requires absence from **both** the `due` and `leases`
-     indexes before re-adding a group.
+  2. Reconciliation must never requeue a group a live flush owns. The
+     implementation enforces that by making only expired lease entries
+     candidates and checking `due` before re-adding (see Reconciliation).
   3. The dependency on #72 is named: flush-time preference revalidation reads
      stored preferences, and #72 says an update can be dropped for a week.
   4. The logical-expiry grace setting is named and validated
@@ -60,11 +61,13 @@ fixed `coalesce_window_secs` buckets aligned to the Redis server clock.
   addressable coordinate cannot be summarized ("others liked your post" would
   cross posts), so those events keep today's immediate path and are not
   coalesced.
-- Grouping follows the **directly acted-upon** reference: the lowercase `e`/`a`
-  tag. An uppercase NIP-22 `A` root is only a fallback, so a reaction that
-  carries its target's root coordinate does not merge with reactions on other
-  objects under the same root. The summary payload keeps the root-aware
-  reference fields the immediate payload uses, so routing is unchanged.
+- Grouping follows the **directly acted-upon** reference: the lowercase `a`
+  coordinate, or the **last** lowercase `e` tag (NIP-25 puts the reacted event
+  last when a reaction copies root and reply tags). An uppercase NIP-22 `A`/`E`
+  root is only a fallback, so a reaction that carries its target's root does not
+  merge with reactions on other objects under the same root. The summary payload
+  keeps the root-aware reference fields the immediate payload uses, so routing
+  is unchanged.
 
 The per-recipient token bucket demotes a would-be immediate push into the
 bucket instead of sending it. The immediate slot is not consumed by a
@@ -274,8 +277,8 @@ Committed regression tests:
   key with its documented value.
 - ingest: first N immediate, the rest buffered; replay returns the original
   decision; bucket rollover resets the immediate budget and gives replay a
-  stable collapse id; grouping follows the direct reference rather than the
-  NIP-22 root.
+  stable collapse id; grouping follows the directly acted-upon reference (the
+  last lowercase `e`, per NIP-25) rather than the root scope.
 - throttle: a recipient at capacity has an immediate push demoted into the
   bucket, and the demoted event does not consume an immediate slot.
 - claim/lease: an expired lease is reclaimed; an empty group is deleted rather

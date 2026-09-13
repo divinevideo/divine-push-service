@@ -2380,10 +2380,11 @@ fn parse_coordinate(address: &str) -> Option<ReferencedCoordinate> {
 /// coalesced without mixing posts in one count. Those events keep the
 /// immediate path.
 ///
-/// Grouping uses the *directly acted-upon* object — the lowercase `e`/`a`
-/// reference — not the NIP-22 root scope. A reaction that also carries an
-/// uppercase `A` root would otherwise group with every other reaction under
-/// that root, mixing likes on different comments into one summary. The
+/// Grouping uses the *directly acted-upon* object. For `e` references that is
+/// the **last** lowercase `e` tag: NIP-25 puts the reacted event last when a
+/// reaction copies the root and reply tags. Uppercase `A`/`E` root-scope
+/// references are only a fallback, so a reaction carrying its target's root
+/// coordinate does not group with every other reaction under that root. The
 /// payload reference fields keep the root-aware values the immediate payload
 /// uses, so routing is unchanged.
 fn coalesce_target(event: &Event) -> Option<coalesce::CoalesceTarget> {
@@ -2397,8 +2398,10 @@ fn coalesce_target(event: &Event) -> Option<coalesce::CoalesceTarget> {
 
     let direct_event = event
         .tags
-        .find(TagKind::e())
-        .and_then(|tag| tag.content())
+        .iter()
+        .filter(|tag| tag.kind() == TagKind::e())
+        .filter_map(|tag| tag.content())
+        .last()
         .map(str::to_string);
     let direct_address = event
         .tags
@@ -5493,6 +5496,30 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_target_uses_the_last_direct_event_reference() {
+        let actor = Keys::generate();
+        let root_id = "d".repeat(64);
+        let reacted_id = "e".repeat(64);
+
+        // NIP-25: when a reaction carries both the root and the reacted event,
+        // the reacted event is the last `e` tag. Grouping must follow it; the
+        // payload's routing field keeps its pre-existing first-`e` value.
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["e", root_id.as_str()]).unwrap())
+            .tag(Tag::parse(["e", reacted_id.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let target = coalesce_target(&event).expect("references exist");
+        assert_eq!(target.key, format!("e:{reacted_id}"));
+        assert_eq!(
+            target.event_id.as_deref(),
+            Some(root_id.as_str()),
+            "payload routing keeps the pre-existing first-e behavior"
+        );
+    }
+
+    #[test]
     fn coalesce_target_falls_back_to_the_root_and_accepts_none() {
         let actor = Keys::generate();
         let root_coordinate = format!("34236:{}:video-1", "b".repeat(64));
@@ -5511,7 +5538,9 @@ mod tests {
     }
 
     /// End to end for the coalescing contract: two immediate pushes, then a
-    /// summary whose banner replaces theirs on the device via the collapse key.
+    /// summary sharing their collapse key. iOS replaces the earlier banner from
+    /// that key; Android banner replacement depends on the client (see the
+    /// plan's accepted losses), so this asserts the wire contract only.
     #[tokio::test]
     async fn like_bursts_coalesce_after_the_immediate_limit() {
         let _guard = crate::coalesce::test_lock().lock().await;
