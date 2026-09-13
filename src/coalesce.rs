@@ -1,0 +1,1761 @@
+//! Like and repost coalescing.
+//!
+//! One popular post must not buzz its author once per like. The first few
+//! interactions in a two-hour bucket still send immediately; the rest collect
+//! in a per-`(recipient, type, target, bucket)` group and flush once as a
+//! summary. Bucket boundaries and deadlines come from the Redis server clock
+//! (`TIME`) inside the ingest script, so every replica agrees and no client
+//! clock participates.
+//!
+//! The design record is `docs/plans/like-repost-coalescing.md`. Two properties
+//! carry the correctness here:
+//!
+//! - A group is immutable once its bucket deadline passes. An event arriving
+//!   after the deadline computes the next bucket and can never join a group
+//!   that is being flushed, so the flush snapshot cannot miss late work.
+//! - Ingest decides and records everything in one Lua script. A replay reads
+//!   the stored disposition and reproduces the original decision and collapse
+//!   id; it never double-counts.
+//!
+//! Comments, mentions, and new-post ("bell") notifications deliberately do not
+//! coalesce: they have no reliably retrievable durable inbox row, so collapsing
+//! one can lose it permanently.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use nostr_sdk::{PublicKey, Timestamp, ToBech32};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::config::ServiceSettings;
+use crate::error::{Result, ServiceError};
+use crate::fcm_sender::FcmError;
+use crate::models::FcmPayload;
+use crate::preferences::{self, NotificationType};
+use crate::redis_store::{self, RedisPool};
+use crate::state::AppState;
+
+/// Key prefixes for the coalescing schema. Kept as prefixes rather than built
+/// keys because the ingest and claim scripts compose the full keys inside the
+/// script, after the bucket is derived from server time.
+pub const GROUP_PREFIX: &str = "coalesce:g:";
+pub const HLL_PREFIX: &str = "coalesce:hll:";
+pub const DISP_PREFIX: &str = "coalesce:disp:";
+pub const DUE_KEY: &str = "coalesce:due";
+pub const LEASES_KEY: &str = "coalesce:leases";
+pub const THROTTLE_PREFIX: &str = "coalesce:throttle:";
+
+/// Expired leases reconciled in one claim call. Bounded so one claim cannot
+/// stall Redis behind an unbounded recovery pass.
+const MAX_RECOVERY_PER_CLAIM: usize = 64;
+/// Dangling due members removed in one claim call, bounded for the same reason.
+const MAX_DANGLING_SKIPS: usize = 8;
+
+/// Where a like/repost points. A summary can only be built for a group with a
+/// stable target, so events without one keep the immediate path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoalesceTarget {
+    /// Redis-safe target identity: `e:{event-id-hex}` or
+    /// `a:{kind:pubkey:d-tag}`.
+    pub key: String,
+    /// Event reference, when the trigger pointed at an event.
+    pub event_id: Option<String>,
+    /// Addressable reference, when the trigger pointed at a coordinate.
+    pub address: Option<TargetAddress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetAddress {
+    pub address: String,
+    pub kind: String,
+    pub author_pubkey: String,
+    pub d_tag: String,
+}
+
+impl CoalesceTarget {
+    /// Build a target from an event's references.
+    ///
+    /// Both references are kept when the event carries both, because the
+    /// summary payload must reproduce the same routing fields the immediate
+    /// payload derives. The addressable coordinate wins the group key: it is
+    /// stable across edits, so likes on the same video group together even if
+    /// they cite different event ids.
+    pub fn new(event_id: Option<String>, address: Option<TargetAddress>) -> Option<Self> {
+        if let Some(address) = address {
+            let key = format!("a:{}", address.address);
+            return Some(Self {
+                key,
+                event_id,
+                address: Some(address),
+            });
+        }
+        event_id.map(|event_id| Self {
+            key: format!("e:{event_id}"),
+            event_id: Some(event_id),
+            address: None,
+        })
+    }
+
+    pub fn event(event_id: impl Into<String>) -> Self {
+        let event_id = event_id.into();
+        Self {
+            key: format!("e:{event_id}"),
+            event_id: Some(event_id),
+            address: None,
+        }
+    }
+
+    pub fn address(address: TargetAddress) -> Self {
+        Self {
+            key: format!("a:{}", address.address),
+            event_id: None,
+            address: Some(address),
+        }
+    }
+}
+
+/// One ingest decision, as recorded in the disposition key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoalesceDecision {
+    /// Deliver now. The collapse key must ride on the FCM payload.
+    Immediate {
+        group_id: String,
+        collapse_key: String,
+    },
+    /// Recorded in the bucket; no push now.
+    Buffered { group_id: String },
+}
+
+/// Data the ingest script needs from the trigger event.
+#[derive(Debug, Clone)]
+pub struct Ingest<'a> {
+    pub event_id: &'a str,
+    pub event_kind: u16,
+    pub actor: &'a str,
+    pub created_at: u64,
+    pub notification_type: NotificationType,
+    pub target: &'a CoalesceTarget,
+}
+
+/// A claim on one due group. `token` is this worker's ownership proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupClaim {
+    pub group_id: String,
+    pub token: String,
+}
+
+/// The buffered state of one group, read after its deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSnapshot {
+    pub group_id: String,
+    pub notification_type: String,
+    pub owner: String,
+    pub target: String,
+    pub due: u64,
+    pub pending: u64,
+    /// Immediate sends already spent in this bucket.
+    pub immediate: u64,
+    pub first_actor: Option<String>,
+    pub first_event: Option<String>,
+    pub last_at: Option<u64>,
+    pub event_kind: Option<String>,
+    pub ref_event_id: Option<String>,
+    pub ref_address: Option<String>,
+    pub ref_kind: Option<String>,
+    pub ref_author: Option<String>,
+    pub ref_dtag: Option<String>,
+    /// Distinct buffered actors, from the HyperLogLog.
+    pub actor_count: u64,
+}
+
+/// Derive the FCM collapse identity for a group.
+///
+/// BLAKE3 of the group id, first 16 bytes, hex: deterministic across replicas
+/// and 32 characters, within APNs' 64-byte `apns-collapse-id` limit.
+pub fn collapse_key_for_group(group_id: &str) -> String {
+    let digest = blake3::hash(group_id.as_bytes());
+    hex::encode(&digest.as_bytes()[..16])
+}
+
+fn disposition_key(event_id: &str, recipient: &PublicKey) -> String {
+    format!("{DISP_PREFIX}{event_id}:{}", recipient.to_hex())
+}
+
+/// Decide and record one like/repost ingest atomically.
+///
+/// Returns the stored decision on a replay. Callers must hold the
+/// `(event_id, recipient)` claim before calling: the claim is what keeps two
+/// replicas from processing the same event, and the disposition then makes any
+/// replay of a released claim reproduce the original decision.
+pub async fn ingest(
+    pool: &RedisPool,
+    settings: &ServiceSettings,
+    recipient: &PublicKey,
+    ingest: &Ingest<'_>,
+) -> Result<CoalesceDecision> {
+    const INGEST_SCRIPT: &str = r#"
+        local disp_key = KEYS[1]
+        local due_key = KEYS[2]
+
+        local window = tonumber(ARGV[1])
+        local limit = tonumber(ARGV[2])
+        local ttl = tonumber(ARGV[3])
+        local capacity = tonumber(ARGV[4])
+        local refill_secs = tonumber(ARGV[5])
+        local throttle_ttl = tonumber(ARGV[6])
+        local group_prefix = ARGV[7]
+        local hll_prefix = ARGV[8]
+        local throttle_prefix = ARGV[9]
+        local ntype = ARGV[10]
+        local owner = ARGV[11]
+        local target = ARGV[12]
+        local actor = ARGV[13]
+        local event_id = ARGV[14]
+        local event_kind = ARGV[15]
+        local created_at = tonumber(ARGV[16])
+        local ref_event_id = ARGV[17]
+        local ref_address = ARGV[18]
+        local ref_kind = ARGV[19]
+        local ref_author = ARGV[20]
+        local ref_dtag = ARGV[21]
+
+        -- Replay: the same decision and therefore the same collapse id.
+        local stored = redis.call('GET', disp_key)
+        if stored then
+          local code, gid = string.match(stored, '^(%a):(.+)$')
+          if code == 'i' then return {1, gid} end
+          if code == 'b' then return {2, gid} end
+        end
+
+        local now = tonumber(redis.call('TIME')[1])
+        local bucket = math.floor(now / window)
+        local due_at = (bucket + 1) * window
+        local gid = ntype .. ':' .. owner .. ':' .. target .. ':' .. bucket
+        local gkey = group_prefix .. gid
+
+        local immediate = tonumber(redis.call('HGET', gkey, 'immediate') or '0')
+        local send_immediately = false
+        local throttled = false
+
+        if immediate < limit then
+          local tkey = throttle_prefix .. owner
+          local now_ms = now * 1000
+          local tokens = tonumber(redis.call('HGET', tkey, 'tokens'))
+          local ts = tonumber(redis.call('HGET', tkey, 'ts'))
+          if tokens == nil then tokens = capacity end
+          if ts == nil then ts = now_ms end
+          local elapsed = now_ms - ts
+          if elapsed < 0 then elapsed = 0 end
+          tokens = math.min(capacity, tokens + elapsed / (refill_secs * 1000))
+          if tokens >= 1 then
+            tokens = tokens - 1
+            send_immediately = true
+          else
+            throttled = true
+          end
+          redis.call('HSET', tkey, 'tokens', tokens, 'ts', now_ms)
+          redis.call('EXPIRE', tkey, throttle_ttl)
+        end
+
+        redis.call('HSETNX', gkey, 'due', due_at)
+        redis.call('HSETNX', gkey, 'owner', owner)
+        redis.call('HSETNX', gkey, 'type', ntype)
+        redis.call('HSETNX', gkey, 'target', target)
+        redis.call('HSETNX', gkey, 'event_kind', event_kind)
+        if ref_event_id ~= '' then
+          redis.call('HSETNX', gkey, 'ref_event_id', ref_event_id)
+        end
+        if ref_address ~= '' then
+          redis.call('HSETNX', gkey, 'ref_address', ref_address)
+          redis.call('HSETNX', gkey, 'ref_kind', ref_kind)
+          redis.call('HSETNX', gkey, 'ref_author', ref_author)
+          redis.call('HSETNX', gkey, 'ref_dtag', ref_dtag)
+        end
+
+        if send_immediately then
+          redis.call('HINCRBY', gkey, 'immediate', 1)
+          redis.call('EXPIRE', gkey, ttl)
+          redis.call('SET', disp_key, 'i:' .. gid, 'EX', ttl)
+          return {1, gid}
+        end
+
+        redis.call('HINCRBY', gkey, 'pending', 1)
+        redis.call('HSETNX', gkey, 'first_actor', actor)
+        redis.call('HSETNX', gkey, 'first_event', event_id)
+        local last_at = tonumber(redis.call('HGET', gkey, 'last_at') or '0')
+        if created_at > last_at then
+          redis.call('HSET', gkey, 'last_at', created_at)
+        end
+        redis.call('PFADD', hll_prefix .. gid, actor)
+        redis.call('EXPIRE', gkey, ttl)
+        redis.call('EXPIRE', hll_prefix .. gid, ttl)
+        redis.call('ZADD', due_key, 'NX', due_at, gid)
+        redis.call('SET', disp_key, 'b:' .. gid, 'EX', ttl)
+        if throttled then
+          return {3, gid}
+        end
+        return {2, gid}
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+
+    let window = settings.coalesce_window_secs;
+    let ttl = window.saturating_add(settings.coalesce_logical_expiry_grace_secs);
+    // One full refill cycle on each side, so the bucket survives idle gaps
+    // between pushes without lingering forever.
+    let throttle_ttl = settings
+        .recipient_throttle_capacity
+        .saturating_mul(settings.recipient_throttle_refill_secs)
+        .saturating_mul(2)
+        .max(ttl);
+
+    let ref_event_id = ingest.target.event_id.clone().unwrap_or_default();
+    let (ref_address, ref_kind, ref_author, ref_dtag) = match &ingest.target.address {
+        Some(address) => (
+            address.address.clone(),
+            address.kind.clone(),
+            address.author_pubkey.clone(),
+            address.d_tag.clone(),
+        ),
+        None => (String::new(), String::new(), String::new(), String::new()),
+    };
+
+    let decision: (i64, String) = redis::Script::new(INGEST_SCRIPT)
+        .key(disposition_key(ingest.event_id, recipient))
+        .key(DUE_KEY)
+        .arg(window)
+        .arg(settings.coalesce_immediate_limit)
+        .arg(ttl)
+        .arg(settings.recipient_throttle_capacity)
+        .arg(settings.recipient_throttle_refill_secs)
+        .arg(throttle_ttl)
+        .arg(GROUP_PREFIX)
+        .arg(HLL_PREFIX)
+        .arg(THROTTLE_PREFIX)
+        .arg(ingest.notification_type.display_name())
+        .arg(recipient.to_hex())
+        .arg(&ingest.target.key)
+        .arg(ingest.actor)
+        .arg(ingest.event_id)
+        .arg(ingest.event_kind)
+        .arg(ingest.created_at)
+        .arg(ref_event_id)
+        .arg(ref_address)
+        .arg(ref_kind)
+        .arg(ref_author)
+        .arg(ref_dtag)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    let collapse_key = collapse_key_for_group(&decision.1);
+    match decision.0 {
+        1 => Ok(CoalesceDecision::Immediate {
+            group_id: decision.1,
+            collapse_key,
+        }),
+        // 2 = buffered because the immediate budget is spent, 3 = buffered
+        // because the recipient's token bucket was empty. Both are buffered;
+        // only the metric differs, and the caller reads it from this code.
+        3 => {
+            crate::metrics::throttled_recipient(ingest.notification_type.display_name());
+            Ok(CoalesceDecision::Buffered {
+                group_id: decision.1,
+            })
+        }
+        _ => Ok(CoalesceDecision::Buffered {
+            group_id: decision.1,
+        }),
+    }
+}
+
+/// Claim the oldest due group, reconciling expired leases first.
+///
+/// Expired entries are handled inside the same atomic script: an entry with
+/// nothing pending is deleted (never re-added), and a pending entry returns to
+/// the due queue only when it is absent from both indexes.
+pub async fn claim_due_group(pool: &RedisPool, lease_secs: u64) -> Result<Option<GroupClaim>> {
+    const CLAIM_SCRIPT: &str = r#"
+        local due_key = KEYS[1]
+        local leases_key = KEYS[2]
+        local group_prefix = ARGV[1]
+        local hll_prefix = ARGV[2]
+        local lease_secs = tonumber(ARGV[3])
+        local max_recovery = tonumber(ARGV[4])
+        local token = ARGV[5]
+        local max_dangling = tonumber(ARGV[6])
+
+        local now = tonumber(redis.call('TIME')[1])
+
+        -- Reconcile expired leases before taking new work.
+        local expired = redis.call('ZRANGEBYSCORE', leases_key, '-inf', now, 'LIMIT', 0, max_recovery)
+        for _, gid in ipairs(expired) do
+          local gkey = group_prefix .. gid
+          local pending = tonumber(redis.call('HGET', gkey, 'pending') or '0')
+          redis.call('ZREM', leases_key, gid)
+          if pending > 0 then
+            -- Re-add only when absent from BOTH indexes; a live flush's entry
+            -- must never be duplicated by reconciliation.
+            if redis.call('ZSCORE', due_key, gid) == false and redis.call('ZSCORE', leases_key, gid) == false then
+              local due_at = tonumber(redis.call('HGET', gkey, 'due') or '0')
+              if due_at <= 0 then due_at = now end
+              redis.call('ZADD', due_key, due_at, gid)
+            end
+          else
+            -- Nothing pending (every event was immediate, or the buffered set
+            -- was already flushed): not work, just stale state.
+            redis.call('DEL', gkey)
+            redis.call('DEL', hll_prefix .. gid)
+          end
+        end
+
+        local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', now, 'LIMIT', 0, max_dangling)
+        for _, gid in ipairs(candidates) do
+          local gkey = group_prefix .. gid
+          if redis.call('EXISTS', gkey) == 0 then
+            -- The group hash expired while queued; drop the dangling member.
+            redis.call('ZREM', due_key, gid)
+          else
+            redis.call('ZREM', due_key, gid)
+            redis.call('ZADD', leases_key, now + lease_secs, gid)
+            redis.call('HSET', gkey, 'lease', token)
+            return gid
+          end
+        end
+        return false
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let token = Uuid::new_v4().to_string();
+
+    let claimed: Option<String> = redis::Script::new(CLAIM_SCRIPT)
+        .key(DUE_KEY)
+        .key(LEASES_KEY)
+        .arg(GROUP_PREFIX)
+        .arg(HLL_PREFIX)
+        .arg(lease_secs)
+        .arg(MAX_RECOVERY_PER_CLAIM)
+        .arg(&token)
+        .arg(MAX_DANGLING_SKIPS)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(claimed.map(|group_id| GroupClaim { group_id, token }))
+}
+
+/// Complete a claimed group under its ownership token.
+///
+/// `requeue_after_secs` is `None` for a finished group (deleted) and
+/// `Some(delay)` to return it to the due queue for a later retry.
+pub async fn complete_group(
+    pool: &RedisPool,
+    claim: &GroupClaim,
+    requeue_after_secs: Option<u64>,
+) -> Result<bool> {
+    const COMPLETE_SCRIPT: &str = r#"
+        local leases_key = KEYS[1]
+        local due_key = KEYS[2]
+        local group_prefix = ARGV[1]
+        local hll_prefix = ARGV[2]
+        local gid = ARGV[3]
+        local token = ARGV[4]
+        local requeue_after = ARGV[5]
+
+        local gkey = group_prefix .. gid
+        if redis.call('HGET', gkey, 'lease') ~= token then
+          -- Another worker's lease owns this group now; never delete its work.
+          return 0
+        end
+        redis.call('ZREM', leases_key, gid)
+        if requeue_after ~= '' then
+          local now = tonumber(redis.call('TIME')[1])
+          redis.call('HDEL', gkey, 'lease')
+          redis.call('ZADD', due_key, now + tonumber(requeue_after), gid)
+          return 2
+        end
+        redis.call('DEL', gkey)
+        redis.call('DEL', hll_prefix .. gid)
+        return 1
+    "#;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let requeue = requeue_after_secs
+        .map(|secs| secs.to_string())
+        .unwrap_or_default();
+    let outcome: i64 = redis::Script::new(COMPLETE_SCRIPT)
+        .key(LEASES_KEY)
+        .key(DUE_KEY)
+        .arg(GROUP_PREFIX)
+        .arg(HLL_PREFIX)
+        .arg(&claim.group_id)
+        .arg(&claim.token)
+        .arg(requeue)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(outcome == 1)
+}
+
+/// Read one group's buffered state plus its distinct-actor count.
+///
+/// The two reads are not atomic, but a group cannot change after its bucket
+/// deadline: ingest computes the next bucket and writes a different key. The
+/// claim script only ever claims groups at or after their deadline.
+pub async fn load_group(pool: &RedisPool, group_id: &str) -> Result<Option<GroupSnapshot>> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+
+    let fields: HashMap<String, String> = redis::cmd("HGETALL")
+        .arg(format!("{GROUP_PREFIX}{group_id}"))
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    if fields.is_empty() {
+        return Ok(None);
+    }
+
+    // PFCOUNT answers 0 for a missing key, which is the right reading for a
+    // group whose HLL expired: there is nothing to summarize.
+    let actor_count: u64 = redis::cmd("PFCOUNT")
+        .arg(format!("{HLL_PREFIX}{group_id}"))
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    let get = |name: &str| fields.get(name).cloned();
+    let number = |name: &str| {
+        get(name)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+
+    Ok(Some(GroupSnapshot {
+        group_id: group_id.to_string(),
+        notification_type: get("type").unwrap_or_default(),
+        owner: get("owner").unwrap_or_default(),
+        target: get("target").unwrap_or_default(),
+        due: number("due"),
+        pending: number("pending"),
+        immediate: number("immediate"),
+        first_actor: get("first_actor"),
+        first_event: get("first_event"),
+        last_at: get("last_at").and_then(|value| value.parse::<u64>().ok()),
+        event_kind: get("event_kind"),
+        ref_event_id: get("ref_event_id"),
+        ref_address: get("ref_address"),
+        ref_kind: get("ref_kind"),
+        ref_author: get("ref_author"),
+        ref_dtag: get("ref_dtag"),
+        actor_count,
+    }))
+}
+
+/// Summary copy for one flush.
+///
+/// The name is the first buffered actor; the count is distinct actors. A single
+/// buffered actor gets the same sentence the immediate push would have used.
+pub fn summary_copy(
+    notification_type: &str,
+    sample_name: &str,
+    distinct_actors: u64,
+) -> (String, String) {
+    let name = if sample_name.is_empty() {
+        "Someone"
+    } else {
+        sample_name
+    };
+    match (notification_type, distinct_actors) {
+        ("repost", 0..=1) => (
+            "New repost".to_string(),
+            format!("{name} reposted your post"),
+        ),
+        ("repost", count) => (
+            "New reposts".to_string(),
+            format!("{name} and {} others reposted your post", count - 1),
+        ),
+        (_, 0..=1) => ("New like".to_string(), format!("{name} liked your post")),
+        (_, count) => (
+            "New likes".to_string(),
+            format!("{name} and {} others liked your post", count - 1),
+        ),
+    }
+}
+
+/// Build the data-only summary payload for a flushed group.
+pub fn build_summary_payload(
+    snapshot: &GroupSnapshot,
+    recipient: &PublicKey,
+    sample_name: &str,
+    collapse_key: &str,
+) -> FcmPayload {
+    let mut data = HashMap::new();
+
+    data.insert("type".to_string(), snapshot.notification_type.clone());
+    data.insert(
+        "eventId".to_string(),
+        snapshot
+            .first_event
+            .clone()
+            .unwrap_or_else(|| snapshot.target.clone()),
+    );
+
+    let (title, body) = summary_copy(
+        &snapshot.notification_type,
+        sample_name,
+        snapshot.actor_count,
+    );
+    data.insert("title".to_string(), title);
+    data.insert("body".to_string(), body);
+    if let Some(actor) = &snapshot.first_actor {
+        data.insert("senderPubkey".to_string(), actor.clone());
+    }
+    data.insert("senderName".to_string(), sample_name.to_string());
+    data.insert("receiverPubkey".to_string(), recipient.to_hex());
+    data.insert(
+        "receiverNpub".to_string(),
+        recipient.to_bech32().unwrap_or_default(),
+    );
+    data.insert(
+        "eventKind".to_string(),
+        snapshot.event_kind.clone().unwrap_or_default(),
+    );
+    data.insert(
+        "timestamp".to_string(),
+        snapshot.last_at.unwrap_or(snapshot.due).to_string(),
+    );
+
+    // Reproduce the same routing fields the immediate payload derives from the
+    // trigger event, so a tap on the summary opens the same target.
+    if let Some(event_id) = &snapshot.ref_event_id {
+        data.insert("referencedEventId".to_string(), event_id.clone());
+    }
+    if let Some(address) = &snapshot.ref_address {
+        data.insert("referencedAddress".to_string(), address.clone());
+        if let Some(kind) = &snapshot.ref_kind {
+            data.insert("referencedKind".to_string(), kind.clone());
+        }
+        if let Some(author) = &snapshot.ref_author {
+            data.insert("referencedAuthorPubkey".to_string(), author.clone());
+        }
+        if let Some(d_tag) = &snapshot.ref_dtag {
+            data.insert("referencedDTag".to_string(), d_tag.clone());
+        }
+    }
+
+    FcmPayload {
+        notification: None,
+        data: Some(data),
+        android: None,
+        webpush: None,
+        apns: None,
+        collapse_key: Some(collapse_key.to_string()),
+    }
+}
+
+fn short_npub(pubkey_hex: &str) -> String {
+    match PublicKey::from_hex(pubkey_hex) {
+        Ok(pubkey) => pubkey
+            .to_bech32()
+            .map(|npub| {
+                if npub.len() > 12 {
+                    format!("{}...", &npub[..12])
+                } else {
+                    npub
+                }
+            })
+            .unwrap_or_else(|_| "unknown".to_string()),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+/// What one flush attempt did, for logging and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlushOutcome {
+    Sent {
+        delivered: usize,
+        failed: usize,
+        actor_count: u64,
+    },
+    RetryQueued,
+    Suppressed {
+        reason: &'static str,
+    },
+    Empty,
+}
+
+/// Process one claimed group. Always attempts to complete the claim; an error
+/// means the group could not even be completed and the caller should requeue.
+pub(crate) async fn flush_group(
+    state: &AppState,
+    claim: &GroupClaim,
+    token: &CancellationToken,
+) -> Result<FlushOutcome> {
+    let Some(snapshot) = load_group(&state.redis_pool, &claim.group_id).await? else {
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Empty);
+    };
+
+    let now = Timestamp::now().as_secs();
+    crate::metrics::coalesce_oldest_due_age(now.saturating_sub(snapshot.due) as f64);
+
+    let Some(notification_type) = NotificationType::from_display_name(&snapshot.notification_type)
+    else {
+        warn!(
+            group_id = %claim.group_id,
+            ntype = %snapshot.notification_type,
+            "Discarding coalesced group with an unknown notification type"
+        );
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Empty);
+    };
+
+    if snapshot.pending == 0 {
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Empty);
+    }
+    if snapshot.actor_count == 0 {
+        // The hyperloglog is written and expired with the group, so this means
+        // it was evicted or lost independently. Dropping the summary loses no
+        // notification: the individual events remain in the recipient's inbox.
+        warn!(
+            group_id = %claim.group_id,
+            pending = snapshot.pending,
+            "Discarding coalesced group whose actor counter is missing"
+        );
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Empty);
+    }
+
+    let owner = match PublicKey::from_hex(&snapshot.owner) {
+        Ok(owner) => owner,
+        Err(e) => {
+            warn!(group_id = %claim.group_id, error = %e, "Discarding coalesced group with an unparseable owner");
+            complete_group(&state.redis_pool, claim, None).await?;
+            return Ok(FlushOutcome::Empty);
+        }
+    };
+
+    // Revalidate every gate the immediate path applies, because all of them can
+    // have changed since the event was buffered.
+    let allowed = &state.settings.service.allowed_pubkeys;
+    if !allowed.is_empty() && !allowed.contains(&snapshot.owner) {
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Suppressed {
+            reason: "not_allowlisted",
+        });
+    }
+
+    let tokens = redis_store::get_tokens_for_pubkey(&state.redis_pool, &owner).await?;
+    if tokens.is_empty() {
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Suppressed {
+            reason: "no_tokens",
+        });
+    }
+
+    let prefs = preferences::get_user_preferences(
+        &state.redis_pool,
+        &snapshot.owner,
+        &state.settings.notification.default_preferences,
+    )
+    .await?;
+    if !notification_type.is_enabled(&prefs) {
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Suppressed {
+            reason: "preference_disabled",
+        });
+    }
+
+    if token.is_cancelled() {
+        return Err(ServiceError::Cancelled);
+    }
+
+    let sample_name = match (&state.mention_parser_service, &snapshot.first_actor) {
+        (Some(parser), Some(actor)) => match parser.get_display_name(actor).await {
+            Ok(Some(name)) => name,
+            Ok(None) => short_npub(actor),
+            Err(e) => {
+                warn!(group_id = %claim.group_id, error = %e, "Failed to resolve summary actor name");
+                short_npub(actor)
+            }
+        },
+        (_, Some(actor)) => short_npub(actor),
+        (_, None) => "Someone".to_string(),
+    };
+
+    let collapse_key = collapse_key_for_group(&claim.group_id);
+    let payload = build_summary_payload(&snapshot, &owner, &sample_name, &collapse_key);
+
+    info!(
+        group_id = %claim.group_id,
+        owner = %snapshot.owner,
+        ntype = %snapshot.notification_type,
+        actor_count = snapshot.actor_count,
+        token_count = tokens.len(),
+        "Flushing coalesced notification group"
+    );
+
+    let results = state.fcm_client.send_batch(&tokens, payload).await;
+
+    let mut delivered = Vec::new();
+    let mut tokens_to_remove = Vec::new();
+    let mut failed = 0usize;
+    let mut retryable_failure = None;
+    for (fcm_token, result) in results {
+        match result {
+            Ok(()) => delivered.push(fcm_token),
+            Err(FcmError::TokenNotRegistered) => {
+                failed += 1;
+                tokens_to_remove.push(fcm_token);
+            }
+            Err(error) => {
+                failed += 1;
+                if let FcmError::RetryableInternal(delay) = &error {
+                    retryable_failure = Some(*delay);
+                }
+                error!(
+                    group_id = %claim.group_id,
+                    token_prefix = %crate::fcm_sender::token_prefix(&fcm_token),
+                    error = %error,
+                    "FCM summary send failed for token"
+                );
+            }
+        }
+    }
+
+    // Bookkeeping about a push that may already have shipped: log and continue
+    // rather than reporting the delivery as failed.
+    if !delivered.is_empty() {
+        if let Err(e) = redis_store::refresh_token_activity(&state.redis_pool, &delivered).await {
+            error!(group_id = %claim.group_id, error = %e, "Failed to refresh token activity after a delivered summary");
+        }
+    }
+    for fcm_token in tokens_to_remove {
+        match redis_store::remove_token(&state.redis_pool, &owner, &fcm_token).await {
+            Ok(removed) => {
+                if removed {
+                    crate::metrics::tokens_pruned("invalid", 1);
+                }
+            }
+            Err(e) => {
+                error!(group_id = %claim.group_id, error = %e, "Failed to remove invalid token after a summary");
+            }
+        }
+    }
+
+    if delivered.is_empty() {
+        if retryable_failure.is_some() {
+            complete_group(
+                &state.redis_pool,
+                claim,
+                Some(state.settings.service.coalesce_retry_secs),
+            )
+            .await?;
+            return Ok(FlushOutcome::RetryQueued);
+        }
+        complete_group(&state.redis_pool, claim, None).await?;
+        return Ok(FlushOutcome::Sent {
+            delivered: 0,
+            failed,
+            actor_count: snapshot.actor_count,
+        });
+    }
+
+    complete_group(&state.redis_pool, claim, None).await?;
+    crate::metrics::coalesced_send(notification_type.display_name());
+    Ok(FlushOutcome::Sent {
+        delivered: delivered.len(),
+        failed,
+        actor_count: snapshot.actor_count,
+    })
+}
+
+/// Runs the leased coalescing outbox. Both replicas run this worker.
+pub async fn run_coalesce_flush(state: Arc<AppState>, token: CancellationToken) -> Result<()> {
+    info!("Starting coalescing flush worker...");
+    let poll_interval = Duration::from_millis(state.settings.service.coalesce_poll_millis);
+
+    loop {
+        if token.is_cancelled() {
+            break;
+        }
+
+        let claim = tokio::select! {
+            biased;
+            _ = token.cancelled() => break,
+            result = claim_due_group(
+                &state.redis_pool,
+                state.settings.service.coalesce_lease_secs,
+            ) => result,
+        };
+
+        match claim {
+            Ok(Some(claim)) => {
+                if let Err(e) = flush_group(&state, &claim, &token).await {
+                    if matches!(e, ServiceError::Cancelled) {
+                        if let Err(release_error) =
+                            complete_group(&state.redis_pool, &claim, Some(0)).await
+                        {
+                            error!(error = %release_error, "Failed to release a coalesced group during shutdown; lease expiry will recover it");
+                        }
+                        break;
+                    }
+
+                    error!(error = %e, "Coalesced group flush failed; requeuing");
+                    if let Err(requeue_error) = complete_group(
+                        &state.redis_pool,
+                        &claim,
+                        Some(state.settings.service.coalesce_retry_secs),
+                    )
+                    .await
+                    {
+                        error!(error = %requeue_error, "Failed to requeue a coalesced group after a flush error; lease expiry will recover it");
+                    }
+                }
+            }
+            Ok(None) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to claim a coalesced group");
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            }
+        }
+    }
+
+    info!("Coalescing flush worker shut down.");
+    Ok(())
+}
+
+/// Serializes tests that share the global coalescing indexes.
+#[cfg(test)]
+pub(crate) fn test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fcm_sender::{FcmClient, FcmSend};
+    use crate::models::FcmPayload;
+    use async_trait::async_trait;
+    use nostr_sdk::Keys;
+    use std::sync::Arc;
+
+    async fn test_pool() -> Option<RedisPool> {
+        let base_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let mut redis_url = url::Url::parse(&base_url).ok()?;
+        // Keep this suite's global indexes out of every other test's keyspace.
+        redis_url.set_path("/15");
+        let pool = redis_store::create_pool(redis_url.as_str(), 3).await.ok()?;
+        let mut conn = pool.get().await.ok()?;
+        let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+        drop(conn);
+        pong.ok().map(|_| pool)
+    }
+
+    fn test_settings() -> ServiceSettings {
+        let mut service = crate::config::Settings::new()
+            .expect("runtime settings load")
+            .service;
+        service.allowed_pubkeys.clear();
+        service
+    }
+
+    fn random_target() -> CoalesceTarget {
+        CoalesceTarget::event(Uuid::new_v4().to_string())
+    }
+
+    fn random_actor() -> String {
+        Keys::generate().public_key().to_hex()
+    }
+
+    async fn reset_indexes(pool: &RedisPool) {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(DUE_KEY)
+            .arg(LEASES_KEY)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    async fn ingest_one(
+        pool: &RedisPool,
+        settings: &ServiceSettings,
+        owner: &PublicKey,
+        target: &CoalesceTarget,
+        event_id: &str,
+        actor: &str,
+    ) -> CoalesceDecision {
+        ingest(
+            pool,
+            settings,
+            owner,
+            &Ingest {
+                event_id,
+                event_kind: 7,
+                actor,
+                created_at: Timestamp::now().as_secs(),
+                notification_type: NotificationType::Like,
+                target,
+            },
+        )
+        .await
+        .expect("ingest should succeed")
+    }
+
+    /// Make a group claimable now, the way a real bucket deadline would.
+    async fn make_claimable(pool: &RedisPool, gid: &str) {
+        let now = Timestamp::now().as_secs();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("HSET")
+            .arg(format!("{GROUP_PREFIX}{gid}"))
+            .arg("due")
+            .arg(now)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        redis::cmd("ZADD")
+            .arg(DUE_KEY)
+            .arg(now)
+            .arg(gid)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    async fn cleanup_group(pool: &RedisPool, gid: &str) {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(format!("{GROUP_PREFIX}{gid}"))
+            .arg(format!("{HLL_PREFIX}{gid}"))
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        redis::cmd("ZREM")
+            .arg(DUE_KEY)
+            .arg(LEASES_KEY)
+            .arg(gid)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    async fn stored_disposition(
+        pool: &RedisPool,
+        event_id: &str,
+        owner: &PublicKey,
+    ) -> Option<String> {
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("GET")
+            .arg(disposition_key(event_id, owner))
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    fn test_state(
+        settings: crate::config::Settings,
+        pool: RedisPool,
+        fcm_client: FcmClient,
+    ) -> AppState {
+        AppState {
+            settings,
+            redis_pool: pool,
+            fcm_client: Arc::new(fcm_client),
+            service_keys: None,
+            crypto_service: None,
+            nostr_client: Arc::new(nostr_sdk::Client::default()),
+            profile_client: Arc::new(nostr_sdk::Client::default()),
+            mention_parser_service: None,
+        }
+    }
+
+    #[test]
+    fn target_keeps_both_references_and_groups_by_coordinate() {
+        let address = TargetAddress {
+            address: format!("34236:{}:vine", "a".repeat(64)),
+            kind: "34236".to_string(),
+            author_pubkey: "a".repeat(64),
+            d_tag: "vine".to_string(),
+        };
+        let target = CoalesceTarget::new(Some("b".repeat(64)), Some(address.clone()))
+            .expect("an addressable target");
+        assert_eq!(target.key, format!("a:{}", address.address));
+        assert_eq!(target.event_id, Some("b".repeat(64)));
+        assert_eq!(target.address, Some(address));
+
+        let event_only = CoalesceTarget::new(Some("c".repeat(64)), None).expect("an event target");
+        assert_eq!(event_only.key, format!("e:{}", "c".repeat(64)));
+        assert!(CoalesceTarget::new(None, None).is_none());
+    }
+
+    #[test]
+    fn collapse_key_is_stable_and_within_the_apns_limit() {
+        let group = "like:owner:target:42";
+        let key = collapse_key_for_group(group);
+        assert_eq!(key, collapse_key_for_group(group));
+        assert_eq!(key.len(), 32, "16 bytes of hex");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(key, collapse_key_for_group("like:owner:target:43"));
+        assert!(key.len() <= 64, "APNs caps apns-collapse-id at 64 bytes");
+    }
+
+    #[test]
+    fn summary_copy_uses_the_distinct_actor_count() {
+        assert_eq!(
+            summary_copy("like", "alice", 1),
+            ("New like".to_string(), "alice liked your post".to_string())
+        );
+        assert_eq!(
+            summary_copy("like", "alice", 13),
+            (
+                "New likes".to_string(),
+                "alice and 12 others liked your post".to_string()
+            )
+        );
+        assert_eq!(
+            summary_copy("repost", "bob", 2),
+            (
+                "New reposts".to_string(),
+                "bob and 1 others reposted your post".to_string()
+            )
+        );
+        assert_eq!(
+            summary_copy("repost", "bob", 1),
+            (
+                "New repost".to_string(),
+                "bob reposted your post".to_string()
+            )
+        );
+        assert_eq!(
+            summary_copy("like", "", 4),
+            (
+                "New likes".to_string(),
+                "Someone and 3 others liked your post".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn summary_payload_carries_routing_and_collapse_fields() {
+        let recipient = Keys::generate().public_key();
+        let snapshot = GroupSnapshot {
+            group_id: "like:owner:e:target:1".to_string(),
+            notification_type: "like".to_string(),
+            owner: recipient.to_hex(),
+            target: "e:target".to_string(),
+            due: 1_700_000_000,
+            pending: 4,
+            immediate: 3,
+            first_actor: Some("a".repeat(64)),
+            first_event: Some("b".repeat(64)),
+            last_at: Some(1_699_999_999),
+            event_kind: Some("7".to_string()),
+            ref_event_id: Some("c".repeat(64)),
+            ref_address: None,
+            ref_kind: None,
+            ref_author: None,
+            ref_dtag: None,
+            actor_count: 4,
+        };
+
+        let payload = build_summary_payload(&snapshot, &recipient, "alice", "collapsequay");
+        assert_eq!(payload.collapse_key.as_deref(), Some("collapsequay"));
+        assert!(payload.notification.is_none());
+        let data = payload.data.expect("data-only payload");
+        assert_eq!(data.get("type"), Some(&"like".to_string()));
+        assert_eq!(
+            data.get("body"),
+            Some(&"alice and 3 others liked your post".to_string())
+        );
+        assert_eq!(data.get("eventId"), Some(&"b".repeat(64)));
+        assert_eq!(data.get("referencedEventId"), Some(&"c".repeat(64)));
+        assert_eq!(data.get("eventKind"), Some(&"7".to_string()));
+        assert_eq!(data.get("receiverPubkey"), Some(&recipient.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn first_events_send_immediately_and_the_rest_buffer() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 3;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let mut events: Vec<(String, String, CoalesceDecision)> = Vec::new();
+        for _ in 0..4 {
+            let event_id = Uuid::new_v4().to_string();
+            let actor = random_actor();
+            let decision = ingest_one(&pool, &settings, &owner, &target, &event_id, &actor).await;
+            events.push((event_id, actor, decision));
+        }
+
+        for (_, _, decision) in &events[..3] {
+            assert!(
+                matches!(decision, CoalesceDecision::Immediate { .. }),
+                "the first three interactions must send immediately"
+            );
+        }
+        let CoalesceDecision::Buffered { group_id } = &events[3].2 else {
+            panic!("the fourth interaction must buffer");
+        };
+
+        // A replay reproduces the same decision, group, and collapse id without
+        // double-counting.
+        let (event_id, actor, decision) = &events[3];
+        let replay = ingest_one(&pool, &settings, &owner, &target, event_id, actor).await;
+        assert_eq!(replay, *decision);
+        let snapshot = load_group(&pool, group_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.pending, 1, "a replay must not double-count");
+        assert_eq!(snapshot.actor_count, 1);
+
+        let (first_event_id, first_actor, first_decision) = &events[0];
+        let first_replay = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            first_event_id,
+            first_actor,
+        )
+        .await;
+        assert_eq!(first_replay, *first_decision);
+        let stored = stored_disposition(&pool, first_event_id, &owner)
+            .await
+            .expect("disposition stored");
+        assert!(stored.starts_with('i'));
+
+        for (_, _, decision) in &events {
+            if let CoalesceDecision::Buffered { group_id } = decision {
+                cleanup_group(&pool, group_id).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn throttle_demotes_without_consuming_an_immediate_slot() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 3;
+        settings.recipient_throttle_capacity = 1;
+        settings.recipient_throttle_refill_secs = 3600;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let first = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        assert!(matches!(first, CoalesceDecision::Immediate { .. }));
+
+        let second_event = Uuid::new_v4().to_string();
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &second_event,
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = &second else {
+            panic!("an empty token bucket must demote the second push");
+        };
+
+        let snapshot = load_group(&pool, group_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.pending, 1,
+            "the throttled push is buffered, not dropped"
+        );
+        assert_eq!(
+            snapshot.immediate, 1,
+            "a throttled push must not spend an immediate slot"
+        );
+
+        // Replaying the throttled event must not double-count the buffer.
+        let replay = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &second_event,
+            "unused-on-replay",
+        )
+        .await;
+        assert_eq!(replay, second);
+        let snapshot = load_group(&pool, group_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.pending, 1);
+
+        cleanup_group(&pool, group_id).await;
+    }
+
+    #[tokio::test]
+    async fn refill_restores_an_immediate_slot() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 3;
+        settings.recipient_throttle_capacity = 1;
+        settings.recipient_throttle_refill_secs = 1;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let first = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        assert!(matches!(first, CoalesceDecision::Immediate { .. }));
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        assert!(matches!(second, CoalesceDecision::Buffered { .. }));
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let third = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        assert!(
+            matches!(third, CoalesceDecision::Immediate { .. }),
+            "a refilled bucket must allow an immediate push"
+        );
+
+        if let CoalesceDecision::Immediate { group_id, .. } = &third {
+            cleanup_group(&pool, group_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_rollover_starts_a_new_group_and_replays_stably() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_window_secs = 1;
+        settings.coalesce_immediate_limit = 1;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let first_event = Uuid::new_v4().to_string();
+        let first = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &first_event,
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Immediate {
+            group_id: first_gid,
+            ..
+        } = &first
+        else {
+            panic!("the first interaction must send immediately");
+        };
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Immediate {
+            group_id: second_gid,
+            ..
+        } = &second
+        else {
+            panic!("a new bucket resets the immediate budget");
+        };
+        assert_ne!(first_gid, second_gid, "a new bucket is a new group");
+
+        let replay = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &first_event,
+            "unused-on-replay",
+        )
+        .await;
+        assert_eq!(
+            replay, first,
+            "a replay keeps the original bucket's decision"
+        );
+
+        cleanup_group(&pool, first_gid).await;
+        cleanup_group(&pool, second_gid).await;
+    }
+
+    #[tokio::test]
+    async fn expired_lease_is_recovered_without_losing_pending_work() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 1;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let first = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        assert!(matches!(first, CoalesceDecision::Immediate { .. }));
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+
+        let claim = claim_due_group(&pool, 1)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        assert_eq!(claim.group_id, group_id);
+
+        // Crash after the claim: the lease expires with the work unfinished.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let recovered = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("an expired lease with pending work must be reclaimed");
+        assert_eq!(
+            recovered.group_id, group_id,
+            "recovery must not lose the buffered group"
+        );
+        assert!(complete_group(&pool, &recovered, None).await.unwrap());
+        assert!(load_group(&pool, &group_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_group_is_deleted_not_requeued() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 3;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let mut group_id = None;
+        for _ in 0..3 {
+            let decision = ingest_one(
+                &pool,
+                &settings,
+                &owner,
+                &target,
+                &Uuid::new_v4().to_string(),
+                &random_actor(),
+            )
+            .await;
+            let CoalesceDecision::Immediate { group_id: gid, .. } = decision else {
+                panic!("all three interactions fit the immediate budget");
+            };
+            group_id = Some(gid);
+        }
+        let group_id = group_id.unwrap();
+
+        // Simulate a stale lease on a group whose events were all immediate.
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZADD")
+            .arg(LEASES_KEY)
+            .arg(Timestamp::now().as_secs().saturating_sub(10))
+            .arg(&group_id)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            claim_due_group(&pool, 30).await.unwrap().is_none(),
+            "a group with nothing pending is not work"
+        );
+        assert!(
+            load_group(&pool, &group_id).await.unwrap().is_none(),
+            "reconciliation must delete an empty group, not requeue it"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_requires_the_lease_token() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 1;
+        settings.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        let impostor = GroupClaim {
+            group_id: group_id.clone(),
+            token: "not-the-lease".to_string(),
+        };
+        assert!(
+            !complete_group(&pool, &impostor, None).await.unwrap(),
+            "a non-owner completion must be refused"
+        );
+        assert!(
+            load_group(&pool, &group_id).await.unwrap().is_some(),
+            "a refused completion must leave the group intact"
+        );
+
+        assert!(complete_group(&pool, &claim, None).await.unwrap());
+        assert!(load_group(&pool, &group_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dangling_due_member_is_dropped() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let gid = format!("like:{}:e:{}:1", "a".repeat(64), Uuid::new_v4());
+
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZADD")
+            .arg(DUE_KEY)
+            .arg(Timestamp::now().as_secs())
+            .arg(&gid)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        let score: Option<u64> = redis::cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(&gid)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(score.is_some());
+        drop(conn);
+
+        assert!(claim_due_group(&pool, 30).await.unwrap().is_none());
+
+        let mut conn = pool.get().await.unwrap();
+        let score: Option<u64> = redis::cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(&gid)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(score.is_none(), "a dangling member must be removed");
+    }
+
+    struct PanickingFcmSender {
+        panic_on: String,
+    }
+
+    #[async_trait]
+    impl FcmSend for PanickingFcmSender {
+        async fn send_single(
+            &self,
+            token: &str,
+            _payload: FcmPayload,
+        ) -> std::result::Result<(), FcmError> {
+            if token == self.panic_on {
+                panic!("simulated upstream panic while sending a summary");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_send_is_contained_and_the_group_still_completes() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.coalesce_immediate_limit = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+
+        redis_store::add_or_update_token(&pool, &owner, "coalesce-panic-good")
+            .await
+            .unwrap();
+        redis_store::add_or_update_token(&pool, &owner, "coalesce-panic-bad")
+            .await
+            .unwrap();
+
+        let state = test_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(PanickingFcmSender {
+                panic_on: "coalesce-panic-bad".to_string(),
+            })),
+        );
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        let outcome = flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FlushOutcome::Sent {
+                delivered: 1,
+                failed: 1,
+                actor_count: 1,
+            },
+            "a panic on one token must not take the group down"
+        );
+        assert!(
+            load_group(&pool, &group_id).await.unwrap().is_none(),
+            "the group must complete despite the contained panic"
+        );
+
+        redis_store::remove_token(&pool, &owner, "coalesce-panic-good")
+            .await
+            .unwrap();
+        redis_store::remove_token(&pool, &owner, "coalesce-panic-bad")
+            .await
+            .unwrap();
+    }
+}

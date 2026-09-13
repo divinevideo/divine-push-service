@@ -17,6 +17,15 @@ pub struct FcmPayload {
     pub webpush: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apns: Option<serde_json::Value>,
+
+    /// Transport-level collapse identity for like/repost coalescing.
+    ///
+    /// Not injected into the FCM message body directly; the transport maps it
+    /// to `android.collapse_key` and the `apns-collapse-id` header. A newer
+    /// push with the same key replaces the pending/banner notification for the
+    /// same group on the device.
+    #[serde(skip)]
+    pub collapse_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]

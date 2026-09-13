@@ -115,6 +115,40 @@ pub struct ServiceSettings {
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
     pub allowed_pubkeys: Vec<String>,
+    /// Length of the like/repost coalescing bucket, in seconds.
+    ///
+    /// Bucket identifiers and deadlines are derived from the Redis server clock
+    /// inside the ingest script, so every replica agrees on where a bucket
+    /// starts and ends.
+    #[serde(default = "default_coalesce_window")]
+    pub coalesce_window_secs: u64,
+    /// How many like/repost pushes per bucket reach a recipient immediately.
+    /// The rest are summarized at the bucket deadline.
+    #[serde(default = "default_coalesce_immediate_limit")]
+    pub coalesce_immediate_limit: u64,
+    /// Lease held while one worker flushes a coalesced group.
+    #[serde(default = "default_coalesce_lease")]
+    pub coalesce_lease_secs: u64,
+    /// Delay before retrying a coalesced group after an all-token retryable
+    /// FCM failure.
+    #[serde(default = "default_coalesce_retry")]
+    pub coalesce_retry_secs: u64,
+    /// Idle poll interval for the coalescing flush worker.
+    #[serde(default = "default_coalesce_poll")]
+    pub coalesce_poll_millis: u64,
+    /// Grace added to the bucket window for coalescing group and disposition
+    /// key TTLs.
+    ///
+    /// The TTL must outlive the bucket deadline so a group is still readable
+    /// when its flush runs, plus the flush worker's own downtime tolerance.
+    #[serde(default = "default_coalesce_grace")]
+    pub coalesce_logical_expiry_grace_secs: u64,
+    /// Per-recipient token-bucket capacity for like/repost immediate pushes.
+    #[serde(default = "default_recipient_throttle_capacity")]
+    pub recipient_throttle_capacity: u64,
+    /// Seconds of sustained like/repost pushes one refilled token buys.
+    #[serde(default = "default_recipient_throttle_refill")]
+    pub recipient_throttle_refill_secs: u64,
 }
 
 fn default_process_window_days() -> i64 {
@@ -169,6 +203,48 @@ fn default_video_coordinate_dedup_ttl() -> u64 {
     // Video coordinates remain stable across edits. One year prevents routine edits from
     // re-notifying recipients while bounding Redis retention for inactive coordinates.
     31_536_000
+}
+
+fn default_coalesce_window() -> u64 {
+    // Two hours: long enough that a burst is summarized once instead of
+    // buzzing per event, short enough that a like is still timely.
+    7200
+}
+
+fn default_coalesce_immediate_limit() -> u64 {
+    // The first three interactions on a post still feel immediate; beyond that
+    // the summary is the notification.
+    3
+}
+
+fn default_coalesce_lease() -> u64 {
+    // One summary push is a single FCM batch, whose operations are bounded at
+    // 45 seconds each; 5 minutes recovers a dead worker promptly.
+    300
+}
+
+fn default_coalesce_retry() -> u64 {
+    5
+}
+
+fn default_coalesce_poll() -> u64 {
+    250
+}
+
+fn default_coalesce_grace() -> u64 {
+    // The TTL must outlive the bucket deadline. One extra hour also covers a
+    // worker restarting before it drains the due queue.
+    3600
+}
+
+fn default_recipient_throttle_capacity() -> u64 {
+    // A recipient can absorb a 60-push burst instantly, then one push per
+    // minute sustains; beyond that the bucket defers to the summary.
+    60
+}
+
+fn default_recipient_throttle_refill() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -340,7 +416,7 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 12] = [
+        let must_be_positive: [(&str, u64, &str); 20] = [
             (
                 "nostr.event_silence_timeout_secs",
                 self.nostr.event_silence_timeout_secs,
@@ -400,6 +476,46 @@ impl Settings {
                 "service.new_post_fanout_poll_millis",
                 self.service.new_post_fanout_poll_millis,
                 "an idle worker spins continuously against Redis",
+            ),
+            (
+                "service.coalesce_window_secs",
+                self.service.coalesce_window_secs,
+                "bucket identifiers divide by zero and no like or repost can be buffered",
+            ),
+            (
+                "service.coalesce_immediate_limit",
+                self.service.coalesce_immediate_limit,
+                "every like and repost is buffered and no summary ever has an immediate predecessor",
+            ),
+            (
+                "service.coalesce_lease_secs",
+                self.service.coalesce_lease_secs,
+                "a claimed group's lease expires in the same instant and is reclaimed forever",
+            ),
+            (
+                "service.coalesce_retry_secs",
+                self.service.coalesce_retry_secs,
+                "a failed summary retries in a tight loop",
+            ),
+            (
+                "service.coalesce_poll_millis",
+                self.service.coalesce_poll_millis,
+                "an idle coalescing worker spins continuously against Redis",
+            ),
+            (
+                "service.coalesce_logical_expiry_grace_secs",
+                self.service.coalesce_logical_expiry_grace_secs,
+                "group keys expire at their bucket deadline, before the flush can read them",
+            ),
+            (
+                "service.recipient_throttle_capacity",
+                self.service.recipient_throttle_capacity,
+                "the recipient bucket starts empty and every immediate push is demoted",
+            ),
+            (
+                "service.recipient_throttle_refill_secs",
+                self.service.recipient_throttle_refill_secs,
+                "token refill divides by zero",
             ),
         ];
 
@@ -531,7 +647,7 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 12] = [
+        let cases: [ZeroCase; 20] = [
             ("nostr.event_silence_timeout_secs", |s| {
                 s.nostr.event_silence_timeout_secs = 0
             }),
@@ -567,6 +683,30 @@ mod tests {
             }),
             ("service.new_post_fanout_poll_millis", |s| {
                 s.service.new_post_fanout_poll_millis = 0
+            }),
+            ("service.coalesce_window_secs", |s| {
+                s.service.coalesce_window_secs = 0
+            }),
+            ("service.coalesce_immediate_limit", |s| {
+                s.service.coalesce_immediate_limit = 0
+            }),
+            ("service.coalesce_lease_secs", |s| {
+                s.service.coalesce_lease_secs = 0
+            }),
+            ("service.coalesce_retry_secs", |s| {
+                s.service.coalesce_retry_secs = 0
+            }),
+            ("service.coalesce_poll_millis", |s| {
+                s.service.coalesce_poll_millis = 0
+            }),
+            ("service.coalesce_logical_expiry_grace_secs", |s| {
+                s.service.coalesce_logical_expiry_grace_secs = 0
+            }),
+            ("service.recipient_throttle_capacity", |s| {
+                s.service.recipient_throttle_capacity = 0
+            }),
+            ("service.recipient_throttle_refill_secs", |s| {
+                s.service.recipient_throttle_refill_secs = 0
             }),
         ];
 

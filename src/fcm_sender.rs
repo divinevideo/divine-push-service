@@ -333,10 +333,7 @@ fn build_apns_config(payload: &FcmPayload) -> Option<serde_json::Value> {
 
         return Some(serde_json::json!({
             "payload": apns_payload,
-            "headers": {
-                "apns-push-type": "alert",
-                "apns-priority": "10",
-            },
+            "headers": apns_headers(payload, "alert", "10"),
         }));
     }
 
@@ -353,17 +350,38 @@ fn build_apns_config(payload: &FcmPayload) -> Option<serde_json::Value> {
 
     Some(serde_json::json!({
         "payload": apns_payload,
-        "headers": {
-            "apns-push-type": "background",
-            "apns-priority": "5",
-        },
+        "headers": apns_headers(payload, "background", "5"),
     }))
+}
+
+/// APNs headers for one push, including the coalescing collapse id when set.
+///
+/// `apns-collapse-id` is capped at 64 bytes by Apple; the caller derives a
+/// 32-character digest, so the limit holds with room to spare.
+fn apns_headers(payload: &FcmPayload, push_type: &str, priority: &str) -> serde_json::Value {
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        "apns-push-type".to_string(),
+        serde_json::Value::String(push_type.to_string()),
+    );
+    headers.insert(
+        "apns-priority".to_string(),
+        serde_json::Value::String(priority.to_string()),
+    );
+    if let Some(collapse_key) = &payload.collapse_key {
+        headers.insert(
+            "apns-collapse-id".to_string(),
+            serde_json::Value::String(collapse_key.clone()),
+        );
+    }
+    serde_json::Value::Object(headers)
 }
 
 /// Builds the `android` block for user-visible FCM messages.
 ///
 /// High priority may wake a device from Doze, so reserve it for payloads that
-/// contain notification copy and will produce a visible notification.
+/// contain notification copy and will produce a visible notification. The
+/// coalescing collapse key rides in the same block; Android stays data-only.
 fn build_android_config(payload: &FcmPayload) -> Option<serde_json::Value> {
     let notification_has_alert = payload
         .notification
@@ -374,7 +392,25 @@ fn build_android_config(payload: &FcmPayload) -> Option<serde_json::Value> {
         .as_ref()
         .is_some_and(|data| data.contains_key("title") || data.contains_key("body"));
 
-    (notification_has_alert || data_has_alert).then(|| serde_json::json!({ "priority": "high" }))
+    if !notification_has_alert && !data_has_alert && payload.collapse_key.is_none() {
+        return None;
+    }
+
+    let mut android = serde_json::Map::new();
+    if notification_has_alert || data_has_alert {
+        android.insert(
+            "priority".to_string(),
+            serde_json::Value::String("high".to_string()),
+        );
+    }
+    if let Some(collapse_key) = &payload.collapse_key {
+        android.insert(
+            "collapse_key".to_string(),
+            serde_json::Value::String(collapse_key.clone()),
+        );
+    }
+
+    Some(serde_json::Value::Object(android))
 }
 
 fn json_object_from_data(
@@ -669,6 +705,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         // Use the FcmClient (which internally uses the mock)
@@ -703,6 +740,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         // Simulate an error for one token (use original instance)
@@ -762,6 +800,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         // Send to the token that should produce an error
@@ -790,6 +829,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         let apns_config = build_apns_config(&payload).expect("apns config should exist");
@@ -825,6 +865,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         let apns_config = build_apns_config(&payload).expect("apns config should exist");
@@ -1181,6 +1222,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         }
     }
 
@@ -1227,6 +1269,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         client
@@ -1258,6 +1301,7 @@ mod tests {
             android: None,
             webpush: None,
             apns: None,
+            collapse_key: None,
         };
 
         client

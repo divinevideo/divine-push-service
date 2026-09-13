@@ -17,13 +17,15 @@ pub enum CriticalTask {
     NostrListener,
     EventHandler,
     NewPostFanout,
+    CoalesceFlush,
 }
 
 impl CriticalTask {
-    pub const ALL: [CriticalTask; 3] = [
+    pub const ALL: [CriticalTask; 4] = [
         CriticalTask::NostrListener,
         CriticalTask::EventHandler,
         CriticalTask::NewPostFanout,
+        CriticalTask::CoalesceFlush,
     ];
 
     /// Stable identifier used in log fields and in the `/health` body.
@@ -32,6 +34,7 @@ impl CriticalTask {
             CriticalTask::NostrListener => "nostr_listener",
             CriticalTask::EventHandler => "event_handler",
             CriticalTask::NewPostFanout => "new_post_fanout",
+            CriticalTask::CoalesceFlush => "coalesce_flush",
         }
     }
 }
@@ -42,6 +45,7 @@ pub struct TaskHealth {
     nostr_listener: AtomicBool,
     event_handler: AtomicBool,
     new_post_fanout: AtomicBool,
+    coalesce_flush: AtomicBool,
     unexpected_exit: AtomicBool,
 }
 
@@ -51,6 +55,7 @@ impl TaskHealth {
             nostr_listener: AtomicBool::new(true),
             event_handler: AtomicBool::new(true),
             new_post_fanout: AtomicBool::new(true),
+            coalesce_flush: AtomicBool::new(true),
             unexpected_exit: AtomicBool::new(false),
         }
     }
@@ -60,6 +65,7 @@ impl TaskHealth {
             CriticalTask::NostrListener => &self.nostr_listener,
             CriticalTask::EventHandler => &self.event_handler,
             CriticalTask::NewPostFanout => &self.new_post_fanout,
+            CriticalTask::CoalesceFlush => &self.coalesce_flush,
         }
     }
 
@@ -247,6 +253,7 @@ mod tests {
         assert_eq!(CriticalTask::NostrListener.name(), "nostr_listener");
         assert_eq!(CriticalTask::EventHandler.name(), "event_handler");
         assert_eq!(CriticalTask::NewPostFanout.name(), "new_post_fanout");
+        assert_eq!(CriticalTask::CoalesceFlush.name(), "coalesce_flush");
     }
 
     /// The outage this guards against: an FCM 5xx panicked the event handler,

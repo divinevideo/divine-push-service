@@ -27,6 +27,17 @@ service:
   new_post_fanout_lease_secs: 1200  # 20 waves x 45s FCM ceiling, plus 5m overhead
   new_post_fanout_retry_secs: 5  # Delay before retrying a recoverable page failure
   new_post_fanout_poll_millis: 250  # Idle durable-worker poll interval
+  # Like/repost coalescing: first N pushes in a bucket send immediately, the
+  # rest are summarized at the bucket deadline. Buckets and deadlines use the
+  # Redis server clock.
+  coalesce_window_secs: 7200  # Two-hour summary bucket
+  coalesce_immediate_limit: 3  # Immediate like/repost pushes per bucket per post
+  coalesce_lease_secs: 300  # Flush lease for one claimed group
+  coalesce_retry_secs: 5  # Requeue delay after an all-token retryable FCM failure
+  coalesce_poll_millis: 250  # Idle flush-worker poll interval
+  coalesce_logical_expiry_grace_secs: 3600  # Added to the window for group/disposition TTLs
+  recipient_throttle_capacity: 60  # Instant burst of immediate pushes per recipient
+  recipient_throttle_refill_secs: 60  # Seconds per refilled immediate-push token
 
 redis:
   url: "redis://127.0.0.1:6379"

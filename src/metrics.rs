@@ -11,6 +11,9 @@ pub const FCM_SENDS_FAILED_TOTAL: &str = "push_fcm_sends_failed_total";
 pub const NEW_POST_FANOUT_RETRIES_TOTAL: &str = "push_new_post_fanout_retries_total";
 pub const INTERNAL_DM_REQUESTS_TOTAL: &str = "push_internal_dm_requests_total";
 pub const TOKENS_PRUNED_TOTAL: &str = "push_tokens_pruned_total";
+pub const COALESCED_SENDS_TOTAL: &str = "push_coalesced_sends_total";
+pub const COALESCE_OLDEST_DUE_AGE_SECONDS: &str = "push_coalesce_oldest_due_age_seconds";
+pub const THROTTLED_RECIPIENTS_TOTAL: &str = "push_throttled_recipients_total";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
 
@@ -51,6 +54,18 @@ pub fn init() -> PrometheusHandle {
     metrics::describe_counter!(
         TOKENS_PRUNED_TOTAL,
         "FCM tokens removed by the service, counted by reason"
+    );
+    metrics::describe_counter!(
+        COALESCED_SENDS_TOTAL,
+        "Coalesced like/repost summary pushes sent, counted by notification type"
+    );
+    metrics::describe_gauge!(
+        COALESCE_OLDEST_DUE_AGE_SECONDS,
+        "Age of the claimed coalescing group's bucket deadline at claim time"
+    );
+    metrics::describe_counter!(
+        THROTTLED_RECIPIENTS_TOTAL,
+        "Would-be immediate like/repost pushes demoted into the coalescing bucket by the per-recipient throttle"
     );
     metrics::describe_gauge!(
         LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS,
@@ -100,6 +115,18 @@ pub fn tokens_pruned(reason: &'static str, count: u64) {
     metrics::counter!(TOKENS_PRUNED_TOTAL, "reason" => reason).increment(count);
 }
 
+pub fn coalesced_send(notification_type: &'static str) {
+    metrics::counter!(COALESCED_SENDS_TOTAL, "type" => notification_type).increment(1);
+}
+
+pub fn coalesce_oldest_due_age(age_seconds: f64) {
+    metrics::gauge!(COALESCE_OLDEST_DUE_AGE_SECONDS).set(age_seconds);
+}
+
+pub fn throttled_recipient(notification_type: &'static str) {
+    metrics::counter!(THROTTLED_RECIPIENTS_TOTAL, "type" => notification_type).increment(1);
+}
+
 fn set_last_event_processed_timestamp(timestamp: f64) {
     metrics::gauge!(LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS).set(timestamp);
 }
@@ -122,6 +149,9 @@ mod tests {
             new_post_fanout_retry("delivery", "scheduled");
             internal_dm_request("unauthorized");
             tokens_pruned("invalid", 1);
+            coalesced_send("like");
+            coalesce_oldest_due_age(12.0);
+            throttled_recipient("repost");
         });
 
         handle.run_upkeep();
@@ -158,6 +188,18 @@ mod tests {
         );
         assert!(
             rendered.contains(r#"push_tokens_pruned_total{reason="invalid"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesced_sends_total{type="like"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("push_coalesce_oldest_due_age_seconds 12"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_throttled_recipients_total{type="repost"} 1"#),
             "{rendered}"
         );
         assert!(

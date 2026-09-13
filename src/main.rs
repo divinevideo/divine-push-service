@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use divine_push_service::cleanup_service;
+use divine_push_service::coalesce;
 use divine_push_service::config;
 use divine_push_service::error::Result;
 use divine_push_service::event_handler;
@@ -137,6 +138,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Cleanup service task finished.");
     });
     tracing::info!("Cleanup service started");
+
+    // Start coalescing flush worker
+    let state_coalesce = Arc::clone(&app_state);
+    let token_coalesce = token.clone();
+    tracker.spawn(
+        "coalesce_flush",
+        Some(CriticalTask::CoalesceFlush),
+        OnReturn::Fatal,
+        async move {
+            if let Err(e) = coalesce::run_coalesce_flush(state_coalesce, token_coalesce).await {
+                tracing::error!("Coalescing flush worker failed: {}", e);
+            }
+            tracing::info!("Coalescing flush worker task finished.");
+        },
+    );
+    tracing::info!("Coalescing flush worker started");
 
     // Start HTTP server
     let token_server = token.clone();
