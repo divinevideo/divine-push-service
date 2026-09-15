@@ -210,6 +210,11 @@ fn validate_api_base_url(raw: &str) -> Result<()> {
 
 /// Returns the next UTC instant outside quiet hours, or `None` when delivery
 /// is currently permitted for this device offset.
+///
+/// The result comes back with a `Z` suffix, not the `+00:00` an offset-based
+/// RFC 3339 rendering would use. `divine-engagement` validates `retryAfter`
+/// with zod's `z.iso.datetime()`, which accepts only the UTC designator, and
+/// rejects the whole results batch when one field fails.
 fn quiet_hours_retry_after(timezone_offset_minutes: i32, now: i64) -> Option<String> {
     let local_seconds = now + i64::from(timezone_offset_minutes) * 60;
     let seconds_today = local_seconds.rem_euclid(86_400);
@@ -223,7 +228,8 @@ fn quiet_hours_retry_after(timezone_offset_minutes: i32, now: i64) -> Option<Str
     } else {
         86_400 - seconds_today + 7 * 3_600
     };
-    chrono::DateTime::from_timestamp(now + until_seven, 0).map(|timestamp| timestamp.to_rfc3339())
+    chrono::DateTime::from_timestamp(now + until_seven, 0)
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 /// Builds the FCM payload for a campaign notification.
@@ -889,11 +895,14 @@ mod tests {
             .timestamp();
         assert_eq!(quiet_hours_retry_after(0, noon_utc), None);
 
+        // `Z`, not `+00:00`: divine-engagement parses retryAfter with zod's
+        // `z.iso.datetime()`, which rejects an offset-form UTC timestamp and
+        // then rejects the entire results batch.
         let retry = quiet_hours_retry_after(600, noon_utc).expect("22:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T21:00:00+00:00");
+        assert_eq!(retry, "2026-01-01T21:00:00Z");
 
         let retry = quiet_hours_retry_after(-480, noon_utc).expect("04:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T15:00:00+00:00");
+        assert_eq!(retry, "2026-01-01T15:00:00Z");
     }
 
     #[test]
@@ -1434,5 +1443,121 @@ mod tests {
         );
 
         delete_claim(&pool, &claim).await;
+    }
+
+    /// Consent precedes every lookup, so a user who never opted in is
+    /// suppressed without a token read or an FCM send, and only an explicit
+    /// `campaignsEnabled` write flips it.
+    #[tokio::test]
+    async fn test_campaign_delivery_requires_an_explicit_consent_opt_in() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, token) = registered_delivery(&pool, "consent").await;
+        let recipient = PublicKey::from_str(&pending.recipient_pubkey).unwrap();
+        redis_store::add_or_update_token_with_timezone(&pool, &recipient, &token, Some(0))
+            .await
+            .unwrap();
+
+        let noon = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.settings.campaign_delivery.allow_unverified_consent = false;
+
+        // No consent key at all reads as false, not as an unknown to retry.
+        let without_consent = deliver(&state, &pending, noon).await;
+        assert_eq!(without_consent.status, DeliveryStatus::Suppressed);
+        assert_eq!(
+            without_consent.reason.as_deref(),
+            Some("campaign_consent_disabled")
+        );
+
+        preferences::set_user_preferences_with_campaign_consent(
+            &pool,
+            &pending.recipient_pubkey,
+            &preferences::UserPreferences { kinds: vec![7] },
+            true,
+        )
+        .await
+        .unwrap();
+
+        let working = MockFcmSender::new();
+        let mut state = sending_state(pool.clone(), working.clone());
+        state.settings.campaign_delivery.allow_unverified_consent = false;
+        let with_consent = deliver(&state, &pending, noon).await;
+        assert_eq!(with_consent.status, DeliveryStatus::Delivered);
+        assert_eq!(working.get_sent_messages().len(), 1);
+    }
+
+    /// A deferral is not a delivery: it has to come back with the instant the
+    /// retry becomes allowed, in the only format the engagement API parses,
+    /// and it must free the claim so that retry can actually send.
+    #[tokio::test]
+    async fn test_quiet_hours_defer_carries_a_z_suffixed_retry_after() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, token) = registered_delivery(&pool, "quiet").await;
+        let recipient = PublicKey::from_str(&pending.recipient_pubkey).unwrap();
+        redis_store::add_or_update_token_with_timezone(&pool, &recipient, &token, Some(600))
+            .await
+            .unwrap();
+        preferences::set_user_preferences_with_campaign_consent(
+            &pool,
+            &pending.recipient_pubkey,
+            &preferences::UserPreferences { kinds: vec![7] },
+            true,
+        )
+        .await
+        .unwrap();
+
+        // UTC+10 at 12:00Z is 22:00 local, so the next allowed instant is
+        // 07:00 local = 21:00Z.
+        let noon = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.settings.campaign_delivery.allow_unverified_consent = false;
+
+        let result = deliver(&state, &pending, noon).await;
+        assert_eq!(result.status, DeliveryStatus::Deferred);
+        assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
+        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T21:00:00Z"));
+        assert_eq!(
+            claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
+            -2,
+            "a deferral must release its claim so the scheduled retry can send"
+        );
+    }
+
+    /// A registration without a timezone is still a device registration; it is
+    /// only ineligible for campaigns, and it must not be reported as a missing
+    /// device to the campaign tool.
+    #[tokio::test]
+    async fn test_a_registration_without_a_timezone_is_ineligible_for_campaigns() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (pending, _token) = registered_delivery(&pool, "no-tz").await;
+        preferences::set_user_preferences_with_campaign_consent(
+            &pool,
+            &pending.recipient_pubkey,
+            &preferences::UserPreferences { kinds: vec![7] },
+            true,
+        )
+        .await
+        .unwrap();
+
+        let noon = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.settings.campaign_delivery.allow_unverified_consent = false;
+
+        let result = deliver(&state, &pending, noon).await;
+        assert_eq!(result.status, DeliveryStatus::Suppressed);
+        assert_eq!(result.reason.as_deref(), Some("recipient_timezone_unknown"));
+        assert_eq!(result.retry_after, None);
     }
 }
