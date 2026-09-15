@@ -32,6 +32,72 @@ pub struct Settings {
     pub server: ServerSettings,
     #[serde(default)]
     pub notification: NotificationSettings,
+    #[serde(default)]
+    pub campaign_delivery: CampaignDeliverySettings,
+}
+
+/// Collecting campaign notifications from `divine-engagement`.
+///
+/// This service pulls; `divine-engagement` has no inbound path to the cluster.
+/// Authentication is a Cloudflare Access service token scoped to that tool's
+/// internal delivery API. See divine-engagement/docs/push-service-contract.md.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CampaignDeliverySettings {
+    /// Off by default. Merging this must not start polling anything.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of divine-engagement, e.g. https://engagement.admin.divine.video
+    #[serde(default)]
+    pub api_base_url: String,
+    #[serde(default)]
+    pub access_client_id: String,
+    #[serde(default)]
+    pub access_client_secret: String,
+    #[serde(default = "default_campaign_poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_campaign_batch_size")]
+    pub batch_size: u32,
+    /// How long a delivered idempotency key is remembered, so a re-offered
+    /// lease cannot produce a second push.
+    #[serde(default = "default_campaign_dedup_ttl")]
+    pub dedup_ttl_secs: u64,
+    /// This service cannot yet evaluate marketing consent or recipient-local
+    /// quiet hours: notification preferences are a list of Nostr event kinds
+    /// and a campaign has no triggering kind, and no timezone is stored.
+    ///
+    /// Until that exists, refuse to send rather than assume consent. Setting
+    /// this true is an operator asserting the audience is staff who opted in
+    /// out of band. divine-engagement gates the same thing independently; both
+    /// sides fail closed on purpose.
+    #[serde(default)]
+    pub allow_unverified_consent: bool,
+}
+
+impl Default for CampaignDeliverySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base_url: String::new(),
+            access_client_id: String::new(),
+            access_client_secret: String::new(),
+            poll_interval_secs: default_campaign_poll_interval(),
+            batch_size: default_campaign_batch_size(),
+            dedup_ttl_secs: default_campaign_dedup_ttl(),
+            allow_unverified_consent: false,
+        }
+    }
+}
+
+fn default_campaign_poll_interval() -> u64 {
+    30
+}
+
+fn default_campaign_batch_size() -> u32 {
+    100
+}
+
+fn default_campaign_dedup_ttl() -> u64 {
+    60 * 60 * 24 * 7
 }
 
 #[derive(Debug, Deserialize, Clone)]

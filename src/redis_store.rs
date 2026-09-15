@@ -11,8 +11,9 @@ use crate::error::{Result, ServiceError};
 use bb8_redis::bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use nostr_sdk::{EventId, PublicKey, Timestamp};
-use redis::{RedisResult, Value};
+use redis::{RedisResult, Script, Value};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -207,6 +208,138 @@ pub async fn refresh_token_activity(pool: &RedisPool, tokens: &[String]) -> Resu
         .map_err(ServiceError::Redis)?;
 
     Ok(changed)
+}
+
+/// Deletes a campaign claim, but only while this attempt still owns it.
+///
+/// `DEL` is unconditional, and a send can outlive its own claim, so by the time
+/// a slow attempt releases, the key may already be the successor's.
+static RELEASE_CAMPAIGN_CLAIM: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0",
+    )
+});
+
+/// Extends a campaign claim, but only while this attempt still owns it.
+///
+/// `EXPIRE` is unconditional in the same way, and extending a successor's
+/// in-flight claim to the dedup window records a push that never landed.
+static PROMOTE_CAMPAIGN_CLAIM: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0",
+    )
+});
+
+/// Mints the owner token one delivery attempt holds its claim under.
+///
+/// The claim outlives the attempt that took it whenever a send is slow or the
+/// process dies, so "is this key set" is not the same question as "is this key
+/// mine". Every write after the claim compares against this.
+pub fn new_claim_owner() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Claims a campaign delivery, returning false if it was already claimed.
+///
+/// `SET NX EX`, the same primitive `try_claim_event` uses, storing the
+/// attempt's owner token rather than a placeholder so that the release and the
+/// promotion below can tell their own claim from a successor's. Final
+/// idempotency belongs here rather than in `divine-engagement`: a lease there
+/// can expire after this service accepted a message but before the result was
+/// reported, so the same key is legitimately re-offered and must not become a
+/// second push.
+pub async fn claim_campaign_delivery(
+    pool: &RedisPool,
+    key: &str,
+    owner: &str,
+    ttl_secs: u64,
+) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let claimed: Option<String> = redis::cmd("SET")
+        .arg(key)
+        .arg(owner)
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(claimed.is_some())
+}
+
+/// Releases a campaign delivery claim so a retry can actually run.
+///
+/// The claim is taken before the send, so a claim still standing after a
+/// failure would turn the retry this service just asked for into
+/// `already_delivered` and lose the push. Every path that took the claim and
+/// ends without a delivery releases it; a path that never took it must not.
+///
+/// Compare-and-delete rather than `DEL`, because nothing bounds a send: by the
+/// time a slow attempt gets here, its own claim may have expired and the
+/// re-offer it produced may be holding the key legitimately.
+///
+/// Returns false when the key was gone or belonged to someone else, which is
+/// the only place a lost claim becomes visible.
+pub async fn release_campaign_delivery(pool: &RedisPool, key: &str, owner: &str) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let released: i64 = RELEASE_CAMPAIGN_CLAIM
+        .key(key)
+        .arg(owner)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(released == 1)
+}
+
+/// Promotes a campaign delivery claim to the full deduplication window.
+///
+/// The claim is taken with a TTL that only has to outlive the lease, so that
+/// an ungraceful death mid-batch expires rather than suppressing the retry.
+/// It becomes the long-lived record of a delivered push only once FCM has
+/// accepted one.
+///
+/// Compare-and-expire for the same reason the release compares: extending a
+/// key this attempt no longer owns would hand a successor's in-flight claim the
+/// seven-day window and record a push that never landed.
+///
+/// Returns false if the claim was no longer this attempt's to promote, which
+/// means the send outlived it and a re-offer can produce a second push.
+pub async fn promote_campaign_delivery(
+    pool: &RedisPool,
+    key: &str,
+    owner: &str,
+    ttl_secs: u64,
+) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let promoted: i64 = PROMOTE_CAMPAIGN_CLAIM
+        .key(key)
+        .arg(owner)
+        .arg(ttl_secs)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(promoted == 1)
 }
 
 /// Cleans up stale tokens based on their last_seen timestamp.
