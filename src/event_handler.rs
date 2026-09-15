@@ -310,23 +310,28 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         return Ok(());
     }
 
-    if token_payload
+    // The offset is optional and only campaign delivery reads it. An
+    // out-of-range value is treated as absent rather than as a reason to drop
+    // the registration: returning here would silence every social push for a
+    // field that social delivery never consults, and campaign delivery already
+    // suppresses a device with no valid offset.
+    let timezone_offset_minutes = token_payload
         .timezone_offset_minutes
-        .is_some_and(|offset| !(-720..=840).contains(&offset))
-    {
+        .filter(|offset| (-720..=840).contains(offset));
+    if token_payload.timezone_offset_minutes.is_some() && timezone_offset_minutes.is_none() {
         warn!(
             event_id = %event.id,
             pubkey = %event.pubkey,
-            "Received registration with an invalid timezone offset"
+            "Ignoring an out-of-range timezone offset; campaign delivery stays \
+             suppressed for this device"
         );
-        return Ok(());
     }
 
     match redis_store::add_or_update_token_with_timezone(
         &state.redis_pool,
         &event.pubkey,
         fcm_token,
-        token_payload.timezone_offset_minutes,
+        timezone_offset_minutes,
     )
     .await
     {
@@ -2685,6 +2690,110 @@ mod tests {
             .await
             .unwrap();
         preferences::delete_user_preferences(&pool, &first_user.public_key().to_hex())
+            .await
+            .unwrap();
+    }
+
+    fn encrypted_registration_event(
+        user_keys: &Keys,
+        service_keys: &Keys,
+        payload: serde_json::Value,
+    ) -> Event {
+        let payload = payload.to_string();
+        let encrypted = nostr_sdk::nips::nip44::encrypt(
+            user_keys.secret_key(),
+            &service_keys.public_key(),
+            payload,
+            nostr_sdk::nips::nip44::Version::V2,
+        )
+        .expect("test token should encrypt");
+
+        EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+            .tag(Tag::public_key(service_keys.public_key()))
+            .sign_with_keys(user_keys)
+            .expect("test registration should sign")
+    }
+
+    /// The offset is optional and only campaigns read it, so a malformed value
+    /// must not cost the device its social notifications.
+    #[tokio::test]
+    async fn an_out_of_range_timezone_does_not_drop_the_registration() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let user = Keys::generate();
+        let service_keys = Keys::generate();
+        let token = format!("registration-offset-{}", user.public_key().to_hex());
+        let settings = crate::config::Settings::new().unwrap();
+
+        let mut state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.service_keys = Some(service_keys.clone());
+        state.crypto_service = Some(CryptoService::new(service_keys.clone()));
+        let event = encrypted_registration_event(
+            &user,
+            &service_keys,
+            serde_json::json!({ "token": token, "timezoneOffsetMinutes": 900 }),
+        );
+
+        handle_registration(&state, &event).await.unwrap();
+
+        assert_eq!(
+            redis_store::get_tokens_for_pubkey(&pool, &user.public_key())
+                .await
+                .unwrap(),
+            vec![token.clone()],
+            "an invalid optional offset must not drop the registration"
+        );
+        assert_eq!(
+            redis_store::get_tokens_with_timezone_offsets(&pool, &user.public_key())
+                .await
+                .unwrap(),
+            vec![(token.clone(), None)],
+            "an invalid offset is stored as absent so campaign delivery stays suppressed"
+        );
+
+        redis_store::remove_token(&pool, &user.public_key(), &token)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_valid_timezone_is_stored_with_the_registration() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let user = Keys::generate();
+        let service_keys = Keys::generate();
+        let token = format!("registration-timezone-{}", user.public_key().to_hex());
+        let settings = crate::config::Settings::new().unwrap();
+
+        let mut state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.service_keys = Some(service_keys.clone());
+        state.crypto_service = Some(CryptoService::new(service_keys.clone()));
+        let event = encrypted_registration_event(
+            &user,
+            &service_keys,
+            serde_json::json!({ "token": token, "timezoneOffsetMinutes": 120 }),
+        );
+
+        handle_registration(&state, &event).await.unwrap();
+
+        assert_eq!(
+            redis_store::get_tokens_with_timezone_offsets(&pool, &user.public_key())
+                .await
+                .unwrap(),
+            vec![(token.clone(), Some(120))]
+        );
+
+        redis_store::remove_token(&pool, &user.public_key(), &token)
             .await
             .unwrap();
     }
