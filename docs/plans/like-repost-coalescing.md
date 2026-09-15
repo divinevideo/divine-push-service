@@ -142,7 +142,7 @@ without re-reading the buffered set.
 | `coalesce:due` | Sorted Set | Groups due for flush, scored by bucket deadline |
 | `coalesce:leases` | Sorted Set | Groups currently owned by a flush, scored by lease expiry |
 | `coalesce:throttle:{owner}` | Hash | Per-recipient token bucket: `tokens`, `ts` |
-| `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: members are the emitted notification identities (trigger event id for an immediate push, group id for a summary) scored by the Redis server time of the send. `ZREMRANGEBYSCORE` drops members older than `recipient_daily_window_secs` on every read and `ZCARD` is the count checked against `recipient_daily_cap`. TTL window + grace |
+| `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: members are the emitted notification identities (trigger event id for an immediate push, group id for a summary) scored by the Redis server time of the send. `ZREMRANGEBYSCORE` drops members older than `recipient_daily_window_secs` on every read and `ZCARD` is the count checked against `recipient_daily_cap`. TTL `recipient_daily_window_secs` + grace; a re-spend of the same member does not inflate the count |
 
 `target` is `e:{event-id-hex}` for an event reference or `a:{kind:pubkey:d-tag}`
 for an addressable coordinate. Reference fields (`ref_event_id`, `ref_address`,
@@ -207,6 +207,15 @@ out, and a summary deferred past `coalesce_group_ttl_secs` is dropped loudly
 and counted. A retryable all-token failure refunds both the token and the
 window slot, because nothing was emitted.
 
+A refusal reports which bound refused it and the delay that clears it: an empty
+bucket requeues the group at the token refill, while a full window requeues it
+at the moment the oldest member ages out (`oldest + window - now`). Without
+that distinction a capped group would re-poll the serial drain every refill for
+its whole lifetime, and the deferral counter would measure retries instead of
+distinct deferrals. A member is identified per emission — the trigger event id
+for an immediate push, the group id for a summary — so a re-spend after a
+recovered lease cannot charge the window twice.
+
 ## Ingest
 
 One atomic Lua script (`coalesce:ingest`), invoked only after the allowlist,
@@ -255,20 +264,24 @@ Processing a claimed group:
    notification preference. A group dropped by any of these is completed
    without a push and counted under its reason;
 4. spend one recipient token and record the emission in the rolling window. An
-   empty bucket or a full window returns the group to the due queue at the
-   refill time, counted as a deferral and not as a failure; a deferral that
-   would cross `expires_at` drops the group instead;
+   empty bucket requeues the group at the refill time, and a full window
+   requeues it when the oldest emission ages out; either way the deferral is
+   counted and is not a failure. A deferral that would cross `expires_at` drops
+   the group instead;
 5. resolve the first buffered actor's display name, build the summary payload
    with the group's collapse key, and send it to all of the recipient's tokens;
 6. refresh token activity from delivered tokens and prune invalid tokens, as
    the immediate path does;
 7. complete the group under the ownership check. A success (at least one
-   delivered token) deletes the group and HLL. An all-token retryable failure
-   refunds the token and the window slot spent in step 4 and requeues the group
-   after FCM's `Retry-After` when it is larger than `coalesce_retry_secs`
-   (`coalesce_retry_secs` is a floor, not a ceiling; a delay that would cross
-   `expires_at` drops the group instead). A non-retryable failure is logged and
-   the group is completed.
+   delivered token) deletes the group and HLL. When no token was delivered the
+   token and the window slot spent in step 4 are refunded, whether the failure
+   was retryable or terminal, because nothing was emitted. A retryable failure
+   then requeues the group after FCM's `Retry-After` when it is larger than
+   `coalesce_retry_secs` (`coalesce_retry_secs` is a floor, not a ceiling; a
+   delay that would cross `expires_at` drops the group instead). A terminal
+   failure (every token non-retryable) deletes the group, counts
+   `push_coalesce_skipped_total{reason="send_failed"}`, and warns with the
+   recipient, type, and target.
 
 The whole flush is bounded by `coalesce_flush_timeout_secs` (120 s). A timed-out
 flush leaves its lease in place; lease expiry recovers the work, and a summary
@@ -362,8 +375,8 @@ New `service` settings, each rejected at zero:
 | `push_coalesced_sends_total` | Counter | `type` (`like`/`repost`) | Summary pushes sent |
 | `push_coalesce_oldest_due_age_seconds` | Gauge | — | Age of the oldest group that is due now, measured against the Redis server clock and sampled on every worker pass |
 | `push_throttled_recipients_total` | Counter | `type` | Would-be immediate pushes demoted by the per-recipient like/repost budget (empty token bucket or rolling emission cap reached) |
-| `push_coalesce_skipped_total` | Counter | `reason` | Terminal non-delivery outcomes: `expired`, `dangling_due`, `missing_group`, `no_pending`, `unknown_type`, `missing_actor_count`, `unparseable_owner`, `not_allowlisted`, `no_tokens`, `preference_disabled` |
-| `push_coalesce_deferred_total` | Counter | `reason` | Flushes deferred without consuming an attempt (`recipient_throttled`: bucket empty or rolling emission cap reached) |
+| `push_coalesce_skipped_total` | Counter | `reason` | Terminal non-delivery outcomes: `expired`, `expired_throttled`, `send_failed`, `dangling_due`, `missing_group`, `no_pending`, `unknown_type`, `missing_actor_count`, `unparseable_owner`, `not_allowlisted`, `no_tokens`, `preference_disabled` |
+| `push_coalesce_deferred_total` | Counter | `reason` | Flushes deferred without consuming an attempt (`recipient_throttled`: token bucket empty; `recipient_daily_capped`: rolling emission cap reached) |
 | `push_coalesce_flush_failures_total` | Counter | `reason` | Flushes that failed before a terminal outcome (`timeout`, `error`) |
 
 ## Accepted losses
@@ -413,8 +426,9 @@ New `service` settings, each rejected at zero:
   by `coalesce_group_ttl_secs`; a recipient who stays at `recipient_daily_cap`
   for the group's whole 24-hour lifetime reaches it. At the shipped defaults the
   window and the lifetime are both 24 h, so this is the expected outcome for a
-  recipient who is continuously at the cap, not an edge case. Loud and counted;
-  the deferral itself is not a drop.
+  recipient who is continuously at the cap, not an edge case. Loud and counted
+  under `push_coalesce_skipped_total{reason="expired_throttled"}`, which keeps
+  the `expired` counter for backlog losses; the deferral itself is not a drop.
 - **Redis footprint grows per interaction.** Every immediate like/repost also
   writes a group hash, a disposition string, and a member of the recipient's
   rolling emission window (`coalesce:emitted:{owner}`, bounded to
@@ -452,11 +466,14 @@ Committed regression tests:
   `Retry-After` when it exceeds the configured floor.
 - daily cap: with `recipient_daily_cap` emissions in the rolling window, an
   immediate push is demoted and a summary flush is deferred without sending or
-  spending a token, and the deferred summary keeps its buffered work until its
-  logical expiry; once the oldest emission ages out of the window the next
-  immediate sends and the deferred summary sends; an all-token retryable
-  failure leaves the window as well as refunding the token, so the retried send
-  is not charged twice.
+  spending a token, and the deferred summary keeps its buffered work; the
+  requeue lands when the oldest emission ages out, not at the token refill, and
+  that due score is asserted; once the window slides the next immediate sends
+  and the deferred summary sends; a re-spend of the same emission (the
+  recovered-lease duplicate path) does not inflate the window count; an
+  all-token failure that delivered nothing refunds the token and the window
+  slot whether it was retryable or terminal, and the terminal case is counted
+  under `send_failed`.
 - durability: a buffered group carries `expires_at` and a physical TTL longer
   than the window plus grace; an immediate-only group keeps the short bucket
   TTL; a flush drops and deletes a group past its logical lifetime; a requeue

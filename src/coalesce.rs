@@ -195,6 +195,18 @@ fn emitted_key_ttl(settings: &ServiceSettings) -> u64 {
         .saturating_add(settings.coalesce_logical_expiry_grace_secs)
 }
 
+/// Why a recipient-budget spend did or did not emit a notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendOutcome {
+    /// The token and the rolling-window slot were spent.
+    Spent,
+    /// The token bucket is empty; retry after the refill window.
+    BucketEmpty { retry_after_secs: u64 },
+    /// The rolling emission window is full; retry when the oldest emission
+    /// ages out, not on the token refill cadence.
+    DailyCapped { retry_after_secs: u64 },
+}
+
 /// Spend one token from a recipient's bucket, refilling lazily.
 ///
 /// The immediate path spends a token inside the ingest script. The flush path
@@ -207,12 +219,16 @@ fn emitted_key_ttl(settings: &ServiceSettings) -> u64 {
 /// emission ages out of the window. `member` identifies this emission in that
 /// window — the trigger event id for an immediate push, the group id for a
 /// summary — so a retry of the same send cannot count twice.
+///
+/// A refusal names its bound and the delay that clears it, so a cap deferral
+/// waits for the window to slide instead of re-polling the serial drain every
+/// refill.
 pub async fn consume_recipient_token(
     pool: &RedisPool,
     owner_hex: &str,
     member: &str,
     settings: &ServiceSettings,
-) -> Result<bool> {
+) -> Result<SpendOutcome> {
     const TOKEN_SCRIPT: &str = r#"
         local tkey = KEYS[1]
         local ekey = KEYS[2]
@@ -230,7 +246,12 @@ pub async fn consume_recipient_token(
         -- refused until the oldest emission ages out.
         redis.call('ZREMRANGEBYSCORE', ekey, '-inf', now - window)
         if redis.call('ZCARD', ekey) >= daily_cap then
-          return 0
+          local oldest = redis.call('ZRANGE', ekey, 0, 0, 'WITHSCORES')
+          local wait = window
+          if oldest[2] then
+            wait = math.max(1, math.ceil(tonumber(oldest[2]) + window - now))
+          end
+          return {-1, wait}
         end
         local tokens = tonumber(redis.call('HGET', tkey, 'tokens'))
         local ts = tonumber(redis.call('HGET', tkey, 'ts'))
@@ -245,11 +266,11 @@ pub async fn consume_recipient_token(
           redis.call('EXPIRE', tkey, throttle_ttl)
           redis.call('ZADD', ekey, now, member)
           redis.call('EXPIRE', ekey, emitted_ttl)
-          return 1
+          return {1, 0}
         end
         redis.call('HSET', tkey, 'tokens', tokens, 'ts', now_ms)
         redis.call('EXPIRE', tkey, throttle_ttl)
-        return 0
+        return {0, refill_secs}
     "#;
 
     let mut conn = pool
@@ -257,7 +278,7 @@ pub async fn consume_recipient_token(
         .await
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
 
-    let consumed: i64 = redis::Script::new(TOKEN_SCRIPT)
+    let outcome: (i64, u64) = redis::Script::new(TOKEN_SCRIPT)
         .key(format!("{THROTTLE_PREFIX}{owner_hex}"))
         .key(format!("{EMITTED_PREFIX}{owner_hex}"))
         .arg(settings.recipient_throttle_capacity)
@@ -271,7 +292,15 @@ pub async fn consume_recipient_token(
         .await
         .map_err(ServiceError::Redis)?;
 
-    Ok(consumed == 1)
+    Ok(match outcome.0 {
+        1 => SpendOutcome::Spent,
+        0 => SpendOutcome::BucketEmpty {
+            retry_after_secs: outcome.1.max(1),
+        },
+        _ => SpendOutcome::DailyCapped {
+            retry_after_secs: outcome.1.max(1),
+        },
+    })
 }
 
 /// Return one token to a recipient's bucket after a flush that emitted nothing.
@@ -1041,13 +1070,23 @@ async fn requeue_or_expire(
     match complete_group(&state.redis_pool, claim, Some(delay_secs)).await? {
         CompleteOutcome::Requeued => Ok(requeue_outcome),
         CompleteOutcome::Expired => {
-            crate::metrics::coalesce_skipped("expired", 1);
+            // A group that expires while its recipient's budget is spent is the
+            // expected steady state at the cap, not a backlog incident; give it
+            // its own reason so the `expired` counter still isolates backlog
+            // losses.
+            let reason = if requeue_outcome == FlushOutcome::Throttled {
+                "expired_throttled"
+            } else {
+                "expired"
+            };
+            crate::metrics::coalesce_skipped(reason, 1);
             warn!(
                 group_id = %claim.group_id,
                 owner = %snapshot.owner,
                 ntype = %snapshot.notification_type,
                 target = %snapshot.target,
                 pending = snapshot.pending,
+                reason,
                 "Dropped a coalesced group at its logical expiry instead of requeueing it"
             );
             Ok(FlushOutcome::Expired)
@@ -1196,9 +1235,12 @@ pub(crate) async fn flush_group(
     // and a slot in the rolling emission window. That is what bounds a
     // boundary burst of summaries, and it is what holds a recipient at
     // `recipient_daily_cap` even when the bucket has refilled. A deferral is
-    // not a failure and does not touch the retry path.
+    // not a failure and does not touch the retry path. Each bound reports the
+    // delay that clears it: a refill for an empty bucket, the oldest emission
+    // aging out for a full window, so a capped group does not re-poll the
+    // serial drain every minute for as long as its lifetime.
     let recipient = snapshot.owner.clone();
-    if !consume_recipient_token(
+    let deferral_secs = match consume_recipient_token(
         &state.redis_pool,
         &recipient,
         &claim.group_id,
@@ -1206,23 +1248,34 @@ pub(crate) async fn flush_group(
     )
     .await?
     {
-        crate::metrics::coalesce_deferred("recipient_throttled", 1);
-        info!(
-            group_id = %claim.group_id,
-            owner = %snapshot.owner,
-            ntype = %snapshot.notification_type,
-            refill_secs = state.settings.service.recipient_throttle_refill_secs,
-            daily_cap = state.settings.service.recipient_daily_cap,
-            "Deferring a coalesced summary; the recipient notification budget is spent"
-        );
-        return requeue_or_expire(
-            state,
-            claim,
-            &snapshot,
-            FlushOutcome::Throttled,
-            state.settings.service.recipient_throttle_refill_secs,
-        )
-        .await;
+        SpendOutcome::Spent => None,
+        SpendOutcome::BucketEmpty { retry_after_secs } => {
+            crate::metrics::coalesce_deferred("recipient_throttled", 1);
+            info!(
+                group_id = %claim.group_id,
+                owner = %snapshot.owner,
+                ntype = %snapshot.notification_type,
+                retry_after_secs,
+                "Deferring a coalesced summary; the recipient token bucket is empty"
+            );
+            Some(retry_after_secs)
+        }
+        SpendOutcome::DailyCapped { retry_after_secs } => {
+            crate::metrics::coalesce_deferred("recipient_daily_capped", 1);
+            info!(
+                group_id = %claim.group_id,
+                owner = %snapshot.owner,
+                ntype = %snapshot.notification_type,
+                retry_after_secs,
+                daily_cap = state.settings.service.recipient_daily_cap,
+                "Deferring a coalesced summary; the recipient is at the rolling emission cap"
+            );
+            Some(retry_after_secs)
+        }
+    };
+    if let Some(delay_secs) = deferral_secs {
+        return requeue_or_expire(state, claim, &snapshot, FlushOutcome::Throttled, delay_secs)
+            .await;
     }
 
     let sample_name = match (&state.mention_parser_service, &snapshot.first_actor) {
@@ -1299,21 +1352,22 @@ pub(crate) async fn flush_group(
     }
 
     if delivered.is_empty() {
+        // Nothing reached a device, so the emitted-notification charge is
+        // returned — the token and the rolling-window slot — whether the
+        // failure was retryable or terminal. Charging for a notification nobody
+        // received would hold budget the recipient can spend on a push that
+        // does arrive.
+        if let Err(e) = refund_recipient_token(
+            &state.redis_pool,
+            &recipient,
+            &claim.group_id,
+            &state.settings.service,
+        )
+        .await
+        {
+            error!(group_id = %claim.group_id, error = %e, "Failed to refund the recipient throttle token after a summary failure that delivered nothing");
+        }
         if let Some(delay) = retryable_failure {
-            // Nothing reached a device, so the emitted-notification charge is
-            // returned — the token and the rolling-window slot — otherwise one
-            // stuck group could hold the recipient's budget spent for as long
-            // as it retries.
-            if let Err(e) = refund_recipient_token(
-                &state.redis_pool,
-                &recipient,
-                &claim.group_id,
-                &state.settings.service,
-            )
-            .await
-            {
-                error!(group_id = %claim.group_id, error = %e, "Failed to refund the recipient throttle token after a retryable summary failure");
-            }
             // FCM's Retry-After wins when it asks for more than the configured
             // minimum. A requeue that would cross the logical lifetime drops
             // the group instead.
@@ -1329,7 +1383,19 @@ pub(crate) async fn flush_group(
             )
             .await;
         }
+        // Every token failed non-retryably: the group is terminal and would
+        // otherwise be deleted with no outcome recorded, so count and log the
+        // loss the way the other terminal paths do.
         complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("send_failed", 1);
+        warn!(
+            group_id = %claim.group_id,
+            owner = %snapshot.owner,
+            ntype = %snapshot.notification_type,
+            target = %snapshot.target,
+            failed,
+            "Dropped a coalesced group whose every send failed non-retryably"
+        );
         return Ok(FlushOutcome::Sent {
             delivered: 0,
             failed,
@@ -2544,9 +2610,10 @@ mod tests {
         settings.service.allowed_pubkeys.clear();
         settings.service.coalesce_immediate_limit = 3;
         // The bucket is deliberately not the binding bound here: the rolling
-        // emission window is.
+        // emission window is, and its slide (an hour) must be far from the
+        // token refill so the requeue delay tells the two bounds apart.
         settings.service.recipient_throttle_capacity = 100;
-        settings.service.recipient_throttle_refill_secs = 3600;
+        settings.service.recipient_throttle_refill_secs = 60;
         settings.service.recipient_daily_window_secs = 3600;
         settings.service.recipient_daily_cap = 2;
         let owner = Keys::generate().public_key();
@@ -2614,9 +2681,23 @@ mod tests {
             "a deferred summary must survive until its logical expiry or the slide"
         );
 
-        // Age the emissions out of the window; the deferred summary now sends.
+        // The requeue waits for the window to slide, not for the token refill.
         let now = Timestamp::now().as_secs();
         let window = settings.service.recipient_daily_window_secs;
+        let mut conn = pool.get().await.unwrap();
+        let score: Option<u64> = redis::cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(group_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert!(
+            score.is_some_and(|score| score >= now + window - 10 && score <= now + window + 5),
+            "a capped group must return when the oldest emission ages out, got {score:?}"
+        );
+
+        // Age the emissions out of the window; the deferred summary now sends.
         set_emitted_window(
             &pool,
             &owner,
@@ -2649,6 +2730,41 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn a_duplicate_spend_of_one_group_counts_once_in_the_emission_window() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.recipient_throttle_capacity = 5;
+        settings.recipient_daily_cap = 3;
+        settings.recipient_daily_window_secs = 3600;
+        let owner = Keys::generate().public_key();
+        let group_id = format!("like:{}:e:{}:0", owner.to_hex(), Uuid::new_v4());
+
+        // A lease-recovered flush can spend the same group's budget twice; the
+        // window member is the group id, so the emission must count once.
+        for _ in 0..2 {
+            let outcome = consume_recipient_token(&pool, &owner.to_hex(), &group_id, &settings)
+                .await
+                .unwrap();
+            assert_eq!(outcome, SpendOutcome::Spent);
+        }
+
+        let mut conn = pool.get().await.unwrap();
+        let emitted: i64 = redis::cmd("ZCARD")
+            .arg(format!("{EMITTED_PREFIX}{}", owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            emitted, 1,
+            "a re-spend of the same emission must not inflate the rolling count"
+        );
+    }
+
     struct RetryableFcmSender {
         delay: Duration,
     }
@@ -2662,6 +2778,103 @@ mod tests {
         ) -> std::result::Result<(), FcmError> {
             Err(FcmError::RetryableInternal(self.delay))
         }
+    }
+
+    struct AllInvalidFcmSender;
+
+    #[async_trait]
+    impl FcmSend for AllInvalidFcmSender {
+        async fn send_single(
+            &self,
+            _token: &str,
+            _payload: FcmPayload,
+        ) -> std::result::Result<(), FcmError> {
+            Err(FcmError::TokenNotRegistered)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_all_invalid_summary_failure_completes_and_clears_the_window() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.coalesce_immediate_limit = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+
+        let _ = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+        redis_store::add_or_update_token(&pool, &owner, "coalesce-invalid-token")
+            .await
+            .unwrap();
+
+        let state = test_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(AllInvalidFcmSender)),
+        );
+        let claim = claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the group is claimable");
+        let outcome = flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FlushOutcome::Sent {
+                delivered: 0,
+                failed: 1,
+                actor_count: 1,
+            },
+            "every token failing non-retryably is a terminal outcome"
+        );
+        assert!(
+            load_group(&pool, &group_id).await.unwrap().is_none(),
+            "a terminal failure must complete the group"
+        );
+
+        // Nothing was emitted, so the spent token and window slot come back.
+        let mut conn = pool.get().await.unwrap();
+        let emitted: Option<u64> = redis::cmd("ZSCORE")
+            .arg(format!("{EMITTED_PREFIX}{}", owner.to_hex()))
+            .arg(&group_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            emitted.is_none(),
+            "a terminal failure that emitted nothing must leave the rolling window"
+        );
+        drop(conn);
+        redis_store::remove_token(&pool, &owner, "coalesce-invalid-token")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

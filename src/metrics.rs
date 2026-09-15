@@ -180,8 +180,11 @@ mod tests {
             coalesce_oldest_due_age(12.0);
             throttled_recipient("repost");
             coalesce_skipped("expired", 1);
+            coalesce_skipped("expired_throttled", 1);
+            coalesce_skipped("send_failed", 1);
             coalesce_skipped("dangling_due", 2);
             coalesce_deferred("recipient_throttled", 1);
+            coalesce_deferred("recipient_daily_capped", 1);
             coalesce_flush_failure("timeout", 1);
         });
 
@@ -238,11 +241,23 @@ mod tests {
             "{rendered}"
         );
         assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="expired_throttled"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="send_failed"} 1"#),
+            "{rendered}"
+        );
+        assert!(
             rendered.contains(r#"push_coalesce_skipped_total{reason="dangling_due"} 2"#),
             "{rendered}"
         );
         assert!(
             rendered.contains(r#"push_coalesce_deferred_total{reason="recipient_throttled"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_deferred_total{reason="recipient_daily_capped"} 1"#),
             "{rendered}"
         );
         assert!(
