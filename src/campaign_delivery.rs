@@ -16,7 +16,7 @@ use crate::{
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-use tokio::time::interval;
+use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -44,6 +44,7 @@ struct PendingDelivery {
 #[serde(rename_all = "camelCase")]
 struct PendingResponse {
     deliveries: Vec<PendingDelivery>,
+    lease_seconds: u64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
@@ -73,26 +74,15 @@ fn dedup_key(idempotency_key: &str) -> String {
     format!("campaign_delivery:{idempotency_key}")
 }
 
-/// How long a claim stands before a push has actually been accepted.
+/// Time reserved to POST a result before the engagement lease expires.
 ///
-/// It only has to outlive `divine-engagement`'s lease (`leaseSeconds`, 300 at
-/// the time of writing) so that a batch this process dies in the middle of is
-/// re-offered and retried rather than suppressed as already delivered. That is
-/// the deploy-time norm rather than an edge case: the binary is PID 1 in its
-/// container and handles only SIGINT, so a pod termination is an ungraceful
-/// kill. Not read from the poll response yet — `PendingResponse` does not
-/// decode `leaseSeconds`.
-///
-/// TODO(#41): replace with the lease budget the delivery API returns.
-const CLAIM_TTL_SECS: u64 = 600;
+/// The HTTP client has a 30-second request timeout. Keeping the same amount in
+/// hand means a delivery is never deliberately started when its result cannot
+/// still be recorded inside the lease.
+const RESULT_REPORT_RESERVE: Duration = Duration::from_secs(30);
 
-/// `divine-engagement`'s `LEASE_SECONDS`, which `CLAIM_TTL_SECS` must outlive.
-///
-/// Duplicated rather than read from the wire because `PendingResponse` does not
-/// decode `leaseSeconds` yet. Tests assert the ordering so the two cannot drift
-/// apart silently.
 #[cfg(test)]
-const ENGAGEMENT_LEASE_SECS: i64 = 300;
+const TEST_LEASE_SECS: u64 = 300;
 
 /// Drops a claim, so that whatever is re-offered gets a real second attempt.
 ///
@@ -203,7 +193,12 @@ fn campaign_payload(delivery: &PendingDelivery, recipient: &PublicKey) -> FcmPay
 /// Order matters. Consent is refused before anything is looked up, so an
 /// unconfigured deployment cannot leak the existence of a recipient by
 /// behaving differently for one who has devices.
-async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> DeliveryResult {
+async fn deliver(
+    state: &AppState,
+    delivery: &PendingDelivery,
+    now: i64,
+    claim_ttl_secs: u64,
+) -> DeliveryResult {
     let settings = &state.settings.campaign_delivery;
 
     let refuse = |status, reason: &str| DeliveryResult {
@@ -231,21 +226,25 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
     // expire after we accepted a message but before the result was reported,
     // so the same key will legitimately be offered again.
     //
-    // The claim survives only a delivery. It is taken for `CLAIM_TTL_SECS` and
+    // The claim survives only a delivery. It is taken for the remaining API
+    // lease and
     // promoted to the full dedup window once FCM has accepted a push; every
     // path that took it and ends without one drops it. Holding the full window
     // across a failure would suppress the very retry this function asks for,
     // and the row would settle `already_delivered` for a push that never
     // landed.
     //
-    // Both of those writes are scoped to `owner`. Nothing bounds the send, so a
-    // claim can expire while this attempt is still inside `send_batch`, and the
-    // key may already belong to the re-offer that produced it. Releasing or
-    // promoting it then would be operating on someone else's claim.
+    // Both writes are scoped to `owner`, so a cancelled or unexpectedly late
+    // attempt cannot release or promote a successor's claim.
     let claim = dedup_key(&delivery.idempotency_key);
     let owner = redis_store::new_claim_owner();
-    match redis_store::claim_campaign_delivery(&state.redis_pool, &claim, &owner, CLAIM_TTL_SECS)
-        .await
+    match redis_store::claim_campaign_delivery(
+        &state.redis_pool,
+        &claim,
+        &owner,
+        claim_ttl_secs.max(1),
+    )
+    .await
     {
         Ok(true) => {}
         Ok(false) => return refuse(DeliveryStatus::Suppressed, "already_delivered"),
@@ -323,7 +322,7 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
         // to outlive any re-offer.
         // Never below the in-flight window. EXPIRE sets rather than extends,
         // and dedup_ttl_secs is operator-settable with nothing tying it to
-        // CLAIM_TTL_SECS, so a shorter value would leave a delivered push
+        // the returned lease, so a shorter value would leave a delivered push
         // holding a shorter claim than an in-flight one. Clamped here rather
         // than with EXPIRE's GT flag, which needs Redis 7 and this repo does
         // not pin the deployed version.
@@ -331,7 +330,7 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
             &state.redis_pool,
             &claim,
             &owner,
-            settings.dedup_ttl_secs.max(CLAIM_TTL_SECS),
+            settings.dedup_ttl_secs.max(claim_ttl_secs),
         )
         .await
         {
@@ -359,6 +358,36 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
     } else {
         release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
         refuse(DeliveryStatus::PermanentFailure, "no_device")
+    }
+}
+
+async fn report_result(
+    settings: &crate::config::CampaignDeliverySettings,
+    http: &reqwest::Client,
+    result: DeliveryResult,
+) {
+    let results_url = format!(
+        "{}/api/internal/deliveries/results",
+        settings.api_base_url.trim_end_matches('/')
+    );
+    let reported = http
+        .post(&results_url)
+        .header("CF-Access-Client-Id", &settings.access_client_id)
+        .header("CF-Access-Client-Secret", &settings.access_client_secret)
+        .json(&ResultsRequest {
+            results: vec![result],
+        })
+        .send()
+        .await;
+
+    match reported {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            warn!(status = %status, body = %body_snippet(&body), "Reporting delivery result failed");
+        }
+        Err(e) => warn!(error = %e, "Reporting delivery result failed"),
     }
 }
 
@@ -397,35 +426,52 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         return Ok(0);
     }
 
-    let now = chrono::Utc::now().timestamp();
-    let mut results = Vec::with_capacity(pending.deliveries.len());
-    for delivery in &pending.deliveries {
-        results.push(deliver(state, delivery, now).await);
+    if pending.lease_seconds == 0 {
+        return Err(crate::error::ServiceError::Internal(
+            "Pending delivery response returned a zero-second lease".to_string(),
+        ));
     }
 
-    let count = results.len();
-    let results_url = format!(
-        "{}/api/internal/deliveries/results",
-        settings.api_base_url.trim_end_matches('/')
-    );
-    let reported = http
-        .post(&results_url)
-        .header("CF-Access-Client-Id", &settings.access_client_id)
-        .header("CF-Access-Client-Secret", &settings.access_client_secret)
-        .json(&ResultsRequest { results })
-        .send()
-        .await;
-
-    match reported {
-        Ok(response) if response.status().is_success() => {}
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            warn!(status = %status, body = %body_snippet(&body), "Reporting delivery results failed");
+    let lease_deadline = Instant::now() + Duration::from_secs(pending.lease_seconds);
+    let mut count = 0;
+    for delivery in &pending.deliveries {
+        let remaining = lease_deadline.saturating_duration_since(Instant::now());
+        if remaining <= RESULT_REPORT_RESERVE {
+            warn!(
+                processed = count,
+                total = pending.deliveries.len(),
+                "Stopping campaign batch before its delivery lease expires"
+            );
+            break;
         }
-        // Not fatal. The lease expires and the work is offered again, and the
-        // dedup key above stops that becoming a second push.
-        Err(e) => warn!(error = %e, "Reporting delivery results failed"),
+
+        let claim_ttl_secs = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+            .max(1);
+        let delivery_budget = remaining - RESULT_REPORT_RESERVE;
+        let result = match timeout(
+            delivery_budget,
+            deliver(
+                state,
+                delivery,
+                chrono::Utc::now().timestamp(),
+                claim_ttl_secs,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    key = %delivery.idempotency_key,
+                    "Campaign delivery exhausted the remaining lease budget"
+                );
+                break;
+            }
+        };
+        report_result(settings, http, result).await;
+        count += 1;
     }
 
     Ok(count)
@@ -462,6 +508,7 @@ pub async fn run_campaign_delivery_service(
         .map_err(|e| crate::error::ServiceError::Internal(format!("HTTP client: {e}")))?;
 
     let mut ticker = interval(Duration::from_secs(settings.poll_interval_secs.max(1)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     info!(
         interval_secs = settings.poll_interval_secs,
         batch_size = settings.batch_size,
@@ -647,7 +694,7 @@ mod tests {
                 .arg(SUCCESSOR_OWNER)
                 .arg("NX")
                 .arg("EX")
-                .arg(CLAIM_TTL_SECS)
+                .arg(TEST_LEASE_SECS)
                 .query_async(&mut *conn)
                 .await
                 .unwrap();
@@ -799,10 +846,8 @@ mod tests {
     fn test_pending_envelope_decodes_what_engagement_serves() {
         // The wire body is the envelope, not a bare delivery: engagement
         // unconditionally returns {"deliveries": [...], "leaseSeconds": 300}.
-        // Nothing decodes leaseSeconds yet, so this pins that the extra field
-        // does not break the envelope and that `deliveries` keeps its wire
-        // name — a deny_unknown_fields or rename here would fail every
-        // production poll while the bare-delivery fixtures below stayed green.
+        // Pin both fields because the lease is part of the correctness
+        // contract, not ignorable envelope metadata.
         let json = r#"{
             "deliveries": [{
                 "idempotencyKey": "rev-1:abc",
@@ -818,6 +863,7 @@ mod tests {
         }"#;
         let parsed: PendingResponse = serde_json::from_str(json).expect("decodes");
         assert_eq!(parsed.deliveries.len(), 1);
+        assert_eq!(parsed.lease_seconds, 300);
         assert_eq!(parsed.deliveries[0].idempotency_key, "rev-1:abc");
         assert_eq!(
             parsed.deliveries[0].expires_at.as_deref(),
@@ -913,6 +959,7 @@ mod tests {
             &sending_state(pool.clone(), failing),
             &pending,
             1_800_000_000,
+            TEST_LEASE_SECS,
         )
         .await;
         assert_eq!(first.status, DeliveryStatus::RetryableFailure);
@@ -930,6 +977,7 @@ mod tests {
             &sending_state(pool.clone(), working.clone()),
             &pending,
             1_800_000_000,
+            TEST_LEASE_SECS,
         )
         .await;
         assert_eq!(
@@ -955,13 +1003,13 @@ mod tests {
         let claim = dedup_key(&pending.idempotency_key);
 
         let state = sending_state(pool.clone(), MockFcmSender::new());
-        let result = deliver(&state, &pending, 1_800_000_000).await;
+        let result = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
 
         // Claimed for the lease window, promoted to the dedup window on send.
         // Left at the lease window, a re-offer after 600s would push twice.
         // Pinned to the configured window, not merely "longer than the claim".
-        // Promoting to CLAIM_TTL_SECS + 1 is three orders of magnitude short of
+        // Promoting to the lease plus one is three orders of magnitude short of
         // the dedup window and would otherwise pass.
         let dedup_ttl = state.settings.campaign_delivery.dedup_ttl_secs as i64;
         let ttl = claim_ttl(&pool, &claim).await;
@@ -989,7 +1037,7 @@ mod tests {
         state.fcm_client = Arc::new(FcmClient::new_with_impl(Box::new(destroyer)));
 
         // A push landed, so the outcome is Delivered whatever the claim did.
-        let result = deliver(&state, &pending, 1_800_000_000).await;
+        let result = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
         assert_eq!(result.reason, None);
 
@@ -1022,7 +1070,7 @@ mod tests {
                 outcome: Err(FcmError::InternalError),
             }),
         );
-        let result = deliver(&state, &pending, 1_800_000_000).await;
+        let result = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::RetryableFailure);
 
         // An unguarded DEL here deletes the successor's live claim, after which
@@ -1054,7 +1102,7 @@ mod tests {
                 outcome: Ok(()),
             }),
         );
-        let result = deliver(&state, &pending, 1_800_000_000).await;
+        let result = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
 
         // An unguarded EXPIRE here gives the successor's *in-flight* claim the
@@ -1067,7 +1115,7 @@ mod tests {
         );
         let ttl = claim_ttl(&pool, &claim).await;
         assert!(
-            ttl <= CLAIM_TTL_SECS as i64,
+            ttl <= TEST_LEASE_SECS as i64,
             "a stale promote must not extend a claim this attempt no longer owns; TTL was {ttl}"
         );
 
@@ -1082,12 +1130,12 @@ mod tests {
         let (pending, _token) = registered_delivery(&pool, "shortdedup").await;
         let claim = dedup_key(&pending.idempotency_key);
 
-        // An operator setting dedup_ttl_secs below CLAIM_TTL_SECS must not end
+        // An operator setting dedup_ttl_secs below the returned lease must not end
         // up with a delivered push held for less time than an in-flight one.
         let mut state = sending_state(pool.clone(), MockFcmSender::new());
         state.settings.campaign_delivery.dedup_ttl_secs = 60;
 
-        let result = deliver(&state, &pending, 1_800_000_000).await;
+        let result = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
 
         // Same few seconds of slack the sibling assertion allows for the round
@@ -1095,7 +1143,7 @@ mod tests {
         // about half a second between the promote and this read.
         let ttl = claim_ttl(&pool, &claim).await;
         assert!(
-            ttl >= CLAIM_TTL_SECS as i64 - 5,
+            ttl >= TEST_LEASE_SECS as i64 - 5,
             "a delivered claim must never be shorter than the in-flight window; TTL was {ttl}"
         );
 
@@ -1119,7 +1167,7 @@ mod tests {
         let state = state_with_sender(pool.clone(), Box::new(probe));
         let dedup_ttl = state.settings.campaign_delivery.dedup_ttl_secs as i64;
 
-        deliver(&state, &pending, 1_800_000_000).await;
+        deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
 
         // Claimed for the lease window, not the dedup window. A process killed
         // between claim and report — the deploy-time norm here — has to expire
@@ -1130,12 +1178,12 @@ mod tests {
         // to outlive divine-engagement's 300s lease, or it expires mid-send and
         // every delivery becomes double-pushable.
         assert!(
-            observed <= CLAIM_TTL_SECS as i64 && observed < dedup_ttl,
+            observed <= TEST_LEASE_SECS as i64 && observed < dedup_ttl,
             "an in-flight claim must be held for the lease window, not the dedup window; TTL was {observed}"
         );
         assert!(
-            observed > ENGAGEMENT_LEASE_SECS,
-            "an in-flight claim must outlive the {ENGAGEMENT_LEASE_SECS}s lease; TTL was {observed}"
+            observed >= TEST_LEASE_SECS as i64 - 1,
+            "an in-flight claim must use the returned {TEST_LEASE_SECS}s lease; TTL was {observed}"
         );
 
         delete_claim(&pool, &claim).await;
@@ -1153,6 +1201,7 @@ mod tests {
             &sending_state(pool.clone(), MockFcmSender::new()),
             &pending,
             1_800_000_000,
+            TEST_LEASE_SECS,
         )
         .await;
         assert_eq!(first.status, DeliveryStatus::Delivered);
@@ -1164,6 +1213,7 @@ mod tests {
             &sending_state(pool.clone(), repeat.clone()),
             &pending,
             1_800_000_000,
+            TEST_LEASE_SECS,
         )
         .await;
         assert_eq!(second.status, DeliveryStatus::Suppressed);
@@ -1242,6 +1292,7 @@ mod tests {
             &sending_state(pool.clone(), MockFcmSender::new()),
             &pending,
             1_800_000_000,
+            TEST_LEASE_SECS,
         )
         .await;
         assert_eq!(result.status, DeliveryStatus::Delivered);
