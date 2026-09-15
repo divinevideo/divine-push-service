@@ -97,6 +97,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - `coalesce:due` - Sorted set of groups due for flush, scored by bucket deadline
 - `coalesce:leases` - Sorted set of groups owned by an in-flight flush, scored by lease expiry; reconciliation never re-adds a group with nothing pending
 - `coalesce:throttle:{owner}` - Per-recipient token bucket shared by immediate like/repost pushes and summary flushes: a summary with an empty bucket defers to the next refill instead of sending
+- `coalesce:emitted:{owner}` - Per-recipient rolling emission window: one member per emitted like/repost notification (trigger event id for an immediate push, group id for a summary), scored by the Redis server time of the send. Reads drop members older than `recipient_daily_window_secs` and `ZCARD` is checked against `recipient_daily_cap` before either path spends, so immediates and summaries share the same 24-hour budget; a retryable failure that emitted nothing removes its member again
 
 ### Notification Types
 | Type | Trigger Kind | Description |

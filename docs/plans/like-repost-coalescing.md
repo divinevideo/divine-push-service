@@ -1,6 +1,6 @@
 # Like and Repost notification coalescing
 
-Status: Revision 10 — implementation plan. Supersedes revision 9.
+Status: Revision 11 — implementation plan. Supersedes revision 10.
 
 Scope: kinds 7 (Like) and 16 (Repost) only. Comments (1111), mentions
 (30023/34236), and new-post ("bell") notifications are not coalesced; they
@@ -48,6 +48,26 @@ preference promise below.
      batch cannot pin the drain behind one group; the lease outlives twice that
      bound and expiry recovers a timed-out flush. Flush outcomes (expired,
      dangling, empty, suppressed, deferred) are logged and counted.
+- Revision 11 (this document): the product owner decided both open items on
+  2026-09-15, and this revision records the decisions and their implementation.
+  1. **The shared collapse id is confirmed.** One collapse id for the immediate
+     pushes and the summary is the intended behavior; each immediate replacing
+     the previous banner and FCM possibly discarding a pending individual push
+     in favour of a later one are accepted consequences of the single-banner
+     behavior. Distinct immediate ids (four banners where there were three plus
+     a summary) were considered and rejected. Per-post thread grouping is a
+     possible future mobile change, explicitly out of scope here.
+  2. **A rolling 24-hour emission cap bounds the recipient budget.** A recipient
+     may emit at most `recipient_daily_cap` like/repost notifications
+     (immediates and summaries both count) in the rolling
+     `recipient_daily_window_secs` window. At the cap the work defers; a
+     deferred summary that is still capped at its logical expiry is dropped
+     loudly and counted, exactly as the throttle disposition table already
+     said. As part of the decision the burst capacity was lowered from 60 to 20
+     (`recipient_throttle_capacity`) so the burst and the rolling daily budget
+     agree. The refill stays one token per minute, and the 24-hour window is
+     what bounds a permanently over-budget recipient; the ~1,440-push/day
+     ceiling revision 10 documented is gone.
 
 ## Problem
 
@@ -96,6 +116,13 @@ bucket also bounds the summaries that can leave at a shared bucket boundary: an
 empty bucket defers the group to the next refill instead of sending, and a
 still-throttled group at its logical expiry is dropped loudly and counted.
 
+On top of the bucket, a rolling emission window bounds how many like/repost
+notifications one recipient can receive: at most `recipient_daily_cap` emitted
+notifications per `recipient_daily_window_secs`, counting immediates and
+summaries. The check is the same decision point as the bucket spend, on both
+paths; a recipient at the cap is demoted or deferred even when the bucket has
+tokens, and the oldest emission aging out of the window admits the next one.
+
 ### Why fixed buckets
 
 Bucket identifiers and deadlines are derived from the Redis server clock
@@ -115,6 +142,7 @@ without re-reading the buffered set.
 | `coalesce:due` | Sorted Set | Groups due for flush, scored by bucket deadline |
 | `coalesce:leases` | Sorted Set | Groups currently owned by a flush, scored by lease expiry |
 | `coalesce:throttle:{owner}` | Hash | Per-recipient token bucket: `tokens`, `ts` |
+| `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: members are the emitted notification identities (trigger event id for an immediate push, group id for a summary) scored by the Redis server time of the send. `ZREMRANGEBYSCORE` drops members older than `recipient_daily_window_secs` on every read and `ZCARD` is the count checked against `recipient_daily_cap`. TTL window + grace |
 
 `target` is `e:{event-id-hex}` for an event reference or `a:{kind:pubkey:d-tag}`
 for an addressable coordinate. Reference fields (`ref_event_id`, `ref_address`,
@@ -152,7 +180,7 @@ watches it is the operator follow-up tracked with the Redis sizing in
 `divinevideo/divine-iac-coreconfig#1932`), and the lifetime is what bounds how
 long any item waits.
 
-### Token bucket
+### Token bucket and rolling emission cap
 
 Capacity `recipient_throttle_capacity`, refill one token per
 `recipient_throttle_refill_secs`. State is stored with millisecond timestamps;
@@ -163,10 +191,21 @@ The bucket charges only for emitted notifications. The immediate path spends a
 token at ingest; the flush path spends one before sending. A summary that
 reached no device and failed retryably returns its token, so a stuck group
 cannot drain each refill and starve the recipient's immediate pushes. A
-deferral spends nothing. At the shipped defaults the bucket passes a 60-push
-burst and then ~1 push/min, so a recipient permanently over budget can still
-receive up to roughly 1,440 pushes a day, one refill at a time; that ceiling is
-what the product owner is being asked to accept or bound differently.
+deferral spends nothing.
+
+The rolling emission cap is the outer bound. Each emitted notification is a
+member of `coalesce:emitted:{owner}` scored with the Redis server time of the
+send; before any spend both paths remove members older than
+`recipient_daily_window_secs` and refuse when `ZCARD` has reached
+`recipient_daily_cap`. At the shipped defaults a recipient can emit a 20-push
+burst (the bucket capacity, deliberately the same as the daily cap so the burst
+cannot exceed it), the bucket then refills one token a minute, and the rolling
+window still holds the recipient to 20 emitted like/repost notifications in any
+24 hours. That replaces the ~1,440-push/day ceiling revision 10 documented: a
+recipient permanently over budget now defers until the oldest emission ages
+out, and a summary deferred past `coalesce_group_ttl_secs` is dropped loudly
+and counted. A retryable all-token failure refunds both the token and the
+window slot, because nothing was emitted.
 
 ## Ingest
 
@@ -176,7 +215,8 @@ held. It:
 
 1. returns the stored disposition when one exists (replay);
 2. otherwise reads the server clock, computes the bucket and deadline, and
-   checks the immediate budget and the recipient token bucket;
+   checks the immediate budget, the recipient token bucket, and the rolling
+   emission window;
 3. for an immediate decision, increments `immediate` and records the
    disposition;
 4. otherwise increments `pending`, adds the actor to the HLL, records the
@@ -214,19 +254,21 @@ Processing a claimed group:
 3. revalidate the allowlist, the recipient's registered tokens, and the stored
    notification preference. A group dropped by any of these is completed
    without a push and counted under its reason;
-4. spend one recipient token. An empty bucket returns the group to the due
-   queue at the refill time, counted as a deferral and not as a failure; a
-   deferral that would cross `expires_at` drops the group instead;
+4. spend one recipient token and record the emission in the rolling window. An
+   empty bucket or a full window returns the group to the due queue at the
+   refill time, counted as a deferral and not as a failure; a deferral that
+   would cross `expires_at` drops the group instead;
 5. resolve the first buffered actor's display name, build the summary payload
    with the group's collapse key, and send it to all of the recipient's tokens;
 6. refresh token activity from delivered tokens and prune invalid tokens, as
    the immediate path does;
 7. complete the group under the ownership check. A success (at least one
    delivered token) deletes the group and HLL. An all-token retryable failure
-   refunds the token spent in step 4 and requeues the group after FCM's
-   `Retry-After` when it is larger than `coalesce_retry_secs` (`coalesce_retry_secs`
-   is a floor, not a ceiling; a delay that would cross `expires_at` drops the
-   group instead). A non-retryable failure is logged and the group is completed.
+   refunds the token and the window slot spent in step 4 and requeues the group
+   after FCM's `Retry-After` when it is larger than `coalesce_retry_secs`
+   (`coalesce_retry_secs` is a floor, not a ceiling; a delay that would cross
+   `expires_at` drops the group instead). A non-retryable failure is logged and
+   the group is completed.
 
 The whole flush is bounded by `coalesce_flush_timeout_secs` (120 s). A timed-out
 flush leaves its lease in place; lease expiry recovers the work, and a summary
@@ -279,11 +321,12 @@ one atomic step:
   summary share one id, on iOS each immediate push replaces the previous banner
   and the summary replaces the last: a user watching the burst sees only the
   newest banner, and FCM may discard a pending individual push in favour of the
-  later one. That is intended — it is how the burst becomes a single banner —
-  and it is a real, user-visible loss, listed in Accepted losses. The
-  alternative, distinct immediate ids, would preserve each immediate banner and
-  send the summary as a separate one; it trades the single-banner behavior for
-  four banners where there were three plus a summary. FCM's
+  later one. That is intended — it is what makes the burst a single banner —
+  and it is the product-confirmed behavior (2026-09-15): one evolving banner
+  per post, with the replacement and possible discard accepted as the cost.
+  Distinct immediate ids, which would preserve each immediate banner and send
+  the summary as a separate one, were considered and rejected. Per-post thread
+  grouping is a possible future mobile change and is out of scope here. FCM's
   `android.collapse_key` coalesces messages *queued while the device is
   offline*; it does not replace a notification the app has already posted.
   Android data-only pushes are rendered by the app, and the current client
@@ -307,8 +350,10 @@ New `service` settings, each rejected at zero:
 | `coalesce_group_ttl_secs` | 86400 | Absolute logical lifetime; must exceed window + lease |
 | `coalesce_flush_timeout_secs` | 120 | Hard bound on one flush |
 | `coalesce_logical_expiry_grace_secs` | 3600 | Physical-TTL grace past the logical lifetime; also the disposition-TTL grace |
-| `recipient_throttle_capacity` | 60 | Per-recipient burst capacity |
+| `recipient_throttle_capacity` | 20 | Per-recipient burst capacity; matches the daily cap so the burst cannot exceed it |
 | `recipient_throttle_refill_secs` | 60 | Seconds per refilled token |
+| `recipient_daily_window_secs` | 86400 | Rolling window for the per-recipient emission cap |
+| `recipient_daily_cap` | 20 | Emitted like/repost notifications per recipient per window (immediates and summaries) |
 
 ## Metrics
 
@@ -316,9 +361,9 @@ New `service` settings, each rejected at zero:
 |--------|------|--------|---------|
 | `push_coalesced_sends_total` | Counter | `type` (`like`/`repost`) | Summary pushes sent |
 | `push_coalesce_oldest_due_age_seconds` | Gauge | — | Age of the oldest group that is due now, measured against the Redis server clock and sampled on every worker pass |
-| `push_throttled_recipients_total` | Counter | `type` | Would-be immediate pushes demoted by the token bucket |
+| `push_throttled_recipients_total` | Counter | `type` | Would-be immediate pushes demoted by the per-recipient like/repost budget (empty token bucket or rolling emission cap reached) |
 | `push_coalesce_skipped_total` | Counter | `reason` | Terminal non-delivery outcomes: `expired`, `dangling_due`, `missing_group`, `no_pending`, `unknown_type`, `missing_actor_count`, `unparseable_owner`, `not_allowlisted`, `no_tokens`, `preference_disabled` |
-| `push_coalesce_deferred_total` | Counter | `reason` | Flushes deferred without consuming an attempt (`recipient_throttled`) |
+| `push_coalesce_deferred_total` | Counter | `reason` | Flushes deferred without consuming an attempt (`recipient_throttled`: bucket empty or rolling emission cap reached) |
 | `push_coalesce_flush_failures_total` | Counter | `reason` | Flushes that failed before a terminal outcome (`timeout`, `error`) |
 
 ## Accepted losses
@@ -326,10 +371,11 @@ New `service` settings, each rejected at zero:
 - **A collapse key can replace an undelivered earlier push.** The immediate
   pushes and the summary share one id, so on iOS each immediate push replaces
   the previous banner, the summary replaces the last, and FCM may discard a
-  pending individual push in favour of a later one. Intended — it is what makes
-  the burst a single banner — but it is a real loss that the product owner
-  should confirm explicitly; the alternative is distinct immediate ids with the
-  summary as a separate banner.
+  pending individual push in favour of a later one. Product-confirmed on
+  2026-09-15: this is how a burst becomes one evolving banner per post, and the
+  replacement and possible discard are accepted. Distinct immediate ids with
+  the summary as a separate banner were rejected; per-post thread grouping is
+  out of scope.
 - **FCM's four-collapse-key-per-device limit.** A device tracking more than
   four groups at once can have older groups' collapse behavior degraded. The
   summary still delivers; only the replacement behavior is affected.
@@ -362,12 +408,17 @@ New `service` settings, each rejected at zero:
   increment. That covers sweeper death, a backlog past the lifetime, repeated
   retries, and a permanently throttled recipient. The long physical TTL then
   only reclaims abandoned state.
-- **A permanently throttled recipient loses the summary at logical expiry.**
-  The bucket defers rather than drops, but deferral is bounded by
-  `coalesce_group_ttl_secs`; a recipient who stays over budget for 24 h reaches
-  it. Loud and counted.
+- **A recipient at the emission cap loses the summary at logical expiry.** The
+  bucket and the rolling window defer rather than drop, but deferral is bounded
+  by `coalesce_group_ttl_secs`; a recipient who stays at `recipient_daily_cap`
+  for the group's whole 24-hour lifetime reaches it. At the shipped defaults the
+  window and the lifetime are both 24 h, so this is the expected outcome for a
+  recipient who is continuously at the cap, not an edge case. Loud and counted;
+  the deferral itself is not a drop.
 - **Redis footprint grows per interaction.** Every immediate like/repost also
-  writes a group hash and a disposition string; every buffered one adds a
+  writes a group hash, a disposition string, and a member of the recipient's
+  rolling emission window (`coalesce:emitted:{owner}`, bounded to
+  `recipient_daily_cap` entries per active recipient); every buffered one adds a
   HyperLogLog and a `coalesce:due` member. An immediate-only group hash keeps
   the window-plus-grace TTL, but a group with buffered work and its HLL live
   for the logical lifetime plus grace (25 h by default) instead of the
@@ -399,6 +450,13 @@ Committed regression tests:
   keeps its buffered work, and sends once the bucket refills; an all-token
   retryable failure refunds the spent token and requeues at FCM's
   `Retry-After` when it exceeds the configured floor.
+- daily cap: with `recipient_daily_cap` emissions in the rolling window, an
+  immediate push is demoted and a summary flush is deferred without sending or
+  spending a token, and the deferred summary keeps its buffered work until its
+  logical expiry; once the oldest emission ages out of the window the next
+  immediate sends and the deferred summary sends; an all-token retryable
+  failure leaves the window as well as refunding the token, so the retried send
+  is not charged twice.
 - durability: a buffered group carries `expires_at` and a physical TTL longer
   than the window plus grace; an immediate-only group keeps the short bucket
   TTL; a flush drops and deletes a group past its logical lifetime; a requeue

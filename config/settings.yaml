@@ -47,8 +47,10 @@ service:
   coalesce_group_ttl_secs: 86400  # Absolute logical lifetime of a buffered group
   coalesce_flush_timeout_secs: 120  # Hard bound on one coalescing flush
   coalesce_logical_expiry_grace_secs: 3600  # Physical-TTL grace past the logical lifetime
-  recipient_throttle_capacity: 60  # Instant burst of immediate pushes per recipient
+  recipient_throttle_capacity: 20  # Instant burst of immediate pushes per recipient
   recipient_throttle_refill_secs: 60  # Seconds per refilled immediate-push token
+  recipient_daily_window_secs: 86400  # Rolling window for the per-recipient emission cap
+  recipient_daily_cap: 20  # Max emitted like/repost notifications per recipient per window
   # allowed_pubkeys: [] — empty means no restriction (production default)
 
 redis:

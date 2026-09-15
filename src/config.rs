@@ -166,6 +166,14 @@ pub struct ServiceSettings {
     /// Seconds of sustained like/repost pushes one refilled token buys.
     #[serde(default = "default_recipient_throttle_refill")]
     pub recipient_throttle_refill_secs: u64,
+    /// Rolling window over which `recipient_daily_cap` bounds emitted
+    /// like/repost notifications for one recipient.
+    #[serde(default = "default_recipient_daily_window")]
+    pub recipient_daily_window_secs: u64,
+    /// Maximum like/repost notifications one recipient may receive per rolling
+    /// window, counting immediate pushes and summaries.
+    #[serde(default = "default_recipient_daily_cap")]
+    pub recipient_daily_cap: u64,
 }
 
 fn default_process_window_days() -> i64 {
@@ -269,13 +277,26 @@ fn default_coalesce_grace() -> u64 {
 }
 
 fn default_recipient_throttle_capacity() -> u64 {
-    // A recipient can absorb a 60-push burst instantly, then one push per
-    // minute sustains; beyond that the bucket defers to the summary.
-    60
+    // A recipient can absorb a 20-push burst instantly — the same size as the
+    // rolling daily cap, so the burst cannot exceed the daily budget — then one
+    // push per minute refills; beyond that the bucket defers to the summary.
+    20
 }
 
 fn default_recipient_throttle_refill() -> u64 {
     60
+}
+
+fn default_recipient_daily_window() -> u64 {
+    // 24 hours, the window the emission cap is defined over.
+    86_400
+}
+
+fn default_recipient_daily_cap() -> u64 {
+    // 20 emitted like/repost notifications in the rolling window, counting
+    // immediate pushes and summaries; at the cap a recipient defers until the
+    // oldest emission slides out.
+    20
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -447,7 +468,7 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 22] = [
+        let must_be_positive: [(&str, u64, &str); 24] = [
             (
                 "nostr.event_silence_timeout_secs",
                 self.nostr.event_silence_timeout_secs,
@@ -557,6 +578,16 @@ impl Settings {
                 "service.recipient_throttle_refill_secs",
                 self.service.recipient_throttle_refill_secs,
                 "token refill divides by zero",
+            ),
+            (
+                "service.recipient_daily_window_secs",
+                self.service.recipient_daily_window_secs,
+                "no emission can age out of the rolling cap window",
+            ),
+            (
+                "service.recipient_daily_cap",
+                self.service.recipient_daily_cap,
+                "no like/repost notification can leave and every event buffers",
             ),
         ];
 
@@ -711,7 +742,7 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 22] = [
+        let cases: [ZeroCase; 24] = [
             ("nostr.event_silence_timeout_secs", |s| {
                 s.nostr.event_silence_timeout_secs = 0
             }),
@@ -777,6 +808,12 @@ mod tests {
             }),
             ("service.recipient_throttle_refill_secs", |s| {
                 s.service.recipient_throttle_refill_secs = 0
+            }),
+            ("service.recipient_daily_window_secs", |s| {
+                s.service.recipient_daily_window_secs = 0
+            }),
+            ("service.recipient_daily_cap", |s| {
+                s.service.recipient_daily_cap = 0
             }),
         ];
 
@@ -855,6 +892,8 @@ mod tests {
             "coalesce_logical_expiry_grace_secs",
             "recipient_throttle_capacity",
             "recipient_throttle_refill_secs",
+            "recipient_daily_window_secs",
+            "recipient_daily_cap",
         ];
 
         for filename in ["settings.yaml", "settings.development.yaml"] {
@@ -878,8 +917,10 @@ mod tests {
             assert_eq!(settings.service.coalesce_group_ttl_secs, 86_400);
             assert_eq!(settings.service.coalesce_flush_timeout_secs, 120);
             assert_eq!(settings.service.coalesce_logical_expiry_grace_secs, 3600);
-            assert_eq!(settings.service.recipient_throttle_capacity, 60);
+            assert_eq!(settings.service.recipient_throttle_capacity, 20);
             assert_eq!(settings.service.recipient_throttle_refill_secs, 60);
+            assert_eq!(settings.service.recipient_daily_window_secs, 86_400);
+            assert_eq!(settings.service.recipient_daily_cap, 20);
         }
     }
 

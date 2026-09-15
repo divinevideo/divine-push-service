@@ -247,6 +247,10 @@ One popular post must not buzz its author once per like. Kinds 7 (Like) and 16
 - A per-recipient token bucket (capacity `recipient_throttle_capacity`,
   refilling one token per `recipient_throttle_refill_secs`) demotes a
   would-be-immediate push into the bucket instead of dropping it.
+- A rolling emission window holds each recipient to `recipient_daily_cap`
+  emitted like/repost notifications (immediates and summaries) per
+  `recipient_daily_window_secs`. At the cap, immediate pushes buffer and
+  summary flushes defer until the oldest emission ages out.
 - Immediate and summary pushes for one group share an FCM collapse key derived
   from the group id: `android.collapse_key` for Android (which stays data-only)
   and the `apns-collapse-id` header for iOS. On iOS the summary replaces the
@@ -518,3 +522,4 @@ The canonical registration and removal rules live in the push specification's
 | `coalesce:due` | Sorted Set | Bucket groups due for flush, scored by deadline. `{target}` is `e:{event-id}` or `a:{kind:pubkey:d-tag}` |
 | `coalesce:leases` | Sorted Set | Groups owned by an in-flight flush, scored by lease expiry. Reconciliation returns expired leases with pending work to `coalesce:due`, never re-adding a group with nothing pending |
 | `coalesce:throttle:{owner}` | Hash | Per-recipient immediate-push token bucket (`tokens`, `ts`) |
+| `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: one member per emitted like/repost notification scored by send time, pruned to `recipient_daily_window_secs` and counted against `recipient_daily_cap` before the bucket is spent |
