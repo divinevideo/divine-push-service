@@ -194,6 +194,7 @@ fn campaign_payload(delivery: &PendingDelivery, recipient: &PublicKey) -> FcmPay
         android: None,
         webpush: None,
         apns: None,
+        collapse_key: None,
     }
 }
 
@@ -747,6 +748,10 @@ mod tests {
         let payload = campaign_payload(&delivery(None), &recipient);
 
         assert!(payload.notification.is_none(), "must stay data-only");
+        assert!(
+            payload.collapse_key.is_none(),
+            "campaigns are not like/repost coalescing groups"
+        );
         let data = payload.data.expect("data");
 
         let expected: HashMap<String, String> = [
