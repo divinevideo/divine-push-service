@@ -310,7 +310,26 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         return Ok(());
     }
 
-    match redis_store::add_or_update_token(&state.redis_pool, &event.pubkey, fcm_token).await {
+    if token_payload
+        .timezone_offset_minutes
+        .is_some_and(|offset| !(-720..=840).contains(&offset))
+    {
+        warn!(
+            event_id = %event.id,
+            pubkey = %event.pubkey,
+            "Received registration with an invalid timezone offset"
+        );
+        return Ok(());
+    }
+
+    match redis_store::add_or_update_token_with_timezone(
+        &state.redis_pool,
+        &event.pubkey,
+        fcm_token,
+        token_payload.timezone_offset_minutes,
+    )
+    .await
+    {
         Ok(_) => {
             info!(event_id = %event.id, pubkey = %event.pubkey, "Registered/Updated encrypted token");
         }
@@ -415,7 +434,15 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
     };
 
     // Parse preferences from decrypted content
-    let prefs: UserPreferences = match serde_json::from_str(&decrypted) {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PreferencesPayload {
+        kinds: Vec<u16>,
+        #[serde(default)]
+        campaigns_enabled: bool,
+    }
+
+    let payload: PreferencesPayload = match serde_json::from_str(&decrypted) {
         Ok(p) => p,
         Err(e) => {
             error!(
@@ -425,10 +452,19 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
             return Ok(());
         }
     };
+    let prefs = UserPreferences {
+        kinds: payload.kinds,
+    };
 
     // Store preferences
     let pubkey_hex = event.pubkey.to_hex();
-    preferences::set_user_preferences(&state.redis_pool, &pubkey_hex, &prefs).await?;
+    preferences::set_user_preferences_with_campaign_consent(
+        &state.redis_pool,
+        &pubkey_hex,
+        &prefs,
+        payload.campaigns_enabled,
+    )
+    .await?;
 
     info!(event_id = %event.id, pubkey = %event.pubkey, prefs = ?prefs, "Updated user preferences");
 

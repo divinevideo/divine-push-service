@@ -131,7 +131,7 @@ These files set the relay (`wss://relay.divine.video`), profile relays, notifica
 
 Optional. When enabled, the service polls the campaign tool's internal delivery API for approved campaign notifications and delivers them over the existing FCM path, reporting each outcome back.
 
-It is off by default, and even when enabled it does not poll unless `api_base_url` and both Access credentials are set. Even when running, it delivers nothing until `allow_unverified_consent` is `true` — this service cannot yet evaluate marketing consent or recipient-local quiet hours, so every delivery is suppressed as `consent_not_verifiable` until an operator asserts the audience opted in out of band.
+It is off by default, and even when enabled it does not poll unless a safe HTTPS `api_base_url` and both Access credentials are set. Normal delivery requires an explicit `campaignsEnabled` kind-3083 preference and a valid device UTC offset from kind 3079, and enforces 21:00–06:59 recipient-local quiet hours. `allow_unverified_consent` is retained only as an explicit staff/internal-test bridge.
 
 ### Environment variables
 

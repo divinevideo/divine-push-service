@@ -99,7 +99,6 @@ campaign_delivery:
   poll_interval_secs: 30
   batch_size: 100
   dedup_ttl_secs: 604800  # 7 days
-  # Refuse to send until marketing consent and recipient-local quiet hours can
-  # actually be evaluated here. Setting this true asserts the audience is staff
-  # who opted in out of band.
+  # Staff-only bridge for an internal-test audience that opted in out of band.
+  # Normal delivery verifies kind 3083 consent and registration timezone.
   allow_unverified_consent: false

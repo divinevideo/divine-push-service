@@ -24,6 +24,7 @@ pub type RedisPool = Pool<RedisConnectionManager>;
 // Redis key constants
 const STALE_TOKENS_ZSET: &str = "stale_tokens";
 const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
+const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 
 /// Build key for user tokens set
@@ -64,8 +65,42 @@ pub async fn get_tokens_for_pubkey(pool: &RedisPool, pubkey: &PublicKey) -> Resu
     Ok(tokens)
 }
 
+/// Retrieves each device token with the UTC offset captured at registration.
+pub async fn get_tokens_with_timezone_offsets(
+    pool: &RedisPool,
+    pubkey: &PublicKey,
+) -> Result<Vec<(String, Option<i32>)>> {
+    let tokens = get_tokens_for_pubkey(pool, pubkey).await?;
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let offsets: Vec<Option<i32>> = redis::cmd("HMGET")
+        .arg(TOKEN_TIMEZONE_OFFSETS_HASH)
+        .arg(&tokens)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+
+    Ok(tokens.into_iter().zip(offsets).collect())
+}
+
 /// Adds or updates a single device token for a pubkey
 pub async fn add_or_update_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> Result<()> {
+    add_or_update_token_with_timezone(pool, pubkey, token, None).await
+}
+
+/// Adds or updates a device token and its current UTC offset.
+pub async fn add_or_update_token_with_timezone(
+    pool: &RedisPool,
+    pubkey: &PublicKey,
+    token: &str,
+    timezone_offset_minutes: Option<i32>,
+) -> Result<()> {
     let now_timestamp = Timestamp::now().as_secs();
     let pubkey_hex = pubkey.to_hex();
     let user_tokens_key = build_user_tokens_key(pubkey);
@@ -107,6 +142,14 @@ pub async fn add_or_update_token(pool: &RedisPool, pubkey: &PublicKey, token: &s
     pipe.sadd(&user_tokens_key, token) // Add token to user's set
         .zadd(STALE_TOKENS_ZSET, token, now_timestamp) // Track for cleanup
         .hset(TOKEN_TO_PUBKEY_HASH, token, &pubkey_hex); // Map token back to pubkey
+    match timezone_offset_minutes {
+        Some(offset) => {
+            pipe.hset(TOKEN_TIMEZONE_OFFSETS_HASH, token, offset);
+        }
+        None => {
+            pipe.hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token);
+        }
+    }
 
     let _result = pipe
         .query_async::<Value>(&mut *conn)
@@ -144,9 +187,11 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
             pipe.atomic()
                 .srem(&user_tokens_key, token) // Remove from user's set
                 .zrem(STALE_TOKENS_ZSET, token) // Remove from stale tracking
-                .hdel(TOKEN_TO_PUBKEY_HASH, token); // Remove from token->pubkey map
+                .hdel(TOKEN_TO_PUBKEY_HASH, token) // Remove from token->pubkey map
+                .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token);
 
-            let _result: RedisResult<(usize, usize, usize)> = pipe.query_async(&mut *conn).await;
+            let _result: RedisResult<(usize, usize, usize, usize)> =
+                pipe.query_async(&mut *conn).await;
             _result.map(|_| ()).map_err(ServiceError::Redis)?;
             Ok(true)
         }
@@ -391,6 +436,7 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
 
     // 3b. Remove tokens from the HASH
     pipe.hdel(TOKEN_TO_PUBKEY_HASH, &stale_tokens);
+    pipe.hdel(TOKEN_TIMEZONE_OFFSETS_HASH, &stale_tokens);
 
     // 3c. Remove tokens from individual user sets
     let mut actual_removed_count = 0;

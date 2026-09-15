@@ -55,7 +55,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 
 # --- Firebase Cloud Messaging (FCM) ---
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 gcp_auth = "0.12"
 tokio-util = "0.7"
 

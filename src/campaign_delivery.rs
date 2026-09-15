@@ -11,8 +11,10 @@
 //! actually be interrupted is decided here.
 
 use crate::{
-    error::Result, fcm_sender::FcmError, models::FcmPayload, redis_store, state::AppState,
+    error::Result, fcm_sender::FcmError, models::FcmPayload, preferences, redis_store,
+    state::AppState,
 };
+use futures_util::StreamExt;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
@@ -50,6 +52,7 @@ struct PendingResponse {
 #[serde(rename_all = "snake_case")]
 enum DeliveryStatus {
     Delivered,
+    Deferred,
     Suppressed,
     PermanentFailure,
     RetryableFailure,
@@ -62,6 +65,8 @@ struct DeliveryResult {
     status: DeliveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +90,7 @@ fn dedup_key(idempotency_key: &str) -> String {
 ///
 /// TODO(#41): replace with the lease budget the delivery API returns.
 const CLAIM_TTL_SECS: u64 = 600;
+const MAX_PENDING_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// `divine-engagement`'s `LEASE_SECONDS`, which `CLAIM_TTL_SECS` must outlive.
 ///
@@ -145,6 +151,23 @@ fn body_snippet(body: &str) -> String {
     body.chars().take(2048).collect()
 }
 
+async fn bounded_response_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            crate::error::ServiceError::Internal(format!("Campaign API body read failed: {e}"))
+        })?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(crate::error::ServiceError::Internal(format!(
+                "Campaign API response exceeded {limit} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Whether the campaign's own expiry has passed.
 ///
 /// An expired campaign is dropped rather than delivered late. An unparseable
@@ -153,10 +176,54 @@ fn is_expired(expires_at: Option<&str>, now: i64) -> bool {
     let Some(raw) = expires_at else {
         return false;
     };
-    match chrono::DateTime::parse_from_rfc3339(raw) {
+    let normalized;
+    let candidate = if raw.len() == 17 && raw.ends_with('Z') {
+        normalized = format!("{}:00Z", &raw[..raw.len() - 1]);
+        normalized.as_str()
+    } else {
+        raw
+    };
+    match chrono::DateTime::parse_from_rfc3339(candidate) {
         Ok(parsed) => parsed.timestamp() <= now,
         Err(_) => true,
     }
+}
+
+fn validate_api_base_url(raw: &str) -> Result<()> {
+    let url = reqwest::Url::parse(raw).map_err(|e| {
+        crate::error::ServiceError::Internal(format!("Invalid campaign API URL: {e}"))
+    })?;
+    let valid = url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(url.path(), "" | "/");
+    if !valid {
+        return Err(crate::error::ServiceError::Internal(
+            "Campaign API base URL must be a credential-free HTTPS origin".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the next UTC instant outside quiet hours, or `None` when delivery
+/// is currently permitted for this device offset.
+fn quiet_hours_retry_after(timezone_offset_minutes: i32, now: i64) -> Option<String> {
+    let local_seconds = now + i64::from(timezone_offset_minutes) * 60;
+    let seconds_today = local_seconds.rem_euclid(86_400);
+    let hour = seconds_today / 3_600;
+    if (7..21).contains(&hour) {
+        return None;
+    }
+
+    let until_seven = if hour < 7 {
+        7 * 3_600 - seconds_today
+    } else {
+        86_400 - seconds_today + 7 * 3_600
+    };
+    chrono::DateTime::from_timestamp(now + until_seven, 0).map(|timestamp| timestamp.to_rfc3339())
 }
 
 /// Builds the FCM payload for a campaign notification.
@@ -210,14 +277,8 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
         idempotency_key: delivery.idempotency_key.clone(),
         status,
         reason: Some(reason.to_string()),
+        retry_after: None,
     };
-
-    if !settings.allow_unverified_consent {
-        // Marketing consent is not expressible in kind 3083 yet, and no
-        // recipient timezone is stored, so quiet hours cannot be evaluated
-        // either. Refusing is the only honest answer.
-        return refuse(DeliveryStatus::Suppressed, "consent_not_verifiable");
-    }
 
     if is_expired(delivery.expires_at.as_deref(), now) {
         return refuse(DeliveryStatus::Suppressed, "campaign_expired");
@@ -226,6 +287,23 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
     let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
     };
+
+    let recipient_hex = recipient.to_hex();
+    let allowed = &state.settings.service.allowed_pubkeys;
+    if !allowed.is_empty() && !allowed.iter().any(|pubkey| pubkey == &recipient_hex) {
+        return refuse(DeliveryStatus::Suppressed, "recipient_not_allowed");
+    }
+
+    if !settings.allow_unverified_consent {
+        match preferences::campaign_consent_enabled(&state.redis_pool, &recipient_hex).await {
+            Ok(true) => {}
+            Ok(false) => return refuse(DeliveryStatus::Suppressed, "campaign_consent_disabled"),
+            Err(e) => {
+                error!(error = %e, key = %delivery.idempotency_key, "Failed to load campaign consent");
+                return refuse(DeliveryStatus::RetryableFailure, "consent_lookup_failed");
+            }
+        }
+    }
 
     // Final idempotency lives here, not in the campaign tool. A lease can
     // expire after we accepted a message but before the result was reported,
@@ -255,18 +333,63 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
         }
     }
 
-    let tokens = match redis_store::get_tokens_for_pubkey(&state.redis_pool, &recipient).await {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            error!(error = %e, key = %delivery.idempotency_key, "Failed to load device tokens");
-            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
-            return refuse(DeliveryStatus::RetryableFailure, "token_lookup_failed");
+    let registered_tokens =
+        match redis_store::get_tokens_with_timezone_offsets(&state.redis_pool, &recipient).await {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                error!(error = %e, key = %delivery.idempotency_key, "Failed to load device tokens");
+                release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+                return refuse(DeliveryStatus::RetryableFailure, "token_lookup_failed");
+            }
+        };
+
+    if registered_tokens.is_empty() {
+        release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+        return refuse(DeliveryStatus::PermanentFailure, "no_device");
+    }
+
+    let mut tokens = Vec::new();
+    let mut earliest_retry_after: Option<String> = None;
+    let mut timezone_unknown = false;
+    for (token, offset) in registered_tokens {
+        if settings.allow_unverified_consent {
+            tokens.push(token);
+            continue;
         }
-    };
+        let Some(offset) = offset else {
+            timezone_unknown = true;
+            continue;
+        };
+        if let Some(retry_after) = quiet_hours_retry_after(offset, now) {
+            if earliest_retry_after
+                .as_ref()
+                .is_none_or(|current| retry_after < *current)
+            {
+                earliest_retry_after = Some(retry_after);
+            }
+        } else {
+            tokens.push(token);
+        }
+    }
 
     if tokens.is_empty() {
         release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
-        return refuse(DeliveryStatus::PermanentFailure, "no_device");
+        if let Some(retry_after) = earliest_retry_after {
+            return DeliveryResult {
+                idempotency_key: delivery.idempotency_key.clone(),
+                status: DeliveryStatus::Deferred,
+                reason: Some("recipient_quiet_hours".to_string()),
+                retry_after: Some(retry_after),
+            };
+        }
+        return refuse(
+            DeliveryStatus::Suppressed,
+            if timezone_unknown {
+                "recipient_timezone_unknown"
+            } else {
+                "no_device"
+            },
+        );
     }
 
     let payload = campaign_payload(delivery, &recipient);
@@ -352,6 +475,7 @@ async fn deliver(state: &AppState, delivery: &PendingDelivery, now: i64) -> Deli
             idempotency_key: delivery.idempotency_key.clone(),
             status: DeliveryStatus::Delivered,
             reason: None,
+            retry_after: None,
         }
     } else if retryable {
         release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
@@ -389,7 +513,8 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         )));
     }
 
-    let pending: PendingResponse = response.json().await.map_err(|e| {
+    let response_body = bounded_response_body(response, MAX_PENDING_RESPONSE_BYTES).await?;
+    let pending: PendingResponse = serde_json::from_slice(&response_body).map_err(|e| {
         crate::error::ServiceError::Internal(format!("Pending delivery decode failed: {e}"))
     })?;
 
@@ -448,16 +573,13 @@ pub async fn run_campaign_delivery_service(
         error!("Campaign delivery is enabled but not configured. Not polling.");
         return Ok(());
     }
-    if !settings.allow_unverified_consent {
-        warn!(
-            "Campaign delivery is polling, but consent and quiet hours cannot be verified, so \
-             every delivery will be suppressed. This is deliberate until preferences carry a \
-             marketing category and registrations carry a timezone."
-        );
+    if let Err(e) = validate_api_base_url(&settings.api_base_url) {
+        error!(error = %e, "Campaign delivery API URL is unsafe. Not polling.");
+        return Ok(());
     }
-
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| crate::error::ServiceError::Internal(format!("HTTP client: {e}")))?;
 
@@ -736,6 +858,57 @@ mod tests {
     }
 
     #[test]
+    fn test_minute_precision_expiry_matches_engagement_schema() {
+        let expiry = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:30:00Z")
+            .unwrap()
+            .timestamp();
+        assert!(is_expired(Some("2026-01-01T12:30Z"), expiry));
+        assert!(!is_expired(Some("2026-01-01T12:30Z"), expiry - 1));
+    }
+
+    #[test]
+    fn test_campaign_api_requires_a_plain_https_origin() {
+        assert!(validate_api_base_url("https://engagement.admin.divine.video").is_ok());
+        for unsafe_url in [
+            "http://engagement.admin.divine.video",
+            "https://user:secret@engagement.admin.divine.video",
+            "https://engagement.admin.divine.video/path",
+            "https://engagement.admin.divine.video?redirect=elsewhere",
+        ] {
+            assert!(
+                validate_api_base_url(unsafe_url).is_err(),
+                "{unsafe_url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quiet_hours_use_recipient_local_offset() {
+        let noon_utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(quiet_hours_retry_after(0, noon_utc), None);
+
+        let retry = quiet_hours_retry_after(600, noon_utc).expect("22:00 local is quiet");
+        assert_eq!(retry, "2026-01-01T21:00:00+00:00");
+
+        let retry = quiet_hours_retry_after(-480, noon_utc).expect("04:00 local is quiet");
+        assert_eq!(retry, "2026-01-01T15:00:00+00:00");
+    }
+
+    #[test]
+    fn test_quiet_hours_boundaries_are_fail_closed() {
+        let at_seven = chrono::DateTime::parse_from_rfc3339("2026-01-01T07:00:00Z")
+            .unwrap()
+            .timestamp();
+        let at_twenty_one = chrono::DateTime::parse_from_rfc3339("2026-01-01T21:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(quiet_hours_retry_after(0, at_seven), None);
+        assert!(quiet_hours_retry_after(0, at_twenty_one).is_some());
+    }
+
+    #[test]
     fn test_payload_is_data_only_and_carries_every_delivery_value() {
         // Whole-map equality, not spot checks, and not a search of the encoded
         // form for the substring "token" — real FCM registration tokens do not
@@ -860,6 +1033,7 @@ mod tests {
         // Every variant needs pinning, not just the one this test used to cover.
         for (status, wire) in [
             (DeliveryStatus::Delivered, "delivered"),
+            (DeliveryStatus::Deferred, "deferred"),
             (DeliveryStatus::Suppressed, "suppressed"),
             (DeliveryStatus::PermanentFailure, "permanent_failure"),
             (DeliveryStatus::RetryableFailure, "retryable_failure"),
@@ -868,6 +1042,7 @@ mod tests {
                 idempotency_key: "k".to_string(),
                 status,
                 reason: None,
+                retry_after: None,
             })
             .unwrap();
             assert!(
@@ -888,6 +1063,7 @@ mod tests {
                 idempotency_key: "rev-1:abc".to_string(),
                 status: DeliveryStatus::RetryableFailure,
                 reason: Some("provider_error".to_string()),
+                retry_after: None,
             }],
         })
         .unwrap();

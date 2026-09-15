@@ -117,10 +117,53 @@ impl NotificationType {
 
 /// Redis key prefix for user preferences
 const PREFERENCES_KEY_PREFIX: &str = "user_preferences:";
+const CAMPAIGN_CONSENT_KEY_PREFIX: &str = "campaign_consent:";
 
 /// Build the Redis key for a user's preferences
 pub fn build_preferences_key(pubkey: &str) -> String {
     format!("{}{}", PREFERENCES_KEY_PREFIX, pubkey)
+}
+
+fn build_campaign_consent_key(pubkey: &str) -> String {
+    format!("{}{}", CAMPAIGN_CONSENT_KEY_PREFIX, pubkey)
+}
+
+/// Returns true only for an explicit campaign opt-in.
+pub async fn campaign_consent_enabled(pool: &RedisPool, pubkey: &str) -> Result<bool> {
+    use redis::AsyncCommands;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let value: Option<bool> = conn
+        .get(build_campaign_consent_key(pubkey))
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(value.unwrap_or(false))
+}
+
+/// Stores notification kinds and campaign consent as one atomic preference update.
+pub async fn set_user_preferences_with_campaign_consent(
+    pool: &RedisPool,
+    pubkey: &str,
+    prefs: &UserPreferences,
+    campaigns_enabled: bool,
+) -> Result<()> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+    let json = serde_json::to_string(prefs)
+        .map_err(|e| ServiceError::Internal(format!("Failed to serialize preferences: {}", e)))?;
+
+    redis::pipe()
+        .atomic()
+        .set(build_preferences_key(pubkey), json)
+        .set(build_campaign_consent_key(pubkey), campaigns_enabled)
+        .query_async::<()>(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)
 }
 
 /// Get user preferences from Redis, returning defaults if not set

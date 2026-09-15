@@ -80,8 +80,10 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 ### Redis Keys
 - `user_tokens:{pubkey}` - Set of FCM tokens registered for a pubkey
 - `token_to_pubkey` - Hash mapping a token back to its owner
+- `token_timezone_offsets` - Hash mapping a token to the UTC offset minutes captured at registration
 - `stale_tokens` - Sorted set scored by the last time a token was known good, for cleanup. Written at registration and again on every delivered push, so the sweep means "inactive" rather than "registered long ago". The refresh uses `ZADD XX GT`: `XX` so a token deregistered mid-send is not resurrected as an owner-less member, `GT` so a replica's clock cannot pull a live token toward the sweep
 - `user_preferences:{pubkey}` - User's notification preferences (JSON)
+- `campaign_consent:{pubkey}` - Explicit campaign opt-in from kind 3083; missing means false
 - `dedup:{event_id}` - Per-event processing claim for control events
 - `dedup:{event_id}:{recipient}` - Per-recipient content-delivery claim. Retryable failures release it; successful or ambiguous sends retain it
 - `dedup:{kind}:{type}:{owner}:{d-tag}:{recipient}` - Per-recipient video delivery, so a NIP-33 edit does not re-notify. Scoped by notification type so a bell does not suppress a later mention on the same video. The scoping is one-directional: a delivered mention also writes the `newPost` record, because naming the video already tells the recipient it exists
