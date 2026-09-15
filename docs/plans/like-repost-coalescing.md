@@ -426,7 +426,11 @@ New `service` settings, each rejected at zero:
   by `coalesce_group_ttl_secs`; a recipient who stays at `recipient_daily_cap`
   for the group's whole 24-hour lifetime reaches it. At the shipped defaults the
   window and the lifetime are both 24 h, so this is the expected outcome for a
-  recipient who is continuously at the cap, not an edge case. Loud and counted
+  recipient who is continuously at the cap, not an edge case. A group whose own
+  burst filled the window loses its summary at the first flush instead of after
+  the lifetime: its own immediate emission is the oldest member, so the slide
+  lands exactly at the group's `expires_at` and `complete_group` drops the group
+  rather than requeueing a retry that would already be past it. Loud and counted
   under `push_coalesce_skipped_total{reason="expired_throttled"}`, which keeps
   the `expired` counter for backlog losses; the deferral itself is not a drop.
 - **Redis footprint grows per interaction.** Every immediate like/repost also
