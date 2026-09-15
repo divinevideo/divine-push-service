@@ -83,13 +83,12 @@ server:
 
 campaign_delivery:
   enabled: false  # Off until the Access service token is configured
-  api_base_url: "https://engagement.admin.divine.video"
+  api_base_url: ""  # Never point local development at the production queue
   access_client_id: ""      # CF-Access-Client-Id, from GCP secret divine-engagement-delivery-token-id
   access_client_secret: ""  # CF-Access-Client-Secret, from GCP secret divine-engagement-delivery-token-secret
   poll_interval_secs: 30
   batch_size: 100
   dedup_ttl_secs: 604800  # 7 days
-  # Refuse to send until marketing consent and recipient-local quiet hours can
-  # actually be evaluated here. Setting this true asserts the audience is staff
-  # who opted in out of band.
+  # Staff-only bridge for an internal-test audience that opted in out of band.
+  # Normal delivery verifies kind 3083 consent and registration timezone.
   allow_unverified_consent: false

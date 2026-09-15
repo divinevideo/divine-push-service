@@ -291,10 +291,15 @@ their atomic replacement script and take no claim.
 Users can optionally send a Kind 3083 event to control which notification types they receive. The decrypted content is:
 
 ```json
-{ "kinds": [1, 7, 16] }
+{ "kinds": [1, 7, 16], "campaignsEnabled": false }
 ```
 
 These values are notification preference categories, not necessarily trigger event kinds. Category `1` controls comments and mentions triggered by supported kinds such as 1111, 30023, and 34236; it does not enable kind-1 text-note pushes. If no preferences are set, the service uses `[1, 7, 16, 30023, 34236]`. Kind 3 contact lists are not notification triggers in this service.
+
+`campaignsEnabled` is separate from the event-kind categories and defaults
+false when absent. Campaign delivery also requires the device UTC offset sent
+in its encrypted kind-3079 registration and defers during 21:00–06:59 local
+time.
 
 ## New-post subscriptions ("bells")
 

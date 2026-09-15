@@ -131,7 +131,7 @@ These files set the relay (`wss://relay.divine.video`), profile relays, notifica
 
 Optional. When enabled, the service polls the campaign tool's internal delivery API for approved campaign notifications and delivers them over the existing FCM path, reporting each outcome back.
 
-It is off by default, and even when enabled it does not poll unless `api_base_url` and both Access credentials are set. Even when running, it delivers nothing until `allow_unverified_consent` is `true` — this service cannot yet evaluate marketing consent or recipient-local quiet hours, so every delivery is suppressed as `consent_not_verifiable` until an operator asserts the audience opted in out of band.
+It is off by default, and even when enabled it does not poll unless a safe HTTPS `api_base_url` and both Access credentials are set. Normal delivery requires an explicit `campaignsEnabled` kind-3083 preference and a valid device UTC offset from kind 3079, and enforces 21:00–06:59 recipient-local quiet hours. `allow_unverified_consent` is retained only as an explicit staff/internal-test bridge.
 
 ### Environment variables
 
@@ -145,10 +145,10 @@ Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nes
 | `NOSTR_PUSH__NOSTR__EVENT_SILENCE_TIMEOUT_SECS` | No | Quiet period before the listener resubscribes, and the window after any resubscribe before it fails health (default `300`) |
 | `NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN` | No | Shared bearer token that enables authenticated internal push requests |
 | `NOSTR_PUSH__CAMPAIGN_DELIVERY__ENABLED` | No | Turns campaign delivery collection on (default `false`) |
-| `NOSTR_PUSH__CAMPAIGN_DELIVERY__API_BASE_URL` | No | Base URL of the campaign tool's delivery API. Must be `https`. |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__API_BASE_URL` | No | Base URL of the campaign tool's delivery API. Must be a credential-free HTTPS origin: no path, query, userinfo, or fragment. |
 | `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_ID` | No | Cloudflare Access service token client id |
 | `NOSTR_PUSH__CAMPAIGN_DELIVERY__ACCESS_CLIENT_SECRET` | No | Cloudflare Access service token secret |
-| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ALLOW_UNVERIFIED_CONSENT` | No | Must be `true` before any campaign is delivered (default `false`) |
+| `NOSTR_PUSH__CAMPAIGN_DELIVERY__ALLOW_UNVERIFIED_CONSENT` | No | Staff/internal-test bridge that bypasses the kind-3083 consent and timezone checks (default `false`). Normal delivery requires an explicit `campaignsEnabled` opt-in and a valid device UTC offset. |
 | `APP_ENV` | No | Selects the config file (default `development`) |
 | `RUST_LOG` | No | Log level (default `info`) |
 

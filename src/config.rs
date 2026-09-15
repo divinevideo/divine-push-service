@@ -61,14 +61,9 @@ pub struct CampaignDeliverySettings {
     /// lease cannot produce a second push.
     #[serde(default = "default_campaign_dedup_ttl")]
     pub dedup_ttl_secs: u64,
-    /// This service cannot yet evaluate marketing consent or recipient-local
-    /// quiet hours: notification preferences are a list of Nostr event kinds
-    /// and a campaign has no triggering kind, and no timezone is stored.
-    ///
-    /// Until that exists, refuse to send rather than assume consent. Setting
-    /// this true is an operator asserting the audience is staff who opted in
-    /// out of band. divine-engagement gates the same thing independently; both
-    /// sides fail closed on purpose.
+    /// Staff-only bridge that bypasses in-band campaign consent and timezone
+    /// checks. Keep false for normal delivery; divine-engagement independently
+    /// restricts this bridge to its internal-test segment.
     #[serde(default)]
     pub allow_unverified_consent: bool,
 }

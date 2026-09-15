@@ -45,14 +45,14 @@ NIP-40 relay interoperability, but this service does not interpret it.
     ["app", "<app-id>"],
     ["expiration", "<unix-seconds>"]
   ],
-  "content": nip44_encrypt({"token": "<platform-token>"}),
+  "content": nip44_encrypt({"token": "<platform-token>", "timezoneOffsetMinutes": -300}),
   "sig": "<signature>"
 }
 ```
 
 The content field contains the NIP-44 encrypted token payload. Example plaintext structure:
 ```json
-{ "token": "<platform-token>" }
+{ "token": "<platform-token>", "timezoneOffsetMinutes": -300 }
 ```
 
 **Note:** The exact payload structure is implementation-specific. Services define their own required fields.
@@ -61,6 +61,8 @@ The content field contains the NIP-44 encrypted token payload. Example plaintext
 - `p` and `app` MUST be present. `expiration` MAY be present.
 - `content` MUST be NIP-44 ciphertext; services MUST reject plaintext.
 - This service does not use `expiration` to accept, reject, or remove a token.
+- `timezoneOffsetMinutes` is optional for social pushes, but campaign delivery
+  suppresses devices that did not provide a valid offset from UTC.
 
 ### Deregistration (kind 3080)
 
@@ -109,17 +111,21 @@ Preferences are keyed by the user's pubkey and persist when individual device to
     ["p", "<push-service-pubkey>"],
     ["app", "<app-id>"]
   ],
-  "content": nip44_encrypt({"kinds": [1, 3, 7, 16]}),
+  "content": nip44_encrypt({"kinds": [1, 3, 7, 16], "campaignsEnabled": false}),
   "sig": "<signature>"
 }
 ```
 
 The decrypted content is a JSON object with a `kinds` array listing service-defined notification categories. Category values do not have to match trigger event kinds. In this service, category `1` controls Comment and Mention notifications triggered by supported kinds such as 1111, 30023, and 34236; the service does not subscribe to kind-1 text notes.
 ```json
-{ "kinds": [1, 3, 7, 16] }
+{ "kinds": [1, 3, 7, 16], "campaignsEnabled": false }
 ```
 
 An empty `kinds` array disables all notifications. Services SHOULD define sensible defaults for users who have not sent a preferences event.
+
+`campaignsEnabled` is an independent, explicit opt-in for engagement campaign
+pushes. Missing values read as `false`; the event-kind list never implies
+campaign consent.
 
 ### Author subscriptions (kind 30000)
 
