@@ -245,6 +245,13 @@ pub async fn consume_recipient_token(
         -- The rolling window slides on every read: a recipient at the cap is
         -- refused until the oldest emission ages out.
         redis.call('ZREMRANGEBYSCORE', ekey, '-inf', now - window)
+        -- A recovered lease may retry after reserving this logical emission but
+        -- before delivery or completion. Reuse that reservation: blocking it on
+        -- its own cap entry can defer unsent work until logical expiry, while
+        -- spending again leaks another bucket token.
+        if redis.call('ZSCORE', ekey, member) ~= false then
+          return {1, 0}
+        end
         if redis.call('ZCARD', ekey) >= daily_cap then
           local oldest = redis.call('ZRANGE', ekey, 0, 0, 'WITHSCORES')
           local wait = window
@@ -2763,6 +2770,45 @@ mod tests {
             emitted, 1,
             "a re-spend of the same emission must not inflate the rolling count"
         );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_group_reuses_its_reservation_at_the_daily_cap() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.recipient_throttle_capacity = 2;
+        settings.recipient_throttle_refill_secs = 3600;
+        settings.recipient_daily_cap = 1;
+        settings.recipient_daily_window_secs = 3600;
+        let owner = Keys::generate().public_key();
+        let group_id = format!("like:{}:e:{}:0", owner.to_hex(), Uuid::new_v4());
+
+        assert_eq!(
+            consume_recipient_token(&pool, &owner.to_hex(), &group_id, &settings)
+                .await
+                .unwrap(),
+            SpendOutcome::Spent
+        );
+        assert_eq!(
+            consume_recipient_token(&pool, &owner.to_hex(), &group_id, &settings)
+                .await
+                .unwrap(),
+            SpendOutcome::Spent,
+            "lease recovery must not be blocked by the group's own reservation"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        let tokens: f64 = redis::cmd("HGET")
+            .arg(format!("{THROTTLE_PREFIX}{}", owner.to_hex()))
+            .arg("tokens")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(tokens, 1.0, "recovery must not spend a second token");
     }
 
     struct RetryableFcmSender {
