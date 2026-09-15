@@ -218,7 +218,7 @@ GET /health
 {
   "status": "ok",
   "pubkey": "abc123...",
-  "tasks": { "nostr_listener": true, "event_handler": true, "new_post_fanout": true }
+  "tasks": { "nostr_listener": true, "event_handler": true, "new_post_fanout": true, "coalesce_flush": true }
 }
 ```
 
@@ -227,10 +227,51 @@ Clients use this pubkey to:
 - Encrypt the NIP-44 content to the service's key
 
 The same endpoint is both Kubernetes probes. It returns `503` with
-`"status": "degraded"` when the Nostr listener, event handler, or durable
-new-post fan-out worker has died,
+`"status": "degraded"` when the Nostr listener, event handler, durable
+new-post fan-out worker, or coalescing flush worker has died,
 so a pod that can no longer deliver is restarted instead of staying in service.
 The `pubkey` field is present either way.
+
+## Like and Repost coalescing
+
+One popular post must not buzz its author once per like. Kinds 7 (Like) and 16
+(Repost) are coalesced per `(recipient, type, target)` inside fixed
+`coalesce_window_secs` buckets (two hours by default):
+
+- The first `coalesce_immediate_limit` interactions in a bucket send
+  immediately, with today's copy.
+- The rest collect in a bucket group and flush at the bucket deadline as one
+  summary: "alice and 12 others liked your post". The count is the distinct
+  actor count from a HyperLogLog; the named actor is the first buffered one,
+  resolved at flush time.
+- A per-recipient token bucket (capacity `recipient_throttle_capacity`,
+  refilling one token per `recipient_throttle_refill_secs`) demotes a
+  would-be-immediate push into the bucket instead of dropping it.
+- A rolling emission window holds each recipient to `recipient_daily_cap`
+  emitted like/repost notifications (immediates and summaries) per
+  `recipient_daily_window_secs`. At the cap, immediate pushes buffer and
+  summary flushes defer until the oldest emission ages out.
+- Immediate and summary pushes for one group share an FCM collapse key derived
+  from the group id: `android.collapse_key` for Android (which stays data-only)
+  and the `apns-collapse-id` header for iOS. On iOS the summary replaces the
+  earlier banner. On Android, FCM's collapse key only coalesces messages queued
+  while the device is offline; the app renders the banners itself and does not
+  key them on the collapse key yet, so a burst still shows the immediate
+  banners plus the summary until the client uses it.
+
+Comments, mentions, and new-post ("bell") notifications are deliberately not
+coalesced: they have no reliably retrievable durable inbox row, so collapsing
+one can lose it permanently. Events with neither an event reference nor an
+addressable coordinate are not coalesced either, because a summary must not mix
+posts in one count.
+
+Ingest runs as one atomic Lua script that records a per-event disposition
+(`i:{group}` or `b:{group}`), so a replay reproduces the original decision and
+collapse id without double-counting. Bucket ids and deadlines come from the
+Redis server clock. A leased outbox worker in every replica flushes claimed
+groups, revalidating the allowlist, tokens, and preferences first. The full
+design and its accepted losses live in
+[`docs/plans/like-repost-coalescing.md`](plans/like-repost-coalescing.md).
 
 ## Deduplication
 
@@ -475,3 +516,10 @@ The canonical registration and removal rules live in the push specification's
 | `notify_subs_ts:{subscriber}` | String | `created_at:event_id` of the last applied notify list. Guards against out-of-order relay delivery of a replaceable event, and carries the id so a `created_at` tie resolves by NIP-01's lowest-id rule. Exact-id replays apply idempotently for repair. A bare integer written by an earlier build is read as a timestamp with no known id, which only makes the guard more conservative. |
 | `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path walks this set with paged `SSCAN` reads. |
 | `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |
+| `coalesce:g:{type}:{owner}:{target}:{bucket}` | Hash | One bucket's like/repost group: deadline, pending and immediate counts, first buffered actor/event, latest timestamp, routing reference fields, and the current flush lease token. TTL `coalesce_window_secs + coalesce_logical_expiry_grace_secs` |
+| `coalesce:hll:{type}:{owner}:{target}:{bucket}` | HyperLogLog | Distinct buffered actors for the group. Same TTL as the group |
+| `coalesce:disp:{event_id}:{recipient}` | String | Per-event ingest disposition, `i:{group}` (immediate) or `b:{group}` (buffered), so a replay reproduces the original decision and collapse id. Same TTL as the group |
+| `coalesce:due` | Sorted Set | Bucket groups due for flush, scored by deadline. `{target}` is `e:{event-id}` or `a:{kind:pubkey:d-tag}` |
+| `coalesce:leases` | Sorted Set | Groups owned by an in-flight flush, scored by lease expiry. Reconciliation returns expired leases with pending work to `coalesce:due`, never re-adding a group with nothing pending |
+| `coalesce:throttle:{owner}` | Hash | Per-recipient immediate-push token bucket (`tokens`, `ts`) |
+| `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: one member per emitted like/repost notification scored by send time, pruned to `recipient_daily_window_secs` and counted against `recipient_daily_cap` before the bucket is spent |

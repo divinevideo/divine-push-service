@@ -2,6 +2,7 @@
 
 // Declare modules as public to be accessible from the binary crate and integration tests
 pub mod cleanup_service;
+pub mod coalesce;
 pub mod config;
 pub mod crypto;
 pub mod error;

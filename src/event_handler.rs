@@ -7,6 +7,7 @@
 //!   and new posts
 
 use crate::{
+    coalesce,
     crypto::CryptoService,
     error::Result,
     fcm_sender,
@@ -1817,6 +1818,73 @@ async fn send_notification_trigger_to_user(
         return Ok(());
     };
 
+    // Like and repost pushes coalesce per (recipient, type, target, bucket).
+    // Buffered events are recorded here and summarized later by the flush
+    // worker; immediate events continue down the normal path carrying a
+    // collapse key so the summary can replace their banner.
+    let mut collapse_key = None;
+    if matches!(
+        delivery_type,
+        NotificationType::Like | NotificationType::Repost
+    ) {
+        if let Some(event) = trigger.nostr_event() {
+            if let Some(target) = coalesce_target(event) {
+                let event_id_hex = event.id.to_hex();
+                let actor_hex = event.pubkey.to_hex();
+                let decision = coalesce::ingest(
+                    &state.redis_pool,
+                    &state.settings.service,
+                    target_pubkey,
+                    &coalesce::Ingest {
+                        event_id: &event_id_hex,
+                        event_kind: event.kind.as_u16(),
+                        actor: &actor_hex,
+                        created_at: event.created_at.as_secs(),
+                        notification_type: delivery_type,
+                        target: &target,
+                    },
+                )
+                .await;
+
+                match decision {
+                    Ok(coalesce::CoalesceDecision::Immediate {
+                        collapse_key: key, ..
+                    }) => {
+                        collapse_key = Some(key);
+                    }
+                    Ok(coalesce::CoalesceDecision::Buffered { group_id }) => {
+                        debug!(
+                            event_id = %event_id,
+                            target_pubkey = %target_pubkey,
+                            group_id = %group_id,
+                            "Buffered like/repost into a coalescing group"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // The disposition script is atomic, so an error means no
+                        // decision was recorded. Release the claim so a relay
+                        // redelivery can retry instead of being blocked by it.
+                        if let Err(release_error) = redis_store::release_recipient_event_claim(
+                            &state.redis_pool,
+                            &recipient_claim,
+                        )
+                        .await
+                        {
+                            error!(
+                                event_id = %event_id,
+                                target_pubkey = %target_pubkey,
+                                error = %release_error,
+                                "Failed to release recipient claim after a coalescing ingest error"
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     info!(
         event_id = %event_id,
         target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
@@ -1843,7 +1911,13 @@ async fn send_notification_trigger_to_user(
 
     // Create FCM payload
     let payload = match trigger.nostr_event() {
-        Some(event) => create_fcm_payload(event, target_pubkey, delivery_type, copy),
+        Some(event) => create_fcm_payload(
+            event,
+            target_pubkey,
+            delivery_type,
+            copy,
+            collapse_key.as_deref(),
+        ),
         None => create_direct_message_payload(event_id, target_pubkey),
     };
 
@@ -2068,6 +2142,7 @@ fn create_fcm_payload(
     target_pubkey: &PublicKey,
     notification_type: NotificationType,
     copy: &EventScopedCopy,
+    collapse_key: Option<&str>,
 ) -> FcmPayload {
     let mut data = std::collections::HashMap::new();
 
@@ -2154,6 +2229,7 @@ fn create_fcm_payload(
         android: None,
         webpush: None,
         apns: None,
+        collapse_key: collapse_key.map(str::to_string),
     }
 }
 
@@ -2182,6 +2258,7 @@ fn create_direct_message_payload(event_id: EventId, target_pubkey: &PublicKey) -
         android: None,
         webpush: None,
         apns: None,
+        collapse_key: None,
     }
 }
 
@@ -2269,12 +2346,16 @@ fn referenced_event_id(event: &Event) -> Option<String> {
 /// pubkey and d-tag). A d-tag may itself contain `:`, so only the first two
 /// separators are split.
 fn referenced_coordinate(event: &Event) -> Option<ReferencedCoordinate> {
-    let address = event
+    event
         .tags
         .find(TagKind::single_letter(Alphabet::A, true))
         .or_else(|| event.tags.find(TagKind::a()))
-        .and_then(|tag| tag.content())?;
+        .and_then(|tag| tag.content())
+        .and_then(parse_coordinate)
+}
 
+/// Parse one `kind:pubkey:d-tag` coordinate string.
+fn parse_coordinate(address: &str) -> Option<ReferencedCoordinate> {
     let mut parts = address.splitn(3, ':');
     let kind = parts.next()?;
     let author_pubkey = parts.next()?;
@@ -2289,6 +2370,61 @@ fn referenced_coordinate(event: &Event) -> Option<ReferencedCoordinate> {
         kind: kind.to_string(),
         author_pubkey: author_pubkey.to_string(),
         d_tag: d_tag.to_string(),
+    })
+}
+
+/// The coalescing target for a like/repost trigger, when it has one.
+///
+/// A summary groups interactions by the post they point at, so an event with
+/// neither an event reference nor an addressable coordinate cannot be
+/// coalesced without mixing posts in one count. Those events keep the
+/// immediate path.
+///
+/// Grouping uses the *directly acted-upon* object. For `e` references that is
+/// the **last** lowercase `e` tag: NIP-25 puts the reacted event last when a
+/// reaction copies the root and reply tags. Uppercase `A`/`E` root-scope
+/// references are only a fallback, so a reaction carrying its target's root
+/// coordinate does not group with every other reaction under that root. The
+/// payload reference fields keep the root-aware values the immediate payload
+/// uses, so routing is unchanged.
+fn coalesce_target(event: &Event) -> Option<coalesce::CoalesceTarget> {
+    let event_id = referenced_event_id(event);
+    let address = referenced_coordinate(event).map(|coordinate| coalesce::TargetAddress {
+        address: coordinate.address,
+        kind: coordinate.kind,
+        author_pubkey: coordinate.author_pubkey,
+        d_tag: coordinate.d_tag,
+    });
+
+    let direct_event = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == TagKind::e())
+        .filter_map(|tag| tag.content())
+        .last()
+        .map(str::to_string);
+    let direct_address = event
+        .tags
+        .find(TagKind::a())
+        .and_then(|tag| tag.content())
+        .and_then(parse_coordinate);
+
+    let key = if let Some(direct_address) = &direct_address {
+        format!("a:{}", direct_address.address)
+    } else if let Some(direct_event) = &direct_event {
+        format!("e:{direct_event}")
+    } else if let Some(address) = &address {
+        format!("a:{}", address.address)
+    } else if let Some(event_id) = &event_id {
+        format!("e:{event_id}")
+    } else {
+        return None;
+    };
+
+    Some(coalesce::CoalesceTarget {
+        key,
+        event_id,
+        address,
     })
 }
 
@@ -3114,7 +3250,8 @@ mod tests {
             formatted_content: None,
         };
 
-        let payload = create_fcm_payload(&event, &recipient, NotificationType::NewPost, &copy);
+        let payload =
+            create_fcm_payload(&event, &recipient, NotificationType::NewPost, &copy, None);
         let data = payload.data.expect("data-only payload");
 
         // The name resolved once for the event reaches the per-recipient push.
@@ -3140,8 +3277,13 @@ mod tests {
             formatted_content: Some(encrypted_content.to_string()),
         };
 
-        let payload =
-            create_fcm_payload(&event, &recipient, NotificationType::DirectMessage, &copy);
+        let payload = create_fcm_payload(
+            &event,
+            &recipient,
+            NotificationType::DirectMessage,
+            &copy,
+            None,
+        );
         let data = payload.data.expect("data-only payload");
 
         assert_eq!(data.get("type"), Some(&"directMessage".to_string()));
@@ -3370,7 +3512,8 @@ mod tests {
             formatted_content: Some("hey @bob".to_string()),
         };
 
-        let payload = create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy);
+        let payload =
+            create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy, None);
         let data = payload.data.expect("data-only payload");
 
         assert_eq!(data.get("body"), Some(&"Alice: hey @bob".to_string()));
@@ -3391,7 +3534,8 @@ mod tests {
             formatted_content: None,
         };
 
-        let payload = create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy);
+        let payload =
+            create_fcm_payload(&event, &recipient, NotificationType::Mention, &copy, None);
         let data = payload.data.expect("data-only payload");
 
         assert_eq!(
@@ -5323,5 +5467,244 @@ mod tests {
 
         assert_eq!(data.get("referencedAddress"), Some(&address));
         assert_eq!(data.get("referencedDTag"), Some(&"weird:d:tag".to_string()));
+    }
+
+    #[test]
+    fn coalesce_target_groups_by_the_direct_reference() {
+        let actor = Keys::generate();
+        let comment_id = "c".repeat(64);
+        let comment_coordinate = format!("1111:{}:comment-1", "a".repeat(64));
+        let root_coordinate = format!("34236:{}:video-1", "b".repeat(64));
+
+        // A reaction that carries both the direct references and a NIP-22 root
+        // `A` tag: grouping must follow the comment, not the root video.
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["e", comment_id.as_str()]).unwrap())
+            .tag(Tag::parse(["a", comment_coordinate.as_str()]).unwrap())
+            .tag(Tag::parse(["A", root_coordinate.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let target = coalesce_target(&event).expect("direct references exist");
+        assert_eq!(target.key, format!("a:{comment_coordinate}"));
+        assert_eq!(target.event_id.as_deref(), Some(comment_id.as_str()));
+        assert_eq!(
+            target.address.as_ref().map(|a| a.address.as_str()),
+            Some(root_coordinate.as_str()),
+            "the payload keeps the root-aware coordinate the immediate push uses"
+        );
+    }
+
+    #[test]
+    fn coalesce_target_uses_the_last_direct_event_reference() {
+        let actor = Keys::generate();
+        let root_id = "d".repeat(64);
+        let reacted_id = "e".repeat(64);
+
+        // NIP-25: when a reaction carries both the root and the reacted event,
+        // the reacted event is the last `e` tag. Grouping must follow it; the
+        // payload's routing field keeps its pre-existing first-`e` value.
+        let event = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["e", root_id.as_str()]).unwrap())
+            .tag(Tag::parse(["e", reacted_id.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+
+        let target = coalesce_target(&event).expect("references exist");
+        assert_eq!(target.key, format!("e:{reacted_id}"));
+        assert_eq!(
+            target.event_id.as_deref(),
+            Some(root_id.as_str()),
+            "payload routing keeps the pre-existing first-e behavior"
+        );
+    }
+
+    #[test]
+    fn coalesce_target_falls_back_to_the_root_and_accepts_none() {
+        let actor = Keys::generate();
+        let root_coordinate = format!("34236:{}:video-1", "b".repeat(64));
+
+        let root_only = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::parse(["A", root_coordinate.as_str()]).unwrap())
+            .sign_with_keys(&actor)
+            .unwrap();
+        let target = coalesce_target(&root_only).expect("a root reference is still a target");
+        assert_eq!(target.key, format!("a:{root_coordinate}"));
+
+        let bare = EventBuilder::new(Kind::Reaction, "+")
+            .sign_with_keys(&actor)
+            .unwrap();
+        assert!(coalesce_target(&bare).is_none());
+    }
+
+    /// End to end for the coalescing contract: two immediate pushes, then a
+    /// summary sharing their collapse key. iOS replaces the earlier banner from
+    /// that key; Android banner replacement depends on the client (see the
+    /// plan's accepted losses), so this asserts the wire contract only.
+    #[tokio::test]
+    async fn like_bursts_coalesce_after_the_immediate_limit() {
+        let _guard = crate::coalesce::test_lock().lock().await;
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        {
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("DEL")
+                .arg(crate::coalesce::DUE_KEY)
+                .arg(crate::coalesce::LEASES_KEY)
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.coalesce_immediate_limit = 2;
+        settings.service.recipient_throttle_capacity = 100;
+
+        let author = Keys::generate();
+        let owner = author.public_key();
+        let token = format!("coalesce-e2e-{}", owner.to_hex());
+        redis_store::add_or_update_token(&pool, &owner, &token)
+            .await
+            .unwrap();
+
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+
+        let post = EventBuilder::new(Kind::TextNote, "a post")
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let mut like_event_ids = Vec::new();
+        for _ in 0..4 {
+            let liker = Keys::generate();
+            let like = EventBuilder::new(Kind::Reaction, "+")
+                .tag(Tag::event(post.id))
+                .tag(Tag::public_key(owner))
+                .sign_with_keys(&liker)
+                .unwrap();
+            like_event_ids.push(like.id.to_hex());
+
+            send_notification_to_user(
+                &state,
+                &like,
+                &owner,
+                NotificationType::Like,
+                &test_copy(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let sent = mock.get_sent_messages();
+        assert_eq!(
+            sent.len(),
+            2,
+            "only the first two likes may send immediately"
+        );
+        let immediate_collapse_keys: Vec<_> = sent
+            .iter()
+            .filter_map(|(_, payload)| payload.collapse_key.clone())
+            .collect();
+        assert_eq!(
+            immediate_collapse_keys.len(),
+            2,
+            "immediate like pushes carry a collapse key"
+        );
+        assert_eq!(
+            immediate_collapse_keys[0], immediate_collapse_keys[1],
+            "immediate pushes in one bucket share the group's key"
+        );
+
+        // The two later likes buffered into one group.
+        let buffered_event_id = &like_event_ids[3];
+        let disp_key = format!("coalesce:disp:{buffered_event_id}:{}", owner.to_hex());
+        let stored = redis_store::get_cached_string(&pool, &disp_key)
+            .await
+            .unwrap()
+            .expect("the buffered event recorded a disposition");
+        let group_id = stored
+            .strip_prefix("b:")
+            .expect("the fourth like must buffer")
+            .to_string();
+
+        // Put the bucket deadline in the past, which is the state the flush
+        // worker finds after a bucket closes.
+        let now = Timestamp::now().as_secs();
+        {
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("HSET")
+                .arg(format!("coalesce:g:{group_id}"))
+                .arg("due")
+                .arg(now)
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+            redis::cmd("ZADD")
+                .arg(crate::coalesce::DUE_KEY)
+                .arg(now)
+                .arg(&group_id)
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        let claim = crate::coalesce::claim_due_group(&pool, 30)
+            .await
+            .unwrap()
+            .expect("the closed bucket is claimable");
+        assert_eq!(claim.group_id, group_id);
+        let outcome = crate::coalesce::flush_group(&state, &claim, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::coalesce::FlushOutcome::Sent {
+                delivered: 1,
+                failed: 0,
+                actor_count: 2,
+            }
+        );
+
+        let sent = mock.get_sent_messages();
+        assert_eq!(sent.len(), 3, "the summary is the third push");
+        let (_, summary) = &sent[2];
+        assert_eq!(
+            summary.collapse_key.as_deref(),
+            Some(immediate_collapse_keys[0].as_str()),
+            "the summary replaces the immediate banners for the same group"
+        );
+        let data = summary.data.as_ref().expect("data-only summary");
+        assert_eq!(data.get("type"), Some(&"like".to_string()));
+        assert!(
+            data.get("body")
+                .is_some_and(|body| body.contains("and 1 other liked your post")),
+            "summary body must carry the bucket's actor count: {data:?}"
+        );
+        assert_eq!(
+            data.get("referencedEventId"),
+            Some(&post.id.to_hex()),
+            "the summary routes to the acted-upon post"
+        );
+
+        // Cleanup so a rerun starts from a clean index.
+        {
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("DEL")
+                .arg(format!("coalesce:g:{group_id}"))
+                .arg(format!("coalesce:hll:{group_id}"))
+                .arg(&disp_key)
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+        redis_store::remove_token(&pool, &owner, &token)
+            .await
+            .unwrap();
     }
 }

@@ -99,6 +99,20 @@ impl NotificationType {
             NotificationType::NewPost => "newPost",
         }
     }
+
+    /// The inverse of [`Self::display_name`], for durable state that stores the
+    /// wire string rather than the enum.
+    pub fn from_display_name(name: &str) -> Option<Self> {
+        match name {
+            "like" => Some(NotificationType::Like),
+            "comment" => Some(NotificationType::Comment),
+            "mention" => Some(NotificationType::Mention),
+            "repost" => Some(NotificationType::Repost),
+            "directMessage" => Some(NotificationType::DirectMessage),
+            "newPost" => Some(NotificationType::NewPost),
+            _ => None,
+        }
+    }
 }
 
 /// Redis key prefix for user preferences

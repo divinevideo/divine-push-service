@@ -115,6 +115,65 @@ pub struct ServiceSettings {
     /// Accepts a comma-separated string (from env vars) or a YAML list.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
     pub allowed_pubkeys: Vec<String>,
+    /// Length of the like/repost coalescing bucket, in seconds.
+    ///
+    /// Bucket identifiers and deadlines are derived from the Redis server clock
+    /// inside the ingest script, so every replica agrees on where a bucket
+    /// starts and ends.
+    #[serde(default = "default_coalesce_window")]
+    pub coalesce_window_secs: u64,
+    /// How many like/repost pushes per bucket reach a recipient immediately.
+    /// The rest are summarized at the bucket deadline.
+    #[serde(default = "default_coalesce_immediate_limit")]
+    pub coalesce_immediate_limit: u64,
+    /// Lease held while one worker flushes a coalesced group.
+    #[serde(default = "default_coalesce_lease")]
+    pub coalesce_lease_secs: u64,
+    /// Delay before retrying a coalesced group after an all-token retryable
+    /// FCM failure.
+    #[serde(default = "default_coalesce_retry")]
+    pub coalesce_retry_secs: u64,
+    /// Idle poll interval for the coalescing flush worker.
+    #[serde(default = "default_coalesce_poll")]
+    pub coalesce_poll_millis: u64,
+    /// Absolute logical lifetime of a coalesced group, in seconds, measured
+    /// from its creation.
+    ///
+    /// Buffered work is durable until this point. The flush and retry paths
+    /// delete and count a group that crosses it while the hash is still
+    /// readable, so a backlog cannot expire into a silent dangling index
+    /// member.
+    #[serde(default = "default_coalesce_group_ttl")]
+    pub coalesce_group_ttl_secs: u64,
+    /// Hard bound on one coalescing flush, in seconds.
+    ///
+    /// One flush resolves a display name and sends an FCM batch; both can
+    /// stall. The bound keeps the drain from pinning all due work behind one
+    /// group. A timed-out flush leaves its lease for expiry to recover.
+    #[serde(default = "default_coalesce_flush_timeout")]
+    pub coalesce_flush_timeout_secs: u64,
+    /// Cleanup grace added to the logical group lifetime for the physical
+    /// Redis TTL, and added to the bucket window for disposition-key TTLs.
+    ///
+    /// The physical TTL must outlive the logical expiry so the dropping path
+    /// can still read the group's recipient, type, and target when it counts
+    /// the loss.
+    #[serde(default = "default_coalesce_grace")]
+    pub coalesce_logical_expiry_grace_secs: u64,
+    /// Per-recipient token-bucket capacity for like/repost immediate pushes.
+    #[serde(default = "default_recipient_throttle_capacity")]
+    pub recipient_throttle_capacity: u64,
+    /// Seconds of sustained like/repost pushes one refilled token buys.
+    #[serde(default = "default_recipient_throttle_refill")]
+    pub recipient_throttle_refill_secs: u64,
+    /// Rolling window over which `recipient_daily_cap` bounds emitted
+    /// like/repost notifications for one recipient.
+    #[serde(default = "default_recipient_daily_window")]
+    pub recipient_daily_window_secs: u64,
+    /// Maximum like/repost notifications one recipient may receive per rolling
+    /// window, counting immediate pushes and summaries.
+    #[serde(default = "default_recipient_daily_cap")]
+    pub recipient_daily_cap: u64,
 }
 
 fn default_process_window_days() -> i64 {
@@ -169,6 +228,75 @@ fn default_video_coordinate_dedup_ttl() -> u64 {
     // Video coordinates remain stable across edits. One year prevents routine edits from
     // re-notifying recipients while bounding Redis retention for inactive coordinates.
     31_536_000
+}
+
+fn default_coalesce_window() -> u64 {
+    // Two hours: long enough that a burst is summarized once instead of
+    // buzzing per event, short enough that a like is still timely.
+    7200
+}
+
+fn default_coalesce_immediate_limit() -> u64 {
+    // The first three interactions on a post still feel immediate; beyond that
+    // the summary is the notification.
+    3
+}
+
+fn default_coalesce_lease() -> u64 {
+    // One summary push is a single FCM batch, whose operations are bounded at
+    // 45 seconds each; 5 minutes recovers a dead worker promptly.
+    300
+}
+
+fn default_coalesce_retry() -> u64 {
+    5
+}
+
+fn default_coalesce_poll() -> u64 {
+    250
+}
+
+fn default_coalesce_group_ttl() -> u64 {
+    // One day of durable deferral. After that a group is dropped loudly and
+    // counted rather than expiring into an unreadable dangling index member.
+    86_400
+}
+
+fn default_coalesce_flush_timeout() -> u64 {
+    // A flush includes a profile lookup bounded at five seconds and an FCM
+    // batch bounded at 45 seconds per token; two minutes covers a slow pass
+    // while leaving the five-minute lease above twice this bound.
+    120
+}
+
+fn default_coalesce_grace() -> u64 {
+    // The physical TTL must outlive the logical lifetime so the dropping path
+    // can still name the recipient, type, and target it counted. One extra
+    // hour also covers a worker restarting before it drains the due queue.
+    3600
+}
+
+fn default_recipient_throttle_capacity() -> u64 {
+    // A recipient can absorb a 20-push burst instantly — the same size as the
+    // rolling daily cap, so the burst cannot exceed the daily budget — then one
+    // push per minute refills; beyond that the bucket defers to the summary.
+    20
+}
+
+fn default_recipient_throttle_refill() -> u64 {
+    60
+}
+
+fn default_recipient_daily_window() -> u64 {
+    // 24 hours, the window the emission cap is defined over.
+    86_400
+}
+
+fn default_recipient_daily_cap() -> u64 {
+    // 20 emitted like/repost notifications in the rolling window, counting
+    // immediate pushes and summaries; at the cap a recipient defers until the
+    // oldest emission slides out.
+    20
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -340,7 +468,7 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
-        let must_be_positive: [(&str, u64, &str); 12] = [
+        let must_be_positive: [(&str, u64, &str); 24] = [
             (
                 "nostr.event_silence_timeout_secs",
                 self.nostr.event_silence_timeout_secs,
@@ -401,6 +529,66 @@ impl Settings {
                 self.service.new_post_fanout_poll_millis,
                 "an idle worker spins continuously against Redis",
             ),
+            (
+                "service.coalesce_window_secs",
+                self.service.coalesce_window_secs,
+                "bucket identifiers divide by zero and no like or repost can be buffered",
+            ),
+            (
+                "service.coalesce_immediate_limit",
+                self.service.coalesce_immediate_limit,
+                "every like and repost is buffered and no summary ever has an immediate predecessor",
+            ),
+            (
+                "service.coalesce_lease_secs",
+                self.service.coalesce_lease_secs,
+                "a claimed group's lease expires in the same instant and is reclaimed forever",
+            ),
+            (
+                "service.coalesce_retry_secs",
+                self.service.coalesce_retry_secs,
+                "a failed summary retries in a tight loop",
+            ),
+            (
+                "service.coalesce_poll_millis",
+                self.service.coalesce_poll_millis,
+                "an idle coalescing worker spins continuously against Redis",
+            ),
+            (
+                "service.coalesce_group_ttl_secs",
+                self.service.coalesce_group_ttl_secs,
+                "buffered work crosses its logical expiry in the same instant it is created",
+            ),
+            (
+                "service.coalesce_flush_timeout_secs",
+                self.service.coalesce_flush_timeout_secs,
+                "every coalescing flush times out before it can send",
+            ),
+            (
+                "service.coalesce_logical_expiry_grace_secs",
+                self.service.coalesce_logical_expiry_grace_secs,
+                "group keys are physically removed at their logical expiry, before the dropping path can count the loss",
+            ),
+            (
+                "service.recipient_throttle_capacity",
+                self.service.recipient_throttle_capacity,
+                "the recipient bucket starts empty and every immediate push is demoted",
+            ),
+            (
+                "service.recipient_throttle_refill_secs",
+                self.service.recipient_throttle_refill_secs,
+                "token refill divides by zero",
+            ),
+            (
+                "service.recipient_daily_window_secs",
+                self.service.recipient_daily_window_secs,
+                "no emission can age out of the rolling cap window",
+            ),
+            (
+                "service.recipient_daily_cap",
+                self.service.recipient_daily_cap,
+                "no like/repost notification can leave and every event buffers",
+            ),
         ];
 
         for (name, value, consequence) in must_be_positive {
@@ -409,6 +597,29 @@ impl Settings {
                     "{name} must be greater than zero: at 0, {consequence}"
                 )));
             }
+        }
+
+        // Checked arithmetic: these values are environment-overridable, so a
+        // near-u64 value must saturate rather than wrap into a passing check.
+        if self.service.coalesce_group_ttl_secs
+            <= self
+                .service
+                .coalesce_window_secs
+                .saturating_add(self.service.coalesce_lease_secs)
+        {
+            return Err(ConfigError::Message(
+                "service.coalesce_group_ttl_secs must exceed coalesce_window_secs + coalesce_lease_secs: a group must stay durable past its bucket deadline and any live lease"
+                    .to_string(),
+            ));
+        }
+
+        if self.service.coalesce_lease_secs
+            <= self.service.coalesce_flush_timeout_secs.saturating_mul(2)
+        {
+            return Err(ConfigError::Message(
+                "service.coalesce_lease_secs must exceed twice coalesce_flush_timeout_secs: an expired lease must not be reclaimed while its flush can still be running"
+                    .to_string(),
+            ));
         }
 
         if self
@@ -531,7 +742,7 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 12] = [
+        let cases: [ZeroCase; 24] = [
             ("nostr.event_silence_timeout_secs", |s| {
                 s.nostr.event_silence_timeout_secs = 0
             }),
@@ -567,6 +778,42 @@ mod tests {
             }),
             ("service.new_post_fanout_poll_millis", |s| {
                 s.service.new_post_fanout_poll_millis = 0
+            }),
+            ("service.coalesce_window_secs", |s| {
+                s.service.coalesce_window_secs = 0
+            }),
+            ("service.coalesce_immediate_limit", |s| {
+                s.service.coalesce_immediate_limit = 0
+            }),
+            ("service.coalesce_lease_secs", |s| {
+                s.service.coalesce_lease_secs = 0
+            }),
+            ("service.coalesce_retry_secs", |s| {
+                s.service.coalesce_retry_secs = 0
+            }),
+            ("service.coalesce_poll_millis", |s| {
+                s.service.coalesce_poll_millis = 0
+            }),
+            ("service.coalesce_group_ttl_secs", |s| {
+                s.service.coalesce_group_ttl_secs = 0
+            }),
+            ("service.coalesce_flush_timeout_secs", |s| {
+                s.service.coalesce_flush_timeout_secs = 0
+            }),
+            ("service.coalesce_logical_expiry_grace_secs", |s| {
+                s.service.coalesce_logical_expiry_grace_secs = 0
+            }),
+            ("service.recipient_throttle_capacity", |s| {
+                s.service.recipient_throttle_capacity = 0
+            }),
+            ("service.recipient_throttle_refill_secs", |s| {
+                s.service.recipient_throttle_refill_secs = 0
+            }),
+            ("service.recipient_daily_window_secs", |s| {
+                s.service.recipient_daily_window_secs = 0
+            }),
+            ("service.recipient_daily_cap", |s| {
+                s.service.recipient_daily_cap = 0
             }),
         ];
 
@@ -627,5 +874,73 @@ mod tests {
                     <= settings.service.new_post_fanout_page_size
             );
         }
+    }
+
+    #[test]
+    fn test_coalescing_shipped_values_are_present_and_bounded() {
+        // Every coalescing setting has a serde default, so a misspelled key in
+        // a shipped file would parse as the default and stay green. Assert the
+        // key text first, then the parsed value.
+        let keys = [
+            "coalesce_window_secs",
+            "coalesce_immediate_limit",
+            "coalesce_lease_secs",
+            "coalesce_retry_secs",
+            "coalesce_poll_millis",
+            "coalesce_group_ttl_secs",
+            "coalesce_flush_timeout_secs",
+            "coalesce_logical_expiry_grace_secs",
+            "recipient_throttle_capacity",
+            "recipient_throttle_refill_secs",
+            "recipient_daily_window_secs",
+            "recipient_daily_cap",
+        ];
+
+        for filename in ["settings.yaml", "settings.development.yaml"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("config")
+                .join(filename);
+            let raw = std::fs::read_to_string(&path).expect("shipped config is readable");
+            for key in keys {
+                assert!(
+                    raw.contains(&format!("{key}:")),
+                    "{filename} must carry {key}"
+                );
+            }
+
+            let settings = load_runtime_settings(filename);
+            assert_eq!(settings.service.coalesce_window_secs, 7200);
+            assert_eq!(settings.service.coalesce_immediate_limit, 3);
+            assert_eq!(settings.service.coalesce_lease_secs, 300);
+            assert_eq!(settings.service.coalesce_retry_secs, 5);
+            assert_eq!(settings.service.coalesce_poll_millis, 250);
+            assert_eq!(settings.service.coalesce_group_ttl_secs, 86_400);
+            assert_eq!(settings.service.coalesce_flush_timeout_secs, 120);
+            assert_eq!(settings.service.coalesce_logical_expiry_grace_secs, 3600);
+            assert_eq!(settings.service.recipient_throttle_capacity, 20);
+            assert_eq!(settings.service.recipient_throttle_refill_secs, 60);
+            assert_eq!(settings.service.recipient_daily_window_secs, 86_400);
+            assert_eq!(settings.service.recipient_daily_cap, 20);
+        }
+    }
+
+    #[test]
+    fn test_coalescing_lifetime_bounds_are_relational() {
+        let mut settings = load_runtime_settings("settings.yaml");
+        settings.service.coalesce_group_ttl_secs = settings.service.coalesce_window_secs;
+        assert!(
+            settings.validate().is_err(),
+            "a group lifetime inside the window must be rejected"
+        );
+
+        settings.service.coalesce_group_ttl_secs = default_coalesce_group_ttl();
+        settings.service.coalesce_flush_timeout_secs = settings.service.coalesce_lease_secs;
+        assert!(
+            settings.validate().is_err(),
+            "a lease at or below twice the flush timeout must be rejected"
+        );
+
+        settings.service.coalesce_flush_timeout_secs = default_coalesce_flush_timeout();
+        assert!(settings.validate().is_ok());
     }
 }

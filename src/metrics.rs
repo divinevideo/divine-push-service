@@ -11,6 +11,12 @@ pub const FCM_SENDS_FAILED_TOTAL: &str = "push_fcm_sends_failed_total";
 pub const NEW_POST_FANOUT_RETRIES_TOTAL: &str = "push_new_post_fanout_retries_total";
 pub const INTERNAL_DM_REQUESTS_TOTAL: &str = "push_internal_dm_requests_total";
 pub const TOKENS_PRUNED_TOTAL: &str = "push_tokens_pruned_total";
+pub const COALESCED_SENDS_TOTAL: &str = "push_coalesced_sends_total";
+pub const COALESCE_OLDEST_DUE_AGE_SECONDS: &str = "push_coalesce_oldest_due_age_seconds";
+pub const THROTTLED_RECIPIENTS_TOTAL: &str = "push_throttled_recipients_total";
+pub const COALESCE_SKIPPED_TOTAL: &str = "push_coalesce_skipped_total";
+pub const COALESCE_DEFERRED_TOTAL: &str = "push_coalesce_deferred_total";
+pub const COALESCE_FLUSH_FAILURES_TOTAL: &str = "push_coalesce_flush_failures_total";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
 
@@ -51,6 +57,30 @@ pub fn init() -> PrometheusHandle {
     metrics::describe_counter!(
         TOKENS_PRUNED_TOTAL,
         "FCM tokens removed by the service, counted by reason"
+    );
+    metrics::describe_counter!(
+        COALESCED_SENDS_TOTAL,
+        "Coalesced like/repost summary pushes sent, counted by notification type"
+    );
+    metrics::describe_gauge!(
+        COALESCE_OLDEST_DUE_AGE_SECONDS,
+        "Age in seconds of the oldest coalescing group that is due now, measured against the Redis server clock and sampled on every worker pass"
+    );
+    metrics::describe_counter!(
+        THROTTLED_RECIPIENTS_TOTAL,
+        "Would-be immediate like/repost pushes demoted into the coalescing bucket by the per-recipient throttle"
+    );
+    metrics::describe_counter!(
+        COALESCE_SKIPPED_TOTAL,
+        "Coalescing work that reached a non-delivery terminal outcome, counted by bounded reason (including logical expiry and dangling due members)"
+    );
+    metrics::describe_counter!(
+        COALESCE_DEFERRED_TOTAL,
+        "Coalescing flushes deferred without consuming an attempt, counted by bounded reason"
+    );
+    metrics::describe_counter!(
+        COALESCE_FLUSH_FAILURES_TOTAL,
+        "Coalescing flushes that failed before a terminal outcome, counted by bounded reason"
     );
     metrics::describe_gauge!(
         LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS,
@@ -100,6 +130,30 @@ pub fn tokens_pruned(reason: &'static str, count: u64) {
     metrics::counter!(TOKENS_PRUNED_TOTAL, "reason" => reason).increment(count);
 }
 
+pub fn coalesced_send(notification_type: &'static str) {
+    metrics::counter!(COALESCED_SENDS_TOTAL, "type" => notification_type).increment(1);
+}
+
+pub fn coalesce_oldest_due_age(age_seconds: f64) {
+    metrics::gauge!(COALESCE_OLDEST_DUE_AGE_SECONDS).set(age_seconds);
+}
+
+pub fn throttled_recipient(notification_type: &'static str) {
+    metrics::counter!(THROTTLED_RECIPIENTS_TOTAL, "type" => notification_type).increment(1);
+}
+
+pub fn coalesce_skipped(reason: &'static str, count: u64) {
+    metrics::counter!(COALESCE_SKIPPED_TOTAL, "reason" => reason).increment(count);
+}
+
+pub fn coalesce_deferred(reason: &'static str, count: u64) {
+    metrics::counter!(COALESCE_DEFERRED_TOTAL, "reason" => reason).increment(count);
+}
+
+pub fn coalesce_flush_failure(reason: &'static str, count: u64) {
+    metrics::counter!(COALESCE_FLUSH_FAILURES_TOTAL, "reason" => reason).increment(count);
+}
+
 fn set_last_event_processed_timestamp(timestamp: f64) {
     metrics::gauge!(LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS).set(timestamp);
 }
@@ -122,6 +176,16 @@ mod tests {
             new_post_fanout_retry("delivery", "scheduled");
             internal_dm_request("unauthorized");
             tokens_pruned("invalid", 1);
+            coalesced_send("like");
+            coalesce_oldest_due_age(12.0);
+            throttled_recipient("repost");
+            coalesce_skipped("expired", 1);
+            coalesce_skipped("expired_throttled", 1);
+            coalesce_skipped("send_failed", 1);
+            coalesce_skipped("dangling_due", 2);
+            coalesce_deferred("recipient_throttled", 1);
+            coalesce_deferred("recipient_daily_capped", 1);
+            coalesce_flush_failure("timeout", 1);
         });
 
         handle.run_upkeep();
@@ -158,6 +222,46 @@ mod tests {
         );
         assert!(
             rendered.contains(r#"push_tokens_pruned_total{reason="invalid"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesced_sends_total{type="like"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("push_coalesce_oldest_due_age_seconds 12"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_throttled_recipients_total{type="repost"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="expired"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="expired_throttled"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="send_failed"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_skipped_total{reason="dangling_due"} 2"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_deferred_total{reason="recipient_throttled"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_deferred_total{reason="recipient_daily_capped"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"push_coalesce_flush_failures_total{reason="timeout"} 1"#),
             "{rendered}"
         );
         assert!(
