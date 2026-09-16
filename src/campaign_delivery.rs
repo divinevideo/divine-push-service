@@ -675,7 +675,11 @@ pub async fn run_campaign_delivery_service(
             }
             _ = ticker.tick() => {
                 match poll_once(&state, &http).await {
-                    Ok(0) => debug!("No campaign deliveries pending."),
+                    // `Ok(0)` also covers a non-empty batch that stopped before
+                    // processing anything (budget exhausted or the first item
+                    // timed out) - poll_once already warns for that case, so
+                    // this line must not claim the batch was empty.
+                    Ok(0) => debug!("No campaign deliveries processed."),
                     Ok(count) => info!(count, "Processed campaign deliveries."),
                     Err(e) => error!(error = %e, "Campaign delivery poll failed."),
                 }
