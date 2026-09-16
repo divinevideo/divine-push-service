@@ -1566,7 +1566,7 @@ mod tests {
         state.settings.campaign_delivery.allow_unverified_consent = false;
 
         // No consent key at all reads as false, not as an unknown to retry.
-        let without_consent = deliver(&state, &pending, noon).await;
+        let without_consent = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(without_consent.status, DeliveryStatus::Suppressed);
         assert_eq!(
             without_consent.reason.as_deref(),
@@ -1585,7 +1585,7 @@ mod tests {
         let working = MockFcmSender::new();
         let mut state = sending_state(pool.clone(), working.clone());
         state.settings.campaign_delivery.allow_unverified_consent = false;
-        let with_consent = deliver(&state, &pending, noon).await;
+        let with_consent = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(with_consent.status, DeliveryStatus::Delivered);
         assert_eq!(working.get_sent_messages().len(), 1);
     }
@@ -1620,7 +1620,7 @@ mod tests {
         let mut state = sending_state(pool.clone(), MockFcmSender::new());
         state.settings.campaign_delivery.allow_unverified_consent = false;
 
-        let result = deliver(&state, &pending, noon).await;
+        let result = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Deferred);
         assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
         assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T21:00:00Z"));
@@ -1655,7 +1655,7 @@ mod tests {
         let mut state = sending_state(pool.clone(), MockFcmSender::new());
         state.settings.campaign_delivery.allow_unverified_consent = false;
 
-        let result = deliver(&state, &pending, noon).await;
+        let result = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Suppressed);
         assert_eq!(result.reason.as_deref(), Some("recipient_timezone_unknown"));
         assert_eq!(result.retry_after, None);
