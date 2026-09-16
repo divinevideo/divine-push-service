@@ -521,6 +521,23 @@ async fn report_result(
     }
 }
 
+/// The point in time by which a campaign batch's upstream lease expires.
+///
+/// `Instant::checked_add` rather than `+`: a malformed or absurd
+/// `lease_seconds` from `divine-engagement` should surface as a poll error
+/// like the zero-second case above it, not panic the process the way
+/// `Instant`'s `Add<Duration>` does on overflow.
+fn compute_lease_deadline(started_at: Instant, lease_seconds: u64) -> Result<Instant> {
+    started_at
+        .checked_add(Duration::from_secs(lease_seconds))
+        .ok_or_else(|| {
+            crate::error::ServiceError::Internal(format!(
+                "Pending delivery response returned an unrepresentable lease: \
+                 {lease_seconds} seconds"
+            ))
+        })
+}
+
 async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
     let settings = &state.settings.campaign_delivery;
     let pending_url = format!(
@@ -563,7 +580,7 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         ));
     }
 
-    let lease_deadline = Instant::now() + Duration::from_secs(pending.lease_seconds);
+    let lease_deadline = compute_lease_deadline(Instant::now(), pending.lease_seconds)?;
     let mut count = 0;
     for delivery in &pending.deliveries {
         let remaining = lease_deadline.saturating_duration_since(Instant::now());
@@ -962,6 +979,23 @@ mod tests {
             .timestamp();
         assert_eq!(quiet_hours_retry_after(0, at_seven), None);
         assert!(quiet_hours_retry_after(0, at_twenty_one).is_some());
+    }
+
+    #[test]
+    fn test_compute_lease_deadline_rejects_an_unrepresentable_lease() {
+        // u64::MAX seconds cannot be added to any Instant without overflowing
+        // the platform's monotonic-clock representation; this must be
+        // reported, not panic the process the way `Instant`'s `Add<Duration>`
+        // does on overflow.
+        assert!(compute_lease_deadline(Instant::now(), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_compute_lease_deadline_holds_the_full_lease_for_an_ordinary_value() {
+        let started = Instant::now();
+        let deadline = compute_lease_deadline(started, TEST_LEASE_SECS)
+            .expect("an ordinary lease must compute");
+        assert_eq!(deadline, started + Duration::from_secs(TEST_LEASE_SECS));
     }
 
     #[test]
