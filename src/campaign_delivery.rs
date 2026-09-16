@@ -546,6 +546,12 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         settings.batch_size
     );
 
+    // Captured before the request goes out, not after the response decodes:
+    // divine-engagement's lease clock is already running by the time it
+    // sends the response, so anchoring any later makes every deadline below
+    // more optimistic than the server's, by however long the GET and the
+    // JSON decode took.
+    let poll_started_at = Instant::now();
     let response = http
         .get(&pending_url)
         .header("CF-Access-Client-Id", &settings.access_client_id)
@@ -580,7 +586,7 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
         ));
     }
 
-    let lease_deadline = compute_lease_deadline(Instant::now(), pending.lease_seconds)?;
+    let lease_deadline = compute_lease_deadline(poll_started_at, pending.lease_seconds)?;
     let mut count = 0;
     for delivery in &pending.deliveries {
         let remaining = lease_deadline.saturating_duration_since(Instant::now());
