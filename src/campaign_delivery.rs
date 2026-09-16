@@ -95,14 +95,17 @@ const TEST_LEASE_SECS: u64 = 300;
 /// Logged rather than propagated, because the caller is already returning a
 /// result for this delivery and has nothing better to do with the error.
 ///
-/// That is a genuine hole rather than a bounded one, and the claim window does
-/// not close it: a `retryable_failure` returns the row to `pending_delivery`
-/// with its lease cleared, and `divine-engagement` re-offers pending rows with
-/// no lease cutoff, so the next poll — 30 seconds later, not 600 — meets the
-/// claim this call failed to drop and settles the row `already_delivered`. The
-/// realistic instance is the `token_lookup_failed` path, where the lookup and
-/// this release share a Redis pool and fail together. Closing it needs the
-/// claim window tied to the lease budget rather than to a constant; see #41.
+/// That is a genuine hole rather than a bounded one: a `retryable_failure`
+/// returns the row to `pending_delivery` with its lease cleared, and
+/// `divine-engagement` re-offers pending rows with no lease cutoff, so the
+/// next poll can meet the claim this call failed to drop and settle the row
+/// `already_delivered`. The realistic instance is the `token_lookup_failed`
+/// path, where the lookup and this release share a Redis pool and fail
+/// together. The claim window is tied to the remaining lease budget
+/// (`claim_ttl_secs`) rather than to a fixed constant, so an abandoned claim
+/// now expires close to when `divine-engagement` would re-offer the row
+/// anyway instead of on a disconnected timer — narrower than before, not
+/// closed.
 async fn release_claim(state: &AppState, claim: &str, owner: &str, idempotency_key: &str) {
     match redis_store::release_campaign_delivery(&state.redis_pool, claim, owner).await {
         Ok(true) => {}
@@ -311,12 +314,14 @@ async fn deliver(
     // so the same key will legitimately be offered again.
     //
     // The claim survives only a delivery. It is taken for the remaining API
-    // lease and
-    // promoted to the full dedup window once FCM has accepted a push; every
-    // path that took it and ends without one drops it. Holding the full window
+    // lease and promoted to the full dedup window once FCM has accepted a
+    // push; every path that returns from inside this function after taking
+    // the claim drops it unless it promoted first. Holding the full window
     // across a failure would suppress the very retry this function asks for,
     // and the row would settle `already_delivered` for a push that never
-    // landed.
+    // landed. The one exception is external cancellation: `poll_once` wraps
+    // this whole call in a timeout, and a claim can still be outstanding when
+    // that timeout drops the future before any of the returns below run.
     //
     // Both writes are scoped to `owner`, so a cancelled or unexpectedly late
     // attempt cannot release or promote a successor's claim.
