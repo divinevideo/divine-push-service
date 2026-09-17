@@ -33,6 +33,19 @@ struct TapTarget {
 #[serde(rename_all = "camelCase")]
 struct PendingDelivery {
     idempotency_key: String,
+    /// The lease this row was handed out under, echoed back with the result.
+    ///
+    /// `idempotency_key` identifies the row; this identifies the *attempt*.
+    /// `divine-engagement` re-offers a row whose lease has expired under a new
+    /// `lease_id`, and records a result only while the echoed value is still
+    /// the row's current lease, so a slow first attempt reporting late can no
+    /// longer settle the second attempt's outcome.
+    ///
+    /// Required rather than optional on purpose: a result without it is
+    /// rejected upstream, which would leave the row cycling through re-offers
+    /// with nothing to show for them. Failing the decode stops the batch
+    /// loudly instead.
+    lease_id: String,
     campaign_revision_id: String,
     recipient_pubkey: String,
     category: String,
@@ -63,6 +76,11 @@ enum DeliveryStatus {
 #[serde(rename_all = "camelCase")]
 struct DeliveryResult {
     idempotency_key: String,
+    /// Copied verbatim from the `PendingDelivery` this result settles.
+    ///
+    /// Never constructed from anything else: a result built with a lease the
+    /// recipient was not offered under is silently dropped upstream.
+    lease_id: String,
     status: DeliveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -279,6 +297,7 @@ async fn deliver(
 
     let refuse = |status, reason: &str| DeliveryResult {
         idempotency_key: delivery.idempotency_key.clone(),
+        lease_id: delivery.lease_id.clone(),
         status,
         reason: Some(reason.to_string()),
         retry_after: None,
@@ -387,6 +406,7 @@ async fn deliver(
         if let Some(retry_after) = earliest_retry_after {
             return DeliveryResult {
                 idempotency_key: delivery.idempotency_key.clone(),
+                lease_id: delivery.lease_id.clone(),
                 status: DeliveryStatus::Deferred,
                 reason: Some("recipient_quiet_hours".to_string()),
                 retry_after: Some(retry_after),
@@ -483,6 +503,7 @@ async fn deliver(
         }
         DeliveryResult {
             idempotency_key: delivery.idempotency_key.clone(),
+            lease_id: delivery.lease_id.clone(),
             status: DeliveryStatus::Delivered,
             reason: None,
             retry_after: None,
@@ -901,6 +922,7 @@ mod tests {
 
         let mut pending = delivery(None);
         pending.idempotency_key = format!("rev-{label}:{}", recipient.public_key().to_hex());
+        pending.lease_id = format!("lease-{label}");
         pending.recipient_pubkey = recipient.public_key().to_hex();
         (pending, token)
     }
@@ -908,6 +930,7 @@ mod tests {
     fn delivery(expires_at: Option<&str>) -> PendingDelivery {
         PendingDelivery {
             idempotency_key: "rev-1:abc".to_string(),
+            lease_id: "2026-09-17T12:00:00.000Z".to_string(),
             campaign_revision_id: "rev-1".to_string(),
             recipient_pubkey: "a".repeat(64),
             category: "engagement".to_string(),
@@ -1058,6 +1081,7 @@ mod tests {
     fn test_pending_delivery_decodes_the_contract_shape() {
         let json = r#"{
             "idempotencyKey": "rev-1:abc",
+            "leaseId": "2026-08-05T11:55:00.000Z",
             "campaignRevisionId": "rev-1",
             "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "category": "engagement",
@@ -1068,6 +1092,7 @@ mod tests {
         }"#;
         let parsed: PendingDelivery = serde_json::from_str(json).expect("decodes");
         assert_eq!(parsed.idempotency_key, "rev-1:abc");
+        assert_eq!(parsed.lease_id, "2026-08-05T11:55:00.000Z");
         assert_eq!(parsed.tap_target.target_type, "app_route");
         assert!(PublicKey::from_str(&parsed.recipient_pubkey).is_ok());
         assert!(parsed.expires_at.is_none());
@@ -1082,6 +1107,7 @@ mod tests {
         let json = r#"{
             "deliveries": [{
                 "idempotencyKey": "rev-1:abc",
+                "leaseId": "2026-08-05T11:55:00.000Z",
                 "campaignRevisionId": "rev-1",
                 "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "category": "engagement",
@@ -1096,6 +1122,7 @@ mod tests {
         assert_eq!(parsed.deliveries.len(), 1);
         assert_eq!(parsed.lease_seconds, 300);
         assert_eq!(parsed.deliveries[0].idempotency_key, "rev-1:abc");
+        assert_eq!(parsed.deliveries[0].lease_id, "2026-08-05T11:55:00.000Z");
         assert_eq!(
             parsed.deliveries[0].expires_at.as_deref(),
             Some("2026-08-05T12:00:00Z")
@@ -1112,6 +1139,7 @@ mod tests {
         // the whole suite stays green.
         let json = r#"{
             "idempotencyKey": "rev-1:abc",
+            "leaseId": "2026-08-05T11:55:00.000Z",
             "campaignRevisionId": "rev-1",
             "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "category": "engagement",
@@ -1144,6 +1172,7 @@ mod tests {
         ] {
             let encoded = serde_json::to_string(&DeliveryResult {
                 idempotency_key: "k".to_string(),
+                lease_id: "2026-09-17T12:00:00.000Z".to_string(),
                 status,
                 reason: None,
                 retry_after: None,
@@ -1154,6 +1183,12 @@ mod tests {
                 "{status:?} must serialise as {wire}, got {encoded}"
             );
             assert!(encoded.contains("\"idempotencyKey\":\"k\""));
+            // camelCase, and never omitted: engagement drops a result it
+            // cannot match to the lease it handed out.
+            assert!(
+                encoded.contains("\"leaseId\":\"2026-09-17T12:00:00.000Z\""),
+                "{status:?} must carry leaseId, got {encoded}"
+            );
             // `reason: None` must be omitted, not emitted as null.
             assert!(!encoded.contains("reason"));
         }
@@ -1165,6 +1200,7 @@ mod tests {
         let encoded = serde_json::to_string(&ResultsRequest {
             results: vec![DeliveryResult {
                 idempotency_key: "rev-1:abc".to_string(),
+                lease_id: "2026-09-17T12:00:00.000Z".to_string(),
                 status: DeliveryStatus::RetryableFailure,
                 reason: Some("provider_error".to_string()),
                 retry_after: None,
@@ -1173,7 +1209,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoded,
-            r#"{"results":[{"idempotencyKey":"rev-1:abc","status":"retryable_failure","reason":"provider_error"}]}"#
+            r#"{"results":[{"idempotencyKey":"rev-1:abc","leaseId":"2026-09-17T12:00:00.000Z","status":"retryable_failure","reason":"provider_error"}]}"#
         );
     }
 
@@ -1659,5 +1695,147 @@ mod tests {
         assert_eq!(result.status, DeliveryStatus::Suppressed);
         assert_eq!(result.reason.as_deref(), Some("recipient_timezone_unknown"));
         assert_eq!(result.retry_after, None);
+    }
+
+    /// Every way `deliver` can end has to report the lease it was handed.
+    ///
+    /// `divine-engagement` drops a result whose lease is no longer the row's
+    /// current one, so an outcome path that loses the value — or invents one —
+    /// does not fail loudly. The row simply never settles: it stays in flight
+    /// until the lease lapses, is offered again, and the same thing happens.
+    /// A distinct lease per case is deliberate, so a hardcoded constant or a
+    /// value carried over from an earlier delivery fails here.
+    #[tokio::test]
+    async fn test_every_outcome_echoes_the_lease_it_was_offered_under() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+
+        // Suppressed: the campaign expired before we got to it.
+        let (mut expired, _token) = registered_delivery(&pool, "lease-suppressed").await;
+        expired.lease_id = "2026-01-01T11:55:01.000Z".to_string();
+        expired.expires_at = Some("2026-01-01T11:00:00Z".to_string());
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &expired,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Suppressed);
+        assert_eq!(result.reason.as_deref(), Some("campaign_expired"));
+        assert_eq!(result.lease_id, expired.lease_id);
+
+        // Permanent failure: the row names something that is not a pubkey.
+        let (mut malformed, _token) = registered_delivery(&pool, "lease-permanent").await;
+        malformed.lease_id = "2026-01-01T11:55:02.000Z".to_string();
+        malformed.recipient_pubkey = "not-a-pubkey".to_string();
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &malformed,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+        assert_eq!(result.reason.as_deref(), Some("invalid_recipient_pubkey"));
+        assert_eq!(result.lease_id, malformed.lease_id);
+
+        // Retryable failure: the provider refused, so the row goes back to
+        // pending and is offered again under a *different* lease.
+        let (mut flaky, flaky_token) = registered_delivery(&pool, "lease-retryable").await;
+        flaky.lease_id = "2026-01-01T11:55:03.000Z".to_string();
+        let failing = MockFcmSender::new();
+        failing.set_error_for_token(&flaky_token, FcmError::InternalError);
+        let result = deliver(
+            &sending_state(pool.clone(), failing),
+            &flaky,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::RetryableFailure);
+        assert_eq!(result.reason.as_deref(), Some("provider_error"));
+        assert_eq!(result.lease_id, flaky.lease_id);
+
+        // Deferred: quiet hours where the recipient is, reported against the
+        // lease that offered the row rather than the one the retry will use.
+        let (mut quiet, quiet_token) = registered_delivery(&pool, "lease-deferred").await;
+        quiet.lease_id = "2026-01-01T11:55:04.000Z".to_string();
+        let quiet_recipient = PublicKey::from_str(&quiet.recipient_pubkey).unwrap();
+        redis_store::add_or_update_token_with_timezone(
+            &pool,
+            &quiet_recipient,
+            &quiet_token,
+            Some(600),
+        )
+        .await
+        .unwrap();
+        preferences::set_user_preferences_with_campaign_consent(
+            &pool,
+            &quiet.recipient_pubkey,
+            &preferences::UserPreferences { kinds: vec![7] },
+            true,
+        )
+        .await
+        .unwrap();
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.settings.campaign_delivery.allow_unverified_consent = false;
+        let result = deliver(&state, &quiet, now, TEST_LEASE_SECS).await;
+        assert_eq!(result.status, DeliveryStatus::Deferred);
+        assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
+        assert_eq!(result.lease_id, quiet.lease_id);
+
+        // Delivered: the one outcome that is terminal on the first try.
+        let (mut sent, _token) = registered_delivery(&pool, "lease-delivered").await;
+        sent.lease_id = "2026-01-01T11:55:05.000Z".to_string();
+        let working = MockFcmSender::new();
+        let result = deliver(
+            &sending_state(pool.clone(), working.clone()),
+            &sent,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+        assert_eq!(working.get_sent_messages().len(), 1);
+        assert_eq!(result.lease_id, sent.lease_id);
+    }
+
+    /// The lease travels as far as the wire, not just as far as the struct.
+    ///
+    /// The outcome test above reads `DeliveryResult` fields directly, so a
+    /// result could carry the right lease and still be serialised without it.
+    /// This is the body `report_result` actually POSTs.
+    #[tokio::test]
+    async fn test_a_reported_result_puts_its_source_lease_on_the_wire() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, _token) = registered_delivery(&pool, "lease-wire").await;
+        pending.lease_id = "2026-01-01T11:55:06.000Z".to_string();
+
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &pending,
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+                .unwrap()
+                .timestamp(),
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+
+        let encoded = serde_json::to_string(&ResultsRequest {
+            results: vec![result],
+        })
+        .unwrap();
+        assert!(
+            encoded.contains(&format!("\"leaseId\":\"{}\"", pending.lease_id)),
+            "the reported body must echo the offered lease, got {encoded}"
+        );
     }
 }
