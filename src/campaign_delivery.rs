@@ -1277,7 +1277,10 @@ mod tests {
     #[test]
     fn test_results_response_reports_how_many_rows_settled() {
         // 200 with `recorded: 0` is how the campaign tool says it discarded
-        // the result, so the field has to survive a rename upstream.
+        // the result, so the count has to decode rather than be skipped.
+        // Only the name on this side is pinned here: a rename upstream is
+        // invisible from this repo, and the stub-endpoint tests below are as
+        // close as it gets to reading a real reply.
         let none: ResultsResponse = serde_json::from_str(r#"{"recorded":0}"#).expect("decodes");
         assert_eq!(none.recorded, 0);
         let one: ResultsResponse = serde_json::from_str(r#"{"recorded":1}"#).expect("decodes");
@@ -1899,7 +1902,9 @@ mod tests {
     ///
     /// The outcome test above reads `DeliveryResult` fields directly, so a
     /// result could carry the right lease and still be serialised without it.
-    /// This is the body `report_result` actually POSTs.
+    /// This serialises the envelope `report_result` sends, from a result that
+    /// came out of a real `deliver` call rather than a literal. It does not
+    /// call `report_result`; the stub-endpoint tests below do that.
     #[tokio::test]
     async fn test_a_reported_result_puts_its_source_lease_on_the_wire() {
         let Some(pool) = test_redis_pool().await else {
