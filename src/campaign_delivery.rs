@@ -1099,6 +1099,22 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_delivery_requires_a_lease_id() {
+        let json = r#"{
+            "idempotencyKey": "rev-1:abc",
+            "campaignRevisionId": "rev-1",
+            "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "category": "engagement",
+            "title": "t",
+            "body": "b",
+            "tapTarget": { "type": "app_route", "value": "/x" },
+            "expiresAt": null
+        }"#;
+
+        assert!(serde_json::from_str::<PendingDelivery>(json).is_err());
+    }
+
+    #[test]
     fn test_pending_envelope_decodes_what_engagement_serves() {
         // The wire body is the envelope, not a bare delivery: engagement
         // unconditionally returns {"deliveries": [...], "leaseSeconds": 300}.
