@@ -33,6 +33,19 @@ struct TapTarget {
 #[serde(rename_all = "camelCase")]
 struct PendingDelivery {
     idempotency_key: String,
+    /// The lease this row was handed out under, echoed back with the result.
+    ///
+    /// `idempotency_key` identifies the row; this identifies the *attempt*.
+    /// `divine-engagement` re-offers a row whose lease has expired under a new
+    /// `lease_id`, and records a result only while the echoed value is still
+    /// the row's current lease, so a slow first attempt reporting late can no
+    /// longer settle the second attempt's outcome.
+    ///
+    /// Required rather than optional on purpose: a result without it is
+    /// rejected upstream, which would leave the row cycling through re-offers
+    /// with nothing to show for them. Failing the decode stops the batch
+    /// loudly instead.
+    lease_id: String,
     campaign_revision_id: String,
     recipient_pubkey: String,
     category: String,
@@ -63,6 +76,11 @@ enum DeliveryStatus {
 #[serde(rename_all = "camelCase")]
 struct DeliveryResult {
     idempotency_key: String,
+    /// Copied verbatim from the `PendingDelivery` this result settles.
+    ///
+    /// Never constructed from anything else: a result built with a lease the
+    /// recipient was not offered under is silently dropped upstream.
+    lease_id: String,
     status: DeliveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -73,6 +91,18 @@ struct DeliveryResult {
 #[derive(Debug, Serialize)]
 struct ResultsRequest {
     results: Vec<DeliveryResult>,
+}
+
+/// How many results the campaign tool actually settled.
+///
+/// A result whose `lease_id` is no longer the row's current lease matches no
+/// row upstream, and the POST still returns 200. Without reading this, a
+/// discarded result is indistinguishable from an applied one and the row goes
+/// round again with nothing to say why.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResultsResponse {
+    recorded: u32,
 }
 
 fn dedup_key(idempotency_key: &str) -> String {
@@ -86,6 +116,13 @@ fn dedup_key(idempotency_key: &str) -> String {
 /// still be recorded inside the lease.
 const RESULT_REPORT_RESERVE: Duration = Duration::from_secs(30);
 const MAX_PENDING_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Cap on the results endpoint's reply, which is `{"recorded":1}`.
+///
+/// Separate from the pending cap and far smaller: that body carries a whole
+/// batch of work, this one carries a single number, and it is now read once
+/// per delivery rather than only when a report fails.
+const MAX_RESULT_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 const TEST_LEASE_SECS: u64 = 300;
@@ -279,6 +316,7 @@ async fn deliver(
 
     let refuse = |status, reason: &str| DeliveryResult {
         idempotency_key: delivery.idempotency_key.clone(),
+        lease_id: delivery.lease_id.clone(),
         status,
         reason: Some(reason.to_string()),
         retry_after: None,
@@ -387,6 +425,7 @@ async fn deliver(
         if let Some(retry_after) = earliest_retry_after {
             return DeliveryResult {
                 idempotency_key: delivery.idempotency_key.clone(),
+                lease_id: delivery.lease_id.clone(),
                 status: DeliveryStatus::Deferred,
                 reason: Some("recipient_quiet_hours".to_string()),
                 retry_after: Some(retry_after),
@@ -483,6 +522,7 @@ async fn deliver(
         }
         DeliveryResult {
             idempotency_key: delivery.idempotency_key.clone(),
+            lease_id: delivery.lease_id.clone(),
             status: DeliveryStatus::Delivered,
             reason: None,
             retry_after: None,
@@ -505,6 +545,9 @@ async fn report_result(
         "{}/api/internal/deliveries/results",
         settings.api_base_url.trim_end_matches('/')
     );
+    // Taken before `result` moves into the request body below.
+    let idempotency_key = result.idempotency_key.clone();
+    let lease_id = result.lease_id.clone();
     let reported = http
         .post(&results_url)
         .header("CF-Access-Client-Id", &settings.access_client_id)
@@ -516,13 +559,55 @@ async fn report_result(
         .await;
 
     match reported {
-        Ok(response) if response.status().is_success() => {}
+        Ok(response) if response.status().is_success() => {
+            // Bounded like the pending poll, and for the same reason: the body
+            // is whatever the upstream chooses to send. `text()` would buffer
+            // all of it, on the path every delivery now takes.
+            let body = match bounded_response_body(response, MAX_RESULT_RESPONSE_BYTES).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        key = %idempotency_key,
+                        lease = %lease_id,
+                        "Could not read the campaign delivery results response"
+                    );
+                    return;
+                }
+            };
+            match serde_json::from_str::<ResultsResponse>(&body) {
+                Ok(recorded) if recorded.recorded == 0 => warn!(
+                    key = %idempotency_key,
+                    lease = %lease_id,
+                    "Campaign delivery result was not recorded; its lease is no longer current"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    key = %idempotency_key,
+                    lease = %lease_id,
+                    body = %body_snippet(&body),
+                    "Could not read how many delivery results were recorded"
+                ),
+            }
+        }
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            warn!(status = %status, body = %body_snippet(&body), "Reporting delivery result failed");
+            warn!(
+                status = %status,
+                key = %idempotency_key,
+                lease = %lease_id,
+                body = %body_snippet(&body),
+                "Reporting delivery result failed"
+            );
         }
-        Err(e) => warn!(error = %e, "Reporting delivery result failed"),
+        Err(e) => warn!(
+            error = %e,
+            key = %idempotency_key,
+            lease = %lease_id,
+            "Reporting delivery result failed"
+        ),
     }
 }
 
@@ -901,6 +986,7 @@ mod tests {
 
         let mut pending = delivery(None);
         pending.idempotency_key = format!("rev-{label}:{}", recipient.public_key().to_hex());
+        pending.lease_id = format!("lease-{label}");
         pending.recipient_pubkey = recipient.public_key().to_hex();
         (pending, token)
     }
@@ -908,6 +994,7 @@ mod tests {
     fn delivery(expires_at: Option<&str>) -> PendingDelivery {
         PendingDelivery {
             idempotency_key: "rev-1:abc".to_string(),
+            lease_id: "2026-09-17T12:00:00.000Z".to_string(),
             campaign_revision_id: "rev-1".to_string(),
             recipient_pubkey: "a".repeat(64),
             category: "engagement".to_string(),
@@ -1058,6 +1145,7 @@ mod tests {
     fn test_pending_delivery_decodes_the_contract_shape() {
         let json = r#"{
             "idempotencyKey": "rev-1:abc",
+            "leaseId": "2026-08-05T11:55:00.000Z",
             "campaignRevisionId": "rev-1",
             "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "category": "engagement",
@@ -1068,9 +1156,26 @@ mod tests {
         }"#;
         let parsed: PendingDelivery = serde_json::from_str(json).expect("decodes");
         assert_eq!(parsed.idempotency_key, "rev-1:abc");
+        assert_eq!(parsed.lease_id, "2026-08-05T11:55:00.000Z");
         assert_eq!(parsed.tap_target.target_type, "app_route");
         assert!(PublicKey::from_str(&parsed.recipient_pubkey).is_ok());
         assert!(parsed.expires_at.is_none());
+    }
+
+    #[test]
+    fn test_pending_delivery_requires_a_lease_id() {
+        let json = r#"{
+            "idempotencyKey": "rev-1:abc",
+            "campaignRevisionId": "rev-1",
+            "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "category": "engagement",
+            "title": "t",
+            "body": "b",
+            "tapTarget": { "type": "app_route", "value": "/x" },
+            "expiresAt": null
+        }"#;
+
+        assert!(serde_json::from_str::<PendingDelivery>(json).is_err());
     }
 
     #[test]
@@ -1082,6 +1187,7 @@ mod tests {
         let json = r#"{
             "deliveries": [{
                 "idempotencyKey": "rev-1:abc",
+                "leaseId": "2026-08-05T11:55:00.000Z",
                 "campaignRevisionId": "rev-1",
                 "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "category": "engagement",
@@ -1096,6 +1202,7 @@ mod tests {
         assert_eq!(parsed.deliveries.len(), 1);
         assert_eq!(parsed.lease_seconds, 300);
         assert_eq!(parsed.deliveries[0].idempotency_key, "rev-1:abc");
+        assert_eq!(parsed.deliveries[0].lease_id, "2026-08-05T11:55:00.000Z");
         assert_eq!(
             parsed.deliveries[0].expires_at.as_deref(),
             Some("2026-08-05T12:00:00Z")
@@ -1112,6 +1219,7 @@ mod tests {
         // the whole suite stays green.
         let json = r#"{
             "idempotencyKey": "rev-1:abc",
+            "leaseId": "2026-08-05T11:55:00.000Z",
             "campaignRevisionId": "rev-1",
             "recipientPubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "category": "engagement",
@@ -1144,6 +1252,7 @@ mod tests {
         ] {
             let encoded = serde_json::to_string(&DeliveryResult {
                 idempotency_key: "k".to_string(),
+                lease_id: "2026-09-17T12:00:00.000Z".to_string(),
                 status,
                 reason: None,
                 retry_after: None,
@@ -1154,9 +1263,28 @@ mod tests {
                 "{status:?} must serialise as {wire}, got {encoded}"
             );
             assert!(encoded.contains("\"idempotencyKey\":\"k\""));
+            // camelCase, and never omitted: engagement drops a result it
+            // cannot match to the lease it handed out.
+            assert!(
+                encoded.contains("\"leaseId\":\"2026-09-17T12:00:00.000Z\""),
+                "{status:?} must carry leaseId, got {encoded}"
+            );
             // `reason: None` must be omitted, not emitted as null.
             assert!(!encoded.contains("reason"));
         }
+    }
+
+    #[test]
+    fn test_results_response_reports_how_many_rows_settled() {
+        // 200 with `recorded: 0` is how the campaign tool says it discarded
+        // the result, so the count has to decode rather than be skipped.
+        // Only the name on this side is pinned here: a rename upstream is
+        // invisible from this repo, and the stub-endpoint tests below are as
+        // close as it gets to reading a real reply.
+        let none: ResultsResponse = serde_json::from_str(r#"{"recorded":0}"#).expect("decodes");
+        assert_eq!(none.recorded, 0);
+        let one: ResultsResponse = serde_json::from_str(r#"{"recorded":1}"#).expect("decodes");
+        assert_eq!(one.recorded, 1);
     }
 
     #[test]
@@ -1165,6 +1293,7 @@ mod tests {
         let encoded = serde_json::to_string(&ResultsRequest {
             results: vec![DeliveryResult {
                 idempotency_key: "rev-1:abc".to_string(),
+                lease_id: "2026-09-17T12:00:00.000Z".to_string(),
                 status: DeliveryStatus::RetryableFailure,
                 reason: Some("provider_error".to_string()),
                 retry_after: None,
@@ -1173,7 +1302,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoded,
-            r#"{"results":[{"idempotencyKey":"rev-1:abc","status":"retryable_failure","reason":"provider_error"}]}"#
+            r#"{"results":[{"idempotencyKey":"rev-1:abc","leaseId":"2026-09-17T12:00:00.000Z","status":"retryable_failure","reason":"provider_error"}]}"#
         );
     }
 
@@ -1659,5 +1788,312 @@ mod tests {
         assert_eq!(result.status, DeliveryStatus::Suppressed);
         assert_eq!(result.reason.as_deref(), Some("recipient_timezone_unknown"));
         assert_eq!(result.retry_after, None);
+    }
+
+    /// Every way `deliver` can end has to report the lease it was handed.
+    ///
+    /// `divine-engagement` drops a result whose lease is no longer the row's
+    /// current one, so an outcome path that loses the value — or invents one —
+    /// does not fail loudly. The row simply never settles: it stays in flight
+    /// until the lease lapses, is offered again, and the same thing happens.
+    /// A distinct lease per case is deliberate, so a hardcoded constant or a
+    /// value carried over from an earlier delivery fails here.
+    #[tokio::test]
+    async fn test_every_outcome_echoes_the_lease_it_was_offered_under() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+
+        // Suppressed: the campaign expired before we got to it.
+        let (mut expired, _token) = registered_delivery(&pool, "lease-suppressed").await;
+        expired.lease_id = "2026-01-01T11:55:01.000Z".to_string();
+        expired.expires_at = Some("2026-01-01T11:00:00Z".to_string());
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &expired,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Suppressed);
+        assert_eq!(result.reason.as_deref(), Some("campaign_expired"));
+        assert_eq!(result.lease_id, expired.lease_id);
+
+        // Permanent failure: the row names something that is not a pubkey.
+        let (mut malformed, _token) = registered_delivery(&pool, "lease-permanent").await;
+        malformed.lease_id = "2026-01-01T11:55:02.000Z".to_string();
+        malformed.recipient_pubkey = "not-a-pubkey".to_string();
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &malformed,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+        assert_eq!(result.reason.as_deref(), Some("invalid_recipient_pubkey"));
+        assert_eq!(result.lease_id, malformed.lease_id);
+
+        // Retryable failure: the provider refused, so the row goes back to
+        // pending and is offered again under a *different* lease.
+        let (mut flaky, flaky_token) = registered_delivery(&pool, "lease-retryable").await;
+        flaky.lease_id = "2026-01-01T11:55:03.000Z".to_string();
+        let failing = MockFcmSender::new();
+        failing.set_error_for_token(&flaky_token, FcmError::InternalError);
+        let result = deliver(
+            &sending_state(pool.clone(), failing),
+            &flaky,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::RetryableFailure);
+        assert_eq!(result.reason.as_deref(), Some("provider_error"));
+        assert_eq!(result.lease_id, flaky.lease_id);
+
+        // Deferred: quiet hours where the recipient is, reported against the
+        // lease that offered the row rather than the one the retry will use.
+        let (mut quiet, quiet_token) = registered_delivery(&pool, "lease-deferred").await;
+        quiet.lease_id = "2026-01-01T11:55:04.000Z".to_string();
+        let quiet_recipient = PublicKey::from_str(&quiet.recipient_pubkey).unwrap();
+        redis_store::add_or_update_token_with_timezone(
+            &pool,
+            &quiet_recipient,
+            &quiet_token,
+            Some(600),
+        )
+        .await
+        .unwrap();
+        preferences::set_user_preferences_with_campaign_consent(
+            &pool,
+            &quiet.recipient_pubkey,
+            &preferences::UserPreferences { kinds: vec![7] },
+            true,
+        )
+        .await
+        .unwrap();
+        let mut state = sending_state(pool.clone(), MockFcmSender::new());
+        state.settings.campaign_delivery.allow_unverified_consent = false;
+        let result = deliver(&state, &quiet, now, TEST_LEASE_SECS).await;
+        assert_eq!(result.status, DeliveryStatus::Deferred);
+        assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
+        assert_eq!(result.lease_id, quiet.lease_id);
+
+        // Delivered: the one outcome that is terminal on the first try.
+        let (mut sent, _token) = registered_delivery(&pool, "lease-delivered").await;
+        sent.lease_id = "2026-01-01T11:55:05.000Z".to_string();
+        let working = MockFcmSender::new();
+        let result = deliver(
+            &sending_state(pool.clone(), working.clone()),
+            &sent,
+            now,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+        assert_eq!(working.get_sent_messages().len(), 1);
+        assert_eq!(result.lease_id, sent.lease_id);
+    }
+
+    /// The lease travels as far as the wire, not just as far as the struct.
+    ///
+    /// The outcome test above reads `DeliveryResult` fields directly, so a
+    /// result could carry the right lease and still be serialised without it.
+    /// This serialises the envelope `report_result` sends, from a result that
+    /// came out of a real `deliver` call rather than a literal. It does not
+    /// call `report_result`; the stub-endpoint tests below do that.
+    #[tokio::test]
+    async fn test_a_reported_result_puts_its_source_lease_on_the_wire() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, _token) = registered_delivery(&pool, "lease-wire").await;
+        pending.lease_id = "2026-01-01T11:55:06.000Z".to_string();
+
+        let result = deliver(
+            &sending_state(pool.clone(), MockFcmSender::new()),
+            &pending,
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+                .unwrap()
+                .timestamp(),
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Delivered);
+
+        let encoded = serde_json::to_string(&ResultsRequest {
+            results: vec![result],
+        })
+        .unwrap();
+        assert!(
+            encoded.contains(&format!("\"leaseId\":\"{}\"", pending.lease_id)),
+            "the reported body must echo the offered lease, got {encoded}"
+        );
+    }
+    /// One request the stand-in results endpoint received.
+    #[derive(Clone)]
+    struct CapturedReport {
+        body: serde_json::Value,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    }
+
+    type CapturedReports = Arc<std::sync::Mutex<Vec<CapturedReport>>>;
+
+    #[derive(Clone)]
+    struct ResultsStub {
+        status: axum::http::StatusCode,
+        body: String,
+        captured: CapturedReports,
+    }
+
+    async fn results_handler(
+        axum::extract::State(stub): axum::extract::State<ResultsStub>,
+        headers: axum::http::HeaderMap,
+        body: String,
+    ) -> (axum::http::StatusCode, String) {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        stub.captured.lock().unwrap().push(CapturedReport {
+            body: serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+            client_id: header("CF-Access-Client-Id"),
+            client_secret: header("CF-Access-Client-Secret"),
+        });
+        (stub.status, stub.body.clone())
+    }
+
+    /// Stands in for the campaign tool's results endpoint on an ephemeral port.
+    ///
+    /// There is no HTTP mock crate here, and none is needed: `fcm_sender`'s
+    /// tests already stub an upstream with an axum router this way, so the
+    /// reporting path can be driven end to end with what the repo has.
+    async fn results_stub(
+        status: u16,
+        body: &str,
+    ) -> (
+        crate::config::CampaignDeliverySettings,
+        reqwest::Client,
+        CapturedReports,
+    ) {
+        let captured: CapturedReports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/deliveries/results",
+                axum::routing::post(results_handler),
+            )
+            .with_state(ResultsStub {
+                status: axum::http::StatusCode::from_u16(status).unwrap(),
+                body: body.to_string(),
+                captured: Arc::clone(&captured),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let settings = crate::config::CampaignDeliverySettings {
+            api_base_url: format!("http://{addr}"),
+            access_client_id: "stub-client-id".to_string(),
+            access_client_secret: "stub-client-secret".to_string(),
+            ..Default::default()
+        };
+        (settings, reqwest::Client::new(), captured)
+    }
+
+    fn reported(status: DeliveryStatus, lease_id: &str) -> DeliveryResult {
+        DeliveryResult {
+            idempotency_key: "rev-1:abc".to_string(),
+            lease_id: lease_id.to_string(),
+            status,
+            reason: Some("recipient_quiet_hours".to_string()),
+            retry_after: Some("2026-01-01T19:00:00Z".to_string()),
+        }
+    }
+
+    /// What actually reaches the campaign tool, from the function that sends it.
+    ///
+    /// The serialisation tests above build `ResultsRequest` by hand, so they
+    /// would still pass if this function posted something else entirely — a
+    /// bare result instead of the envelope, or one built without the lease.
+    /// This drives `report_result` itself and reads what arrived, including the
+    /// Access credentials, which nothing else covers.
+    #[tokio::test]
+    async fn test_report_result_posts_the_offered_lease_with_its_credentials() {
+        let (settings, http, captured) = results_stub(200, r#"{"recorded":1}"#).await;
+
+        report_result(
+            &settings,
+            &http,
+            reported(DeliveryStatus::Deferred, "2026-01-01T11:55:07.000Z"),
+        )
+        .await;
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one result per report, one report per row"
+        );
+        let received = &requests[0];
+        let result = &received.body["results"][0];
+        assert_eq!(received.body["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["idempotencyKey"], "rev-1:abc");
+        assert_eq!(result["leaseId"], "2026-01-01T11:55:07.000Z");
+        assert_eq!(result["status"], "deferred");
+        assert_eq!(result["reason"], "recipient_quiet_hours");
+        assert_eq!(result["retryAfter"], "2026-01-01T19:00:00Z");
+        assert_eq!(received.client_id.as_deref(), Some("stub-client-id"));
+        assert_eq!(
+            received.client_secret.as_deref(),
+            Some("stub-client-secret")
+        );
+    }
+
+    /// Reporting has to survive every answer the endpoint can give.
+    ///
+    /// `report_result` returns nothing and `poll_once` counts the row as
+    /// processed either way, so an answer it cannot read must still leave the
+    /// batch moving. `recorded: 0` is the case this change reads for: the POST
+    /// succeeded and the campaign tool discarded the result anyway. The
+    /// oversized body is the bounded read: without a cap the whole thing is
+    /// buffered, and the body arrives from outside this service.
+    #[tokio::test]
+    async fn test_a_result_is_posted_whatever_the_endpoint_answers() {
+        let oversized = "x".repeat(MAX_RESULT_RESPONSE_BYTES + 1);
+        let cases: Vec<(u16, String, &str)> = vec![
+            (200, r#"{"recorded":1}"#.to_string(), "recorded"),
+            (200, r#"{"recorded":0}"#.to_string(), "discarded upstream"),
+            (200, "{\"ok\":true}".to_string(), "no recorded count"),
+            (200, "not json at all".to_string(), "unreadable body"),
+            (200, String::new(), "empty body"),
+            (200, oversized, "body over the cap"),
+            (500, "boom".to_string(), "server error"),
+        ];
+
+        for (status, body, case) in cases {
+            let (settings, http, captured) = results_stub(status, &body).await;
+
+            report_result(
+                &settings,
+                &http,
+                reported(DeliveryStatus::Delivered, "2026-01-01T11:55:08.000Z"),
+            )
+            .await;
+
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1, "{case}: the result must still be posted");
+            assert_eq!(
+                requests[0].body["results"][0]["leaseId"], "2026-01-01T11:55:08.000Z",
+                "{case}: the lease must reach the endpoint"
+            );
+        }
     }
 }

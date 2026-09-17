@@ -44,6 +44,14 @@ pub struct Settings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct CampaignDeliverySettings {
     /// Off by default. Merging this must not start polling anything.
+    ///
+    /// Turning it on also requires a `divine-engagement` that serves `leaseId`
+    /// on every pending delivery. Every result echoes that field, and an
+    /// upstream that does not send it fails the decode of the whole batch, so
+    /// against an older one nothing is collected at all. Campaign delivery
+    /// publishes no metrics, so that state shows up only as a poll error every
+    /// `poll_interval_secs`. Deploy this service's support for the field first,
+    /// then that one, then flip this.
     #[serde(default)]
     pub enabled: bool,
     /// Base URL of divine-engagement, e.g. https://engagement.admin.divine.video
