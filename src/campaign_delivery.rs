@@ -93,6 +93,18 @@ struct ResultsRequest {
     results: Vec<DeliveryResult>,
 }
 
+/// How many results the campaign tool actually settled.
+///
+/// A result whose `lease_id` is no longer the row's current lease matches no
+/// row upstream, and the POST still returns 200. Without reading this, a
+/// discarded result is indistinguishable from an applied one and the row goes
+/// round again with nothing to say why.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResultsResponse {
+    recorded: u32,
+}
+
 fn dedup_key(idempotency_key: &str) -> String {
     format!("campaign_delivery:{idempotency_key}")
 }
@@ -526,6 +538,9 @@ async fn report_result(
         "{}/api/internal/deliveries/results",
         settings.api_base_url.trim_end_matches('/')
     );
+    // Taken before `result` moves into the request body below.
+    let idempotency_key = result.idempotency_key.clone();
+    let lease_id = result.lease_id.clone();
     let reported = http
         .post(&results_url)
         .header("CF-Access-Client-Id", &settings.access_client_id)
@@ -537,13 +552,41 @@ async fn report_result(
         .await;
 
     match reported {
-        Ok(response) if response.status().is_success() => {}
+        Ok(response) if response.status().is_success() => {
+            let body = response.text().await.unwrap_or_default();
+            match serde_json::from_str::<ResultsResponse>(&body) {
+                Ok(recorded) if recorded.recorded == 0 => warn!(
+                    key = %idempotency_key,
+                    lease = %lease_id,
+                    "Campaign delivery result was not recorded; its lease is no longer current"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    key = %idempotency_key,
+                    lease = %lease_id,
+                    body = %body_snippet(&body),
+                    "Could not read how many delivery results were recorded"
+                ),
+            }
+        }
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            warn!(status = %status, body = %body_snippet(&body), "Reporting delivery result failed");
+            warn!(
+                status = %status,
+                key = %idempotency_key,
+                lease = %lease_id,
+                body = %body_snippet(&body),
+                "Reporting delivery result failed"
+            );
         }
-        Err(e) => warn!(error = %e, "Reporting delivery result failed"),
+        Err(e) => warn!(
+            error = %e,
+            key = %idempotency_key,
+            lease = %lease_id,
+            "Reporting delivery result failed"
+        ),
     }
 }
 
@@ -1208,6 +1251,16 @@ mod tests {
             // `reason: None` must be omitted, not emitted as null.
             assert!(!encoded.contains("reason"));
         }
+    }
+
+    #[test]
+    fn test_results_response_reports_how_many_rows_settled() {
+        // 200 with `recorded: 0` is how the campaign tool says it discarded
+        // the result, so the field has to survive a rename upstream.
+        let none: ResultsResponse = serde_json::from_str(r#"{"recorded":0}"#).expect("decodes");
+        assert_eq!(none.recorded, 0);
+        let one: ResultsResponse = serde_json::from_str(r#"{"recorded":1}"#).expect("decodes");
+        assert_eq!(one.recorded, 1);
     }
 
     #[test]
