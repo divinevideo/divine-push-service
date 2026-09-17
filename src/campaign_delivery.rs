@@ -117,6 +117,13 @@ fn dedup_key(idempotency_key: &str) -> String {
 const RESULT_REPORT_RESERVE: Duration = Duration::from_secs(30);
 const MAX_PENDING_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
+/// Cap on the results endpoint's reply, which is `{"recorded":1}`.
+///
+/// Separate from the pending cap and far smaller: that body carries a whole
+/// batch of work, this one carries a single number, and it is now read once
+/// per delivery rather than only when a report fails.
+const MAX_RESULT_RESPONSE_BYTES: usize = 64 * 1024;
+
 #[cfg(test)]
 const TEST_LEASE_SECS: u64 = 300;
 
@@ -553,7 +560,21 @@ async fn report_result(
 
     match reported {
         Ok(response) if response.status().is_success() => {
-            let body = response.text().await.unwrap_or_default();
+            // Bounded like the pending poll, and for the same reason: the body
+            // is whatever the upstream chooses to send. `text()` would buffer
+            // all of it, on the path every delivery now takes.
+            let body = match bounded_response_body(response, MAX_RESULT_RESPONSE_BYTES).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        key = %idempotency_key,
+                        lease = %lease_id,
+                        "Could not read the campaign delivery results response"
+                    );
+                    return;
+                }
+            };
             match serde_json::from_str::<ResultsResponse>(&body) {
                 Ok(recorded) if recorded.recorded == 0 => warn!(
                     key = %idempotency_key,
