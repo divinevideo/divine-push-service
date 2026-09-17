@@ -1928,4 +1928,167 @@ mod tests {
             "the reported body must echo the offered lease, got {encoded}"
         );
     }
+    /// One request the stand-in results endpoint received.
+    #[derive(Clone)]
+    struct CapturedReport {
+        body: serde_json::Value,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    }
+
+    type CapturedReports = Arc<std::sync::Mutex<Vec<CapturedReport>>>;
+
+    #[derive(Clone)]
+    struct ResultsStub {
+        status: axum::http::StatusCode,
+        body: String,
+        captured: CapturedReports,
+    }
+
+    async fn results_handler(
+        axum::extract::State(stub): axum::extract::State<ResultsStub>,
+        headers: axum::http::HeaderMap,
+        body: String,
+    ) -> (axum::http::StatusCode, String) {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        stub.captured.lock().unwrap().push(CapturedReport {
+            body: serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+            client_id: header("CF-Access-Client-Id"),
+            client_secret: header("CF-Access-Client-Secret"),
+        });
+        (stub.status, stub.body.clone())
+    }
+
+    /// Stands in for the campaign tool's results endpoint on an ephemeral port.
+    ///
+    /// There is no HTTP mock crate here, and none is needed: `fcm_sender`'s
+    /// tests already stub an upstream with an axum router this way, so the
+    /// reporting path can be driven end to end with what the repo has.
+    async fn results_stub(
+        status: u16,
+        body: &str,
+    ) -> (
+        crate::config::CampaignDeliverySettings,
+        reqwest::Client,
+        CapturedReports,
+    ) {
+        let captured: CapturedReports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/deliveries/results",
+                axum::routing::post(results_handler),
+            )
+            .with_state(ResultsStub {
+                status: axum::http::StatusCode::from_u16(status).unwrap(),
+                body: body.to_string(),
+                captured: Arc::clone(&captured),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let settings = crate::config::CampaignDeliverySettings {
+            api_base_url: format!("http://{addr}"),
+            access_client_id: "stub-client-id".to_string(),
+            access_client_secret: "stub-client-secret".to_string(),
+            ..Default::default()
+        };
+        (settings, reqwest::Client::new(), captured)
+    }
+
+    fn reported(status: DeliveryStatus, lease_id: &str) -> DeliveryResult {
+        DeliveryResult {
+            idempotency_key: "rev-1:abc".to_string(),
+            lease_id: lease_id.to_string(),
+            status,
+            reason: Some("recipient_quiet_hours".to_string()),
+            retry_after: Some("2026-01-01T19:00:00Z".to_string()),
+        }
+    }
+
+    /// What actually reaches the campaign tool, from the function that sends it.
+    ///
+    /// The serialisation tests above build `ResultsRequest` by hand, so they
+    /// would still pass if this function posted something else entirely — a
+    /// bare result instead of the envelope, or one built without the lease.
+    /// This drives `report_result` itself and reads what arrived, including the
+    /// Access credentials, which nothing else covers.
+    #[tokio::test]
+    async fn test_report_result_posts_the_offered_lease_with_its_credentials() {
+        let (settings, http, captured) = results_stub(200, r#"{"recorded":1}"#).await;
+
+        report_result(
+            &settings,
+            &http,
+            reported(DeliveryStatus::Deferred, "2026-01-01T11:55:07.000Z"),
+        )
+        .await;
+
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one result per report, one report per row"
+        );
+        let received = &requests[0];
+        let result = &received.body["results"][0];
+        assert_eq!(received.body["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["idempotencyKey"], "rev-1:abc");
+        assert_eq!(result["leaseId"], "2026-01-01T11:55:07.000Z");
+        assert_eq!(result["status"], "deferred");
+        assert_eq!(result["reason"], "recipient_quiet_hours");
+        assert_eq!(result["retryAfter"], "2026-01-01T19:00:00Z");
+        assert_eq!(received.client_id.as_deref(), Some("stub-client-id"));
+        assert_eq!(
+            received.client_secret.as_deref(),
+            Some("stub-client-secret")
+        );
+    }
+
+    /// Reporting has to survive every answer the endpoint can give.
+    ///
+    /// `report_result` returns nothing and `poll_once` counts the row as
+    /// processed either way, so an answer it cannot read must still leave the
+    /// batch moving. `recorded: 0` is the case this change reads for: the POST
+    /// succeeded and the campaign tool discarded the result anyway. The
+    /// oversized body is the bounded read: without a cap the whole thing is
+    /// buffered, and the body arrives from outside this service.
+    #[tokio::test]
+    async fn test_a_result_is_posted_whatever_the_endpoint_answers() {
+        let oversized = "x".repeat(MAX_RESULT_RESPONSE_BYTES + 1);
+        let cases: Vec<(u16, String, &str)> = vec![
+            (200, r#"{"recorded":1}"#.to_string(), "recorded"),
+            (200, r#"{"recorded":0}"#.to_string(), "discarded upstream"),
+            (200, "{\"ok\":true}".to_string(), "no recorded count"),
+            (200, "not json at all".to_string(), "unreadable body"),
+            (200, String::new(), "empty body"),
+            (200, oversized, "body over the cap"),
+            (500, "boom".to_string(), "server error"),
+        ];
+
+        for (status, body, case) in cases {
+            let (settings, http, captured) = results_stub(status, &body).await;
+
+            report_result(
+                &settings,
+                &http,
+                reported(DeliveryStatus::Delivered, "2026-01-01T11:55:08.000Z"),
+            )
+            .await;
+
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1, "{case}: the result must still be posted");
+            assert_eq!(
+                requests[0].body["results"][0]["leaseId"], "2026-01-01T11:55:08.000Z",
+                "{case}: the lease must reach the endpoint"
+            );
+        }
+    }
 }
