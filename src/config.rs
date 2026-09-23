@@ -74,6 +74,12 @@ pub struct CampaignDeliverySettings {
     /// restricts this bridge to its internal-test segment.
     #[serde(default)]
     pub allow_unverified_consent: bool,
+    /// Seconds between opt-in roster uploads to divine-engagement.
+    ///
+    /// Zero disables the publisher. Deliberately separate from `enabled`: the
+    /// delivery poller and the roster uploader turn on independently.
+    #[serde(default = "default_roster_publish_interval")]
+    pub roster_publish_interval_secs: u64,
 }
 
 impl Default for CampaignDeliverySettings {
@@ -87,8 +93,13 @@ impl Default for CampaignDeliverySettings {
             batch_size: default_campaign_batch_size(),
             dedup_ttl_secs: default_campaign_dedup_ttl(),
             allow_unverified_consent: false,
+            roster_publish_interval_secs: default_roster_publish_interval(),
         }
     }
+}
+
+fn default_roster_publish_interval() -> u64 {
+    0
 }
 
 fn default_campaign_poll_interval() -> u64 {

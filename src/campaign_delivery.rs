@@ -219,7 +219,20 @@ fn is_expired(expires_at: Option<&str>, now: i64) -> bool {
     }
 }
 
-fn validate_api_base_url(raw: &str) -> Result<()> {
+/// Attach the Cloudflare Access service-token headers to an outbound request.
+///
+/// One definition so the roster publisher and the delivery pollers cannot drift
+/// on which header carries which credential.
+pub(crate) fn with_access_headers(
+    request: reqwest::RequestBuilder,
+    settings: &crate::config::CampaignDeliverySettings,
+) -> reqwest::RequestBuilder {
+    request
+        .header("CF-Access-Client-Id", &settings.access_client_id)
+        .header("CF-Access-Client-Secret", &settings.access_client_secret)
+}
+
+pub(crate) fn validate_api_base_url(raw: &str) -> Result<()> {
     let url = reqwest::Url::parse(raw).map_err(|e| {
         crate::error::ServiceError::Internal(format!("Invalid campaign API URL: {e}"))
     })?;
@@ -548,10 +561,7 @@ async fn report_result(
     // Taken before `result` moves into the request body below.
     let idempotency_key = result.idempotency_key.clone();
     let lease_id = result.lease_id.clone();
-    let reported = http
-        .post(&results_url)
-        .header("CF-Access-Client-Id", &settings.access_client_id)
-        .header("CF-Access-Client-Secret", &settings.access_client_secret)
+    let reported = with_access_headers(http.post(&results_url), settings)
         .json(&ResultsRequest {
             results: vec![result],
         })
@@ -642,10 +652,7 @@ async fn poll_once(state: &AppState, http: &reqwest::Client) -> Result<usize> {
     // more optimistic than the server's, by however long the GET and the
     // JSON decode took.
     let poll_started_at = Instant::now();
-    let response = http
-        .get(&pending_url)
-        .header("CF-Access-Client-Id", &settings.access_client_id)
-        .header("CF-Access-Client-Secret", &settings.access_client_secret)
+    let response = with_access_headers(http.get(&pending_url), settings)
         .send()
         .await
         .map_err(|e| {

@@ -102,3 +102,5 @@ campaign_delivery:
   # Staff-only bridge for an internal-test audience that opted in out of band.
   # Normal delivery verifies kind 3083 consent and registration timezone.
   allow_unverified_consent: false
+  # Opt-in roster upload to divine-engagement. Zero disables the publisher.
+  roster_publish_interval_secs: 900

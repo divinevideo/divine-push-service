@@ -15,6 +15,7 @@ pub mod models;
 pub mod nostr_listener;
 pub mod preferences;
 pub mod redis_store;
+pub mod roster_publisher;
 pub mod server;
 pub mod services;
 pub mod state;
