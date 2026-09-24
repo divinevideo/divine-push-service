@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .campaign_delivery
         .roster_publish_interval_secs
         > 0
-        && !app_state.settings.campaign_delivery.api_base_url.is_empty()
+        && roster_publisher::is_configured(&app_state.settings.campaign_delivery)
     {
         let state_roster = Arc::clone(&app_state);
         let token_roster = token.clone();

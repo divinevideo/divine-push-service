@@ -4,6 +4,7 @@
 //! who may be campaigned to without ever seeing a token. The direction matches
 //! campaign delivery: GKE reaches out to Cloudflare, never the reverse.
 
+use crate::config::CampaignDeliverySettings;
 use crate::{campaign_delivery, error::Result, preferences, redis_store, state::AppState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,31 +28,60 @@ pub(crate) fn build_roster(entries: Vec<(String, bool, usize)>) -> Vec<String> {
     roster
 }
 
+/// Whether the publisher has everything it needs to authenticate.
+///
+/// A configured API URL with empty Access credentials must not start the
+/// publisher: it would collect the full roster and send a request the Access
+/// edge rejects on every tick. The delivery poller guards the same way.
+pub fn is_configured(settings: &CampaignDeliverySettings) -> bool {
+    !settings.api_base_url.is_empty()
+        && !settings.access_client_id.is_empty()
+        && !settings.access_client_secret.is_empty()
+}
+
 /// Collect every registered pubkey that has campaign consent and a device.
+///
+/// One pubkey's consent or device read failing does not abort the snapshot: a
+/// single bad key would otherwise suppress the whole roster. The failure is
+/// logged and that pubkey is left out, so the upload is smaller, never wrong.
 pub async fn collect_opted_in(state: &AppState) -> Result<Vec<String>> {
     let mut entries = Vec::new();
     for pubkey in redis_store::all_registered_pubkeys(&state.redis_pool).await? {
-        let consented = preferences::campaign_consent_enabled(&state.redis_pool, &pubkey).await?;
-        let device_count = match nostr_sdk::PublicKey::from_hex(&pubkey) {
-            Ok(parsed) => redis_store::get_tokens_for_pubkey(&state.redis_pool, &parsed)
-                .await?
-                .len(),
-            Err(_) => 0,
-        };
-        entries.push((pubkey, consented, device_count));
+        match consent_and_device_count(state, &pubkey).await {
+            Ok((consented, device_count)) => entries.push((pubkey, consented, device_count)),
+            Err(e) => {
+                warn!(pubkey = %pubkey, error = %e, "Skipping a pubkey after a consent read failed.");
+            }
+        }
     }
     Ok(build_roster(entries))
 }
 
+async fn consent_and_device_count(state: &AppState, pubkey: &str) -> Result<(bool, usize)> {
+    let consented = preferences::campaign_consent_enabled(&state.redis_pool, pubkey).await?;
+    let device_count = match nostr_sdk::PublicKey::from_hex(pubkey) {
+        Ok(parsed) => redis_store::get_tokens_for_pubkey(&state.redis_pool, &parsed)
+            .await?
+            .len(),
+        Err(_) => 0,
+    };
+    Ok((consented, device_count))
+}
+
 /// Publish the opt-in roster to divine-engagement on a fixed interval.
 ///
-/// Returns immediately when the interval is zero or the API base URL is unset,
-/// so an unconfigured deployment is closed rather than failing on a timer.
+/// Returns immediately when the interval is zero or the deployment is not
+/// fully configured (missing API URL or Access credentials), so an
+/// unconfigured deployment is closed rather than failing on a timer.
 pub async fn run_roster_publisher(state: Arc<AppState>, token: CancellationToken) -> Result<()> {
     let settings = state.settings.campaign_delivery.clone();
 
-    if settings.roster_publish_interval_secs == 0 || settings.api_base_url.is_empty() {
+    if settings.roster_publish_interval_secs == 0 {
         info!("Opt-in roster publishing is disabled.");
+        return Ok(());
+    }
+    if !is_configured(&settings) {
+        error!("Opt-in roster publishing is enabled but not configured. Not publishing.");
         return Ok(());
     }
     if let Err(e) = campaign_delivery::validate_api_base_url(&settings.api_base_url) {
@@ -158,5 +188,41 @@ mod tests {
             (b.clone(), true, 1),
         ]);
         assert_eq!(roster, vec![a, b]);
+    }
+
+    #[test]
+    fn publisher_is_not_configured_without_access_credentials() {
+        let base = CampaignDeliverySettings {
+            api_base_url: "https://engagement.admin.divine.video".to_string(),
+            roster_publish_interval_secs: 900,
+            ..Default::default()
+        };
+
+        // No client id: the upload would send empty Access headers and be
+        // rejected on every tick.
+        assert!(!is_configured(&base));
+
+        let id_only = CampaignDeliverySettings {
+            access_client_id: "cf-id".to_string(),
+            ..base.clone()
+        };
+        assert!(!is_configured(&id_only));
+
+        let both = CampaignDeliverySettings {
+            access_client_secret: "cf-secret".to_string(),
+            ..id_only
+        };
+        assert!(is_configured(&both));
+    }
+
+    #[test]
+    fn publisher_is_not_configured_without_an_api_url() {
+        let settings = CampaignDeliverySettings {
+            access_client_id: "cf-id".to_string(),
+            access_client_secret: "cf-secret".to_string(),
+            roster_publish_interval_secs: 900,
+            ..Default::default()
+        };
+        assert!(!is_configured(&settings));
     }
 }
