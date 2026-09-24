@@ -41,18 +41,14 @@ pub fn is_configured(settings: &CampaignDeliverySettings) -> bool {
 
 /// Collect every registered pubkey that has campaign consent and a device.
 ///
-/// One pubkey's consent or device read failing does not abort the snapshot: a
-/// single bad key would otherwise suppress the whole roster. The failure is
-/// logged and that pubkey is left out, so the upload is smaller, never wrong.
+/// Any consent or device read failure aborts the snapshot. The receiver replaces
+/// its roster wholesale, so uploading a partial result could remove opted-in
+/// people until a later successful publish.
 pub async fn collect_opted_in(state: &AppState) -> Result<Vec<String>> {
     let mut entries = Vec::new();
     for pubkey in redis_store::all_registered_pubkeys(&state.redis_pool).await? {
-        match consent_and_device_count(state, &pubkey).await {
-            Ok((consented, device_count)) => entries.push((pubkey, consented, device_count)),
-            Err(e) => {
-                warn!(pubkey = %pubkey, error = %e, "Skipping a pubkey after a consent read failed.");
-            }
-        }
+        let (consented, device_count) = consent_and_device_count(state, &pubkey).await?;
+        entries.push((pubkey, consented, device_count));
     }
     Ok(build_roster(entries))
 }
