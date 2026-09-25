@@ -26,10 +26,15 @@ const STALE_TOKENS_ZSET: &str = "stale_tokens";
 const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
 const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
+const USER_TOKENS_PREFIX: &str = "user_tokens:";
+
+/// Keys Redis returns per `SCAN` call. A per-call work bound, not a total cap:
+/// the cursor loop still reaches every key.
+const USER_TOKENS_SCAN_COUNT: usize = 1000;
 
 /// Build key for user tokens set
 fn build_user_tokens_key(pubkey: &PublicKey) -> String {
-    format!("user_tokens:{}", pubkey.to_hex())
+    format!("{}{}", USER_TOKENS_PREFIX, pubkey.to_hex())
 }
 
 /// Creates a new Redis connection pool.
@@ -87,6 +92,57 @@ pub async fn get_tokens_with_timezone_offsets(
         .map_err(ServiceError::Redis)?;
 
     Ok(tokens.into_iter().zip(offsets).collect())
+}
+
+/// Every pubkey that has at least one registered device token.
+///
+/// Bounded `SCAN` over the `user_tokens:*` keyspace, never `KEYS`: a single call
+/// must not stall Redis for every other user while the roster publisher walks
+/// the whole database on a timer. Unparseable keys are skipped with a warning
+/// rather than failing the collection, so one corrupt entry cannot hide the
+/// whole roster.
+pub async fn all_registered_pubkeys(pool: &RedisPool) -> Result<Vec<String>> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {}", e)))?;
+
+    let mut cursor: u64 = 0;
+    let mut pubkeys = HashSet::new();
+    loop {
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(format!("{}*", USER_TOKENS_PREFIX))
+            .arg("COUNT")
+            .arg(USER_TOKENS_SCAN_COUNT)
+            .query_async(&mut *conn)
+            .await
+            .map_err(ServiceError::Redis)?;
+
+        for key in keys {
+            let Some(pubkey_hex) = key.strip_prefix(USER_TOKENS_PREFIX) else {
+                continue;
+            };
+            match PublicKey::from_hex(pubkey_hex) {
+                Ok(pubkey) => {
+                    pubkeys.insert(pubkey.to_hex());
+                }
+                Err(e) => tracing::warn!(
+                    key = %key,
+                    error = %e,
+                    "Skipping unparseable user_tokens key"
+                ),
+            }
+        }
+
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    Ok(pubkeys.into_iter().collect())
 }
 
 /// Adds or updates a single device token for a pubkey

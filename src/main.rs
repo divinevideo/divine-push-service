@@ -16,6 +16,7 @@ use divine_push_service::event_handler;
 use divine_push_service::health::{CriticalTask, OnReturn, TaskHealth, TaskTracker};
 use divine_push_service::metrics;
 use divine_push_service::nostr_listener;
+use divine_push_service::roster_publisher;
 use divine_push_service::server::run_server;
 use divine_push_service::state;
 
@@ -142,6 +143,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::error!(error = %e, "Campaign delivery service exited with error");
         }
     });
+
+    // Start opt-in roster publishing, only when it can actually reach
+    // divine-engagement. Not a `CriticalTask`, for the same reason as campaign
+    // delivery: it is off by default and returns immediately when disabled.
+    if app_state
+        .settings
+        .campaign_delivery
+        .roster_publish_interval_secs
+        > 0
+        && roster_publisher::is_configured(&app_state.settings.campaign_delivery)
+    {
+        let state_roster = Arc::clone(&app_state);
+        let token_roster = token.clone();
+        tracker.spawn("roster_publisher", None, OnReturn::Tolerated, async move {
+            if let Err(e) = roster_publisher::run_roster_publisher(state_roster, token_roster).await
+            {
+                tracing::error!(error = %e, "Opt-in roster publisher exited with error");
+            }
+        });
+        tracing::info!("Opt-in roster publisher started");
+    }
 
     // Start cleanup service
     let state_cleanup = Arc::clone(&app_state);
