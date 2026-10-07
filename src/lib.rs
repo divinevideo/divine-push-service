@@ -1,5 +1,10 @@
 //! diVine Push Service Library Crate
 
+// Clippy's `double_must_use` fires on `#[async_trait]` trait methods that return
+// `Result`, attributing a `#[must_use]` to the macro-expanded method. There is
+// no `#[must_use]` in the source to remove, so allow the lint crate-wide.
+#![allow(clippy::double_must_use)]
+
 // Declare modules as public to be accessible from the binary crate and integration tests
 pub mod campaign_delivery;
 pub mod cleanup_service;
