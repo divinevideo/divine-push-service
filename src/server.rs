@@ -23,6 +23,10 @@ use crate::state::AppState;
 
 #[async_trait]
 trait DirectMessageDelivery: Send + Sync {
+    #[allow(
+        clippy::double_must_use,
+        reason = "async_trait adds must_use to the generated future-returning method"
+    )]
     async fn deliver(&self, event_id: EventId, recipient: PublicKey) -> Result<()>;
 }
 

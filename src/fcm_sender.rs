@@ -231,6 +231,10 @@ fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> FcmErr
 // Define the trait for sending FCM messages
 #[async_trait]
 pub trait FcmSend: Send + Sync {
+    #[allow(
+        clippy::double_must_use,
+        reason = "async_trait adds must_use to the generated future-returning method"
+    )]
     async fn send_single(
         &self,
         token: &str,

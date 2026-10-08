@@ -512,6 +512,10 @@ impl NostrListener {
 
 #[async_trait]
 trait SubscriptionRecovery: Send + Sync {
+    #[allow(
+        clippy::double_must_use,
+        reason = "async_trait adds must_use to the generated future-returning method"
+    )]
     async fn resubscribe(&self, since: Timestamp, token: &CancellationToken) -> Result<bool>;
 }
 
