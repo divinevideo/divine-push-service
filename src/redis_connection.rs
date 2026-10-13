@@ -10,9 +10,14 @@
 //! primary. Rejecting a replica in `connect` as well puts reconnects behind
 //! bb8's retry backoff while the URL still resolves to the demoted node,
 //! instead of a tight connect-and-reject loop.
+//!
+//! The role check cannot run when the server refuses `ROLE`, and it only runs
+//! between checkouts. Pooled connections therefore also watch their replies:
+//! one that sees a `READONLY` error reports itself broken, and bb8 drops it
+//! when it returns to the pool instead of handing it out again.
 
-use redis::aio::MultiplexedConnection;
-use redis::{Client, ErrorKind, IntoConnectionInfo, RedisError, Value};
+use redis::aio::{ConnectionLike, MultiplexedConnection};
+use redis::{Client, Cmd, ErrorKind, IntoConnectionInfo, Pipeline, RedisError, RedisFuture, Value};
 use tracing::warn;
 
 /// A `bb8::ManageConnection` that rejects connections to a Redis replica.
@@ -31,21 +36,80 @@ impl PrimaryConnectionManager {
 }
 
 impl bb8_redis::bb8::ManageConnection for PrimaryConnectionManager {
-    type Connection = MultiplexedConnection;
+    type Connection = PrimaryConnection;
     type Error = RedisError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
         let mut conn = self.client.get_multiplexed_async_connection().await?;
         ensure_primary(&mut conn).await?;
-        Ok(conn)
+        Ok(PrimaryConnection {
+            inner: conn,
+            saw_read_only: false,
+        })
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        ensure_primary(conn).await
+        ensure_primary(&mut conn.inner).await
     }
 
-    fn has_broken(&self, _: &mut Self::Connection) -> bool {
-        false
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        if conn.saw_read_only {
+            warn!("Dropping pooled Redis connection that received a READONLY reply");
+        }
+        conn.saw_read_only
+    }
+}
+
+/// A pooled Redis connection that remembers whether a reply was `READONLY`.
+pub struct PrimaryConnection {
+    inner: MultiplexedConnection,
+    saw_read_only: bool,
+}
+
+impl ConnectionLike for PrimaryConnection {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        Box::pin(async move {
+            let result = self.inner.req_packed_command(cmd).await;
+            self.saw_read_only |= match &result {
+                Ok(value) => value_is_read_only(value),
+                Err(e) => error_is_read_only(e),
+            };
+            result
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            let result = self.inner.req_packed_commands(cmd, offset, count).await;
+            self.saw_read_only |= match &result {
+                Ok(values) => values.iter().any(value_is_read_only),
+                Err(e) => error_is_read_only(e),
+            };
+            result
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.inner.get_db()
+    }
+}
+
+fn error_is_read_only(e: &RedisError) -> bool {
+    e.kind() == ErrorKind::ReadOnly || e.code() == Some("READONLY")
+}
+
+/// Finds a `READONLY` error anywhere in a reply, including inside a pipeline
+/// or `EXEC` result, where errors arrive as values rather than as `Err`.
+fn value_is_read_only(value: &Value) -> bool {
+    match value {
+        Value::ServerError(e) => e.code() == "READONLY",
+        Value::Array(items) => items.iter().any(value_is_read_only),
+        _ => false,
     }
 }
 
@@ -121,6 +185,28 @@ mod tests {
     #[test]
     fn sentinel_role_is_rejected() {
         assert!(check_role(&role_reply("sentinel")).is_err());
+    }
+
+    #[test]
+    fn read_only_reply_is_detected_anywhere_in_a_reply() {
+        let read_only = || {
+            redis::parse_redis_value(b"-READONLY You can't write against a read only replica.\r\n")
+                .unwrap()
+        };
+        assert!(value_is_read_only(&read_only()));
+        assert!(value_is_read_only(&Value::Array(vec![
+            Value::Okay,
+            Value::Array(vec![read_only()]),
+        ])));
+        assert!(!value_is_read_only(&Value::Okay));
+        assert!(error_is_read_only(&RedisError::from((
+            ErrorKind::ReadOnly,
+            "READONLY"
+        ))));
+        assert!(!error_is_read_only(&RedisError::from((
+            ErrorKind::ResponseError,
+            "ERR"
+        ))));
     }
 
     #[test]

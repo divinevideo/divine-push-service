@@ -113,7 +113,7 @@ cargo clippy --all-targets --all-features
 cargo fmt --all -- --check
 ```
 
-`tests/redis_failover_test.rs` demotes and re-promotes its Redis server with `REPLICAOF`, so it runs only when `REDIS_FAILOVER_TEST_URL` points at a dedicated instance (for example `redis-server --port 6390` and `REDIS_FAILOVER_TEST_URL=redis://127.0.0.1:6390`).
+`tests/redis_failover_test.rs` demotes and re-promotes its Redis server with `REPLICAOF` and adds a temporary ACL user, so it runs only when `REDIS_FAILOVER_TEST_URL` points at a dedicated instance (for example `redis-server --port 6390` and `REDIS_FAILOVER_TEST_URL=redis://127.0.0.1:6390`).
 
 ## Configuration
 
@@ -142,7 +142,7 @@ Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nes
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `NOSTR_PUSH__SERVICE__PRIVATE_KEY_HEX` | Yes | Service's Nostr private key (hex), used for NIP-44 decryption |
-| `NOSTR_PUSH__REDIS__URL` | No | Redis connection URL (overrides the config file). Must reach the current primary: pooled connections check `ROLE` and are dropped when the node is a replica, so after a failover the pool reconnects through this URL |
+| `NOSTR_PUSH__REDIS__URL` | No | Redis connection URL (overrides the config file). Must reach the current primary. After a failover the pool reconnects through this URL: a pooled connection is dropped when `ROLE` reports a replica, or after any reply on it is `READONLY` |
 | `NOSTR_PUSH__NOSTR__RELAY_URL` | No | Nostr relay to subscribe to |
 | `NOSTR_PUSH__NOSTR__EVENT_SILENCE_TIMEOUT_SECS` | No | Quiet period before the listener resubscribes, and the window after any resubscribe before it fails health (default `300`) |
 | `NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN` | No | Shared bearer token that enables authenticated internal push requests |
