@@ -141,3 +141,42 @@ async fn connection_that_hit_readonly_is_dropped_when_role_is_refused() {
     );
     after_promotion.unwrap();
 }
+
+async fn connections_received(admin: &mut MultiplexedConnection) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("stats")
+        .query_async(admin)
+        .await
+        .unwrap();
+    info.lines()
+        .find_map(|line| line.strip_prefix("total_connections_received:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap()
+}
+
+/// A replica must be rejected when the connection is opened, not only at
+/// checkout, so reconnects wait on the pool's backoff. Rejecting only at
+/// checkout reconnects in a tight loop for the whole connection timeout.
+#[tokio::test]
+async fn replica_is_rejected_on_connect_without_a_reconnect_storm() {
+    let Some(url) = failover_url() else { return };
+    let _server = SERVER.lock().await;
+    let mut admin = admin(&url).await;
+    let pool = pool(&url).await;
+
+    demote(&mut admin).await;
+    let before = connections_received(&mut admin).await;
+    let while_replica = pool.get().await.map(|_| ());
+    let opened = connections_received(&mut admin).await - before;
+    promote(&mut admin).await;
+
+    assert!(
+        while_replica.is_err(),
+        "checkout handed out a connection to a replica"
+    );
+    assert!(
+        opened < 100,
+        "one checkout opened {opened} connections to the replica"
+    );
+    set(&mut *pool.get().await.unwrap()).await.unwrap();
+}
