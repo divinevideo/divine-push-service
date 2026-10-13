@@ -8,8 +8,8 @@
 //! - User preferences (handled by preferences module)
 
 use crate::error::{Result, ServiceError};
+use crate::redis_connection::PrimaryConnectionManager;
 use bb8_redis::bb8::Pool;
-use bb8_redis::RedisConnectionManager;
 use nostr_sdk::{EventId, PublicKey, Timestamp};
 use redis::{RedisResult, Script, Value};
 use std::collections::HashSet;
@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 // Type alias for the connection pool
-pub type RedisPool = Pool<RedisConnectionManager>;
+pub type RedisPool = Pool<PrimaryConnectionManager>;
 
 // Redis key constants
 const STALE_TOKENS_ZSET: &str = "stale_tokens";
@@ -39,7 +39,7 @@ fn build_user_tokens_key(pubkey: &PublicKey) -> String {
 
 /// Creates a new Redis connection pool.
 pub async fn create_pool(redis_url: &str, pool_size: u32) -> Result<RedisPool> {
-    let manager = RedisConnectionManager::new(redis_url).map_err(ServiceError::Redis)?;
+    let manager = PrimaryConnectionManager::new(redis_url).map_err(ServiceError::Redis)?;
     Pool::builder()
         .max_size(pool_size)
         .connection_timeout(Duration::from_secs(15))
