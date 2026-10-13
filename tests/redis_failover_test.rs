@@ -2,7 +2,7 @@
 //! instance: set `REDIS_FAILOVER_TEST_URL` (for example `redis://127.0.0.1:6390`)
 //! to run them.
 
-use bb8_redis::bb8::Pool;
+use bb8_redis::bb8::{Pool, RunError};
 use divine_push_service::redis_connection::PrimaryConnectionManager;
 use redis::aio::MultiplexedConnection;
 use std::sync::LazyLock;
@@ -66,6 +66,15 @@ async fn set(conn: &mut impl redis::aio::ConnectionLike) -> redis::RedisResult<(
         .await
 }
 
+/// Returns a failed checkout instead of panicking, so the caller can restore
+/// the server before it asserts.
+async fn checkout_and_set(
+    pool: &Pool<PrimaryConnectionManager>,
+) -> Result<redis::RedisResult<()>, RunError<redis::RedisError>> {
+    let mut conn = pool.get().await?;
+    Ok(set(&mut *conn).await)
+}
+
 #[tokio::test]
 async fn pooled_connection_to_demoted_primary_is_not_handed_out() {
     let Some(url) = failover_url() else { return };
@@ -115,16 +124,10 @@ async fn connection_that_hit_readonly_is_dropped_when_role_is_refused() {
     set(&mut *pool.get().await.unwrap()).await.unwrap();
 
     demote(&mut admin).await;
-    let write_while_replica = match pool.get().await {
-        Ok(mut conn) => set(&mut *conn).await,
-        Err(e) => panic!("checkout failed with ROLE refused: {e}"),
-    };
+    let write_while_replica = checkout_and_set(&pool).await;
     let pooled_after_readonly = pool.state().connections;
     promote(&mut admin).await;
-    let after_promotion = match pool.get().await {
-        Ok(mut conn) => set(&mut *conn).await,
-        Err(e) => panic!("checkout failed after promotion: {e}"),
-    };
+    let after_promotion = checkout_and_set(&pool).await;
     redis::cmd("ACL")
         .arg(&["DELUSER", ROLELESS_USER])
         .query_async::<()>(&mut admin)
@@ -132,14 +135,19 @@ async fn connection_that_hit_readonly_is_dropped_when_role_is_refused() {
         .unwrap();
 
     assert_eq!(
-        write_while_replica.unwrap_err().kind(),
+        write_while_replica
+            .expect("checkout failed with ROLE refused")
+            .unwrap_err()
+            .kind(),
         redis::ErrorKind::ReadOnly
     );
     assert_eq!(
         pooled_after_readonly, 0,
         "connection that hit READONLY went back into the pool"
     );
-    after_promotion.unwrap();
+    after_promotion
+        .expect("checkout failed after promotion")
+        .unwrap();
 }
 
 async fn connections_received(admin: &mut MultiplexedConnection) -> u64 {
