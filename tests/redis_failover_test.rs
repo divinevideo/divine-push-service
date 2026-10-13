@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-/// Both tests reconfigure the same server, so they must not overlap.
+/// Every test here reconfigures the same server, so they must not overlap.
 static SERVER: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const ROLELESS_USER: &str = "failover_test_no_role";
