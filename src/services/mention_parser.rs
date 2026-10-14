@@ -5,8 +5,7 @@
 //! readable names for push notification display.
 
 use crate::error::{Result, ServiceError};
-use bb8_redis::bb8::Pool;
-use bb8_redis::RedisConnectionManager;
+use crate::redis_store::RedisPool;
 use nostr_sdk::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -56,18 +55,14 @@ pub fn npub_to_pubkey(npub: &str) -> Result<String> {
 
 /// Service for profile fetching with Redis caching.
 pub struct MentionParserService {
-    redis_pool: Pool<RedisConnectionManager>,
+    redis_pool: RedisPool,
     nostr_client: Arc<Client>,
     cache_ttl_secs: u64,
 }
 
 impl MentionParserService {
     /// Create service with Nostr client and cache TTL.
-    pub fn new(
-        redis_pool: Pool<RedisConnectionManager>,
-        nostr_client: Arc<Client>,
-        cache_ttl_secs: u64,
-    ) -> Self {
+    pub fn new(redis_pool: RedisPool, nostr_client: Arc<Client>, cache_ttl_secs: u64) -> Self {
         Self {
             redis_pool,
             nostr_client,
