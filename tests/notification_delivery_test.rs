@@ -150,3 +150,58 @@ async fn quiet_device_does_not_silence_awake_or_legacy_devices() {
             .unwrap();
     }
 }
+
+#[tokio::test]
+async fn named_registration_overrides_offset_and_is_removed_with_token() {
+    use divine_push_service::redis_store::{
+        add_or_update_token_with_timezone_name, get_tokens_with_timezone_offsets,
+        timezone_offset_at,
+    };
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let pool = redis_store::create_pool(&url, 5).await.unwrap();
+    let recipient = Keys::generate().public_key();
+    let token = format!("synthetic-zone-{}", recipient.to_hex());
+    add_or_update_token_with_timezone_name(
+        &pool,
+        &recipient,
+        &token,
+        Some(0),
+        Some("Pacific/Auckland"),
+    )
+    .await
+    .unwrap();
+    let devices = get_tokens_with_timezone_offsets(&pool, &recipient)
+        .await
+        .unwrap();
+    assert_eq!(
+        devices[0].1,
+        timezone_offset_at("Pacific/Auckland", chrono::Utc::now().timestamp())
+    );
+    add_or_update_token_with_timezone_name(
+        &pool,
+        &recipient,
+        &token,
+        Some(120),
+        Some("invalid-zone"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        get_tokens_with_timezone_offsets(&pool, &recipient)
+            .await
+            .unwrap()[0]
+            .1,
+        Some(120)
+    );
+    redis_store::remove_token(&pool, &recipient, &token)
+        .await
+        .unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let name: Option<String> = redis::cmd("HGET")
+        .arg("token_timezone_names")
+        .arg(token)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(name.is_none());
+}
