@@ -319,8 +319,7 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         warn!(
             event_id = %event.id,
             pubkey = %event.pubkey,
-            "Ignoring an out-of-range timezone offset; campaign delivery stays \
-             suppressed for this device"
+            "Ignoring an out-of-range optional timezone offset"
         );
     }
 
