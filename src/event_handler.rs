@@ -1739,7 +1739,7 @@ async fn send_notification_trigger_to_user(
         info!(
             event_id = %event_id,
             target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
-            "No FCM tokens registered for recipient - skipping notification"
+            "No eligible FCM tokens for recipient (unregistered or quiet) - skipping notification"
         );
         return Ok(());
     }
@@ -1999,6 +1999,17 @@ async fn send_notification_trigger_to_user(
         Ok::<_, crate::error::ServiceError>(eligible)
     }
     .await;
+    // Ingest charged the like/repost emission window before these final
+    // policy gates. A push suppressed before FCM must not occupy that window.
+    if collapse_key.is_some() && matches!(&preflight, Ok(tokens) if tokens.is_empty()) {
+        coalesce::refund_recipient_token(
+            &state.redis_pool,
+            &pubkey_hex,
+            &event_id.to_hex(),
+            &state.settings.service,
+        )
+        .await?;
+    }
     let tokens = match preflight {
         Ok(tokens) if tokens.is_empty() => return Ok(()),
         Ok(tokens) => tokens,
@@ -5733,6 +5744,70 @@ mod tests {
     /// summary sharing their collapse key. iOS replaces the earlier banner from
     /// that key; Android banner replacement depends on the client (see the
     /// plan's accepted losses), so this asserts the wire contract only.
+    #[tokio::test]
+    async fn frequency_capped_like_refunds_its_coalescing_charge() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.delivery.hourly_cap = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let device = format!("capped-like-{}", owner.to_hex());
+        redis_store::add_or_update_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+        assert!(crate::notification_delivery::reserve_budget(
+            &pool,
+            &owner,
+            "event:earlier-comment",
+            &settings.service.delivery,
+        )
+        .await
+        .unwrap());
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let like = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::event(test_event_id(987)))
+            .tag(Tag::public_key(owner))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &like,
+            &owner,
+            NotificationType::Like,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(mock.get_sent_messages().is_empty());
+        let mut conn = pool.get().await.unwrap();
+        let emitted: u64 = redis::cmd("ZCARD")
+            .arg(format!("{}{}", coalesce::EMITTED_PREFIX, owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(emitted, 0, "a capped like emitted no notification");
+        let remaining: f64 = redis::cmd("HGET")
+            .arg(format!("{}{}", coalesce::THROTTLE_PREFIX, owner.to_hex()))
+            .arg("tokens")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 100.0);
+        drop(conn);
+        redis_store::remove_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn like_bursts_coalesce_after_the_immediate_limit() {
         let _guard = crate::coalesce::test_lock().lock().await;
