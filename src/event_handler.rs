@@ -310,11 +310,8 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         return Ok(());
     }
 
-    // The offset is optional and only campaign delivery reads it. An
-    // out-of-range value is treated as absent rather than as a reason to drop
-    // the registration: returning here would silence every social push for a
-    // field that social delivery never consults, and campaign delivery already
-    // suppresses a device with no valid offset.
+    // An invalid optional timezone must not drop the registration. Legacy
+    // social delivery remains available without it; campaigns still require it.
     let timezone_offset_minutes = token_payload
         .timezone_offset_minutes
         .filter(|offset| (-720..=840).contains(offset));
@@ -327,11 +324,12 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         );
     }
 
-    match redis_store::add_or_update_token_with_timezone(
+    match redis_store::add_or_update_token_with_timezone_name(
         &state.redis_pool,
         &event.pubkey,
         fcm_token,
         timezone_offset_minutes,
+        token_payload.timezone.as_deref(),
     )
     .await
     {
@@ -1701,6 +1699,16 @@ async fn send_notification_trigger_to_user(
 ) -> Result<()> {
     let event_id = trigger.event_id();
     let pubkey_hex = target_pubkey.to_hex();
+    if let Some(event) = trigger.nostr_event() {
+        if Timestamp::now()
+            .as_secs()
+            .saturating_sub(event.created_at.as_secs())
+            > state.settings.service.delivery.max_event_age_secs
+        {
+            crate::notification_delivery::outcome("expired");
+            return Ok(());
+        }
+    }
 
     // Check pubkey allowlist (for non-production environments)
     let allowed = &state.settings.service.allowed_pubkeys;
@@ -1720,7 +1728,9 @@ async fn send_notification_trigger_to_user(
             info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while fetching tokens.");
             return Err(crate::error::ServiceError::Cancelled);
         }
-        res = redis_store::get_tokens_for_pubkey(&state.redis_pool, target_pubkey) => {
+        res = crate::notification_delivery::social_tokens(
+            &state.redis_pool, target_pubkey, &state.settings.service.delivery,
+        ) => {
             res?
         }
     };
@@ -1951,7 +1961,7 @@ async fn send_notification_trigger_to_user(
     };
 
     // Create FCM payload
-    let payload = match trigger.nostr_event() {
+    let mut payload = match trigger.nostr_event() {
         Some(event) => create_fcm_payload(
             event,
             target_pubkey,
@@ -1961,6 +1971,43 @@ async fn send_notification_trigger_to_user(
         ),
         None => create_direct_message_payload(event_id, target_pubkey),
     };
+
+    let preflight = async {
+        let awake = crate::notification_delivery::social_tokens(
+            &state.redis_pool,
+            target_pubkey,
+            &state.settings.service.delivery,
+        )
+        .await?;
+        let eligible: Vec<String> = tokens
+            .into_iter()
+            .filter(|token| awake.contains(token))
+            .collect();
+        if eligible.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !crate::notification_delivery::reserve_budget(
+            &state.redis_pool,
+            target_pubkey,
+            &format!("event:{event_id}"),
+            &state.settings.service.delivery,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        Ok::<_, crate::error::ServiceError>(eligible)
+    }
+    .await;
+    let tokens = match preflight {
+        Ok(tokens) if tokens.is_empty() => return Ok(()),
+        Ok(tokens) => tokens,
+        Err(error) => {
+            redis_store::release_recipient_event_claim(&state.redis_pool, &recipient_claim).await?;
+            return Err(error);
+        }
+    };
+    crate::notification_delivery::immediate_delivery(&mut payload);
 
     // Send to all tokens
     info!(

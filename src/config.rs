@@ -148,6 +148,9 @@ fn default_query_timeout() -> u64 {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServiceSettings {
+    /// Shared limits applied to social, summary, and campaign sends.
+    #[serde(default)]
+    pub delivery: crate::notification_delivery::DeliverySettings,
     pub private_key_hex: Option<String>,
     #[serde(default = "default_process_window_days")]
     pub process_window_days: i64,
@@ -317,9 +320,8 @@ fn default_coalesce_window() -> u64 {
 }
 
 fn default_coalesce_immediate_limit() -> u64 {
-    // The first three interactions on a post still feel immediate; beyond that
-    // the summary is the notification.
-    3
+    // The first interaction is immediate; the rest are summarized.
+    1
 }
 
 fn default_coalesce_lease() -> u64 {
@@ -548,6 +550,18 @@ impl Settings {
     /// `NOSTR_PUSH__SERVICE__ALLOWED_PUBKEYS` that way, so the same mechanism
     /// reaches every field below.
     fn validate(&self) -> Result<(), ConfigError> {
+        let delivery = &self.service.delivery;
+        if delivery.quiet_start_hour > 23
+            || delivery.quiet_end_hour > 23
+            || delivery.quiet_start_hour == delivery.quiet_end_hour
+            || delivery.hourly_cap == 0
+            || delivery.daily_cap == 0
+            || delivery.max_event_age_secs == 0
+        {
+            return Err(ConfigError::Message(
+                "service.delivery requires distinct hours in 0..23 and positive caps/age".into(),
+            ));
+        }
         let must_be_positive: [(&str, u64, &str); 24] = [
             (
                 "nostr.event_silence_timeout_secs",
@@ -990,7 +1004,7 @@ mod tests {
 
             let settings = load_runtime_settings(filename);
             assert_eq!(settings.service.coalesce_window_secs, 7200);
-            assert_eq!(settings.service.coalesce_immediate_limit, 3);
+            assert_eq!(settings.service.coalesce_immediate_limit, 1);
             assert_eq!(settings.service.coalesce_lease_secs, 300);
             assert_eq!(settings.service.coalesce_retry_secs, 5);
             assert_eq!(settings.service.coalesce_poll_millis, 250);

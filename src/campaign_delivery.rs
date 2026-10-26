@@ -258,20 +258,19 @@ pub(crate) fn validate_api_base_url(raw: &str) -> Result<()> {
 /// RFC 3339 rendering would use. `divine-engagement` validates `retryAfter`
 /// with zod's `z.iso.datetime()`, which accepts only the UTC designator, and
 /// rejects the whole results batch when one field fails.
-fn quiet_hours_retry_after(timezone_offset_minutes: i32, now: i64) -> Option<String> {
+fn quiet_hours_retry_after(
+    timezone_offset_minutes: i32,
+    now: i64,
+    settings: &crate::notification_delivery::DeliverySettings,
+) -> Option<String> {
     let local_seconds = now + i64::from(timezone_offset_minutes) * 60;
     let seconds_today = local_seconds.rem_euclid(86_400);
-    let hour = seconds_today / 3_600;
-    if (7..21).contains(&hour) {
+    if !crate::notification_delivery::in_quiet_hours(timezone_offset_minutes, now, settings) {
         return None;
     }
 
-    let until_seven = if hour < 7 {
-        7 * 3_600 - seconds_today
-    } else {
-        86_400 - seconds_today + 7 * 3_600
-    };
-    chrono::DateTime::from_timestamp(now + until_seven, 0)
+    let until_end = (i64::from(settings.quiet_end_hour) * 3600 - seconds_today).rem_euclid(86400);
+    chrono::DateTime::from_timestamp(now + until_end, 0)
         .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
@@ -421,7 +420,9 @@ async fn deliver(
             timezone_unknown = true;
             continue;
         };
-        if let Some(retry_after) = quiet_hours_retry_after(offset, now) {
+        if let Some(retry_after) =
+            quiet_hours_retry_after(offset, now, &state.settings.service.delivery)
+        {
             if earliest_retry_after
                 .as_ref()
                 .is_none_or(|current| retry_after < *current)
@@ -454,7 +455,29 @@ async fn deliver(
         );
     }
 
-    let payload = campaign_payload(delivery, &recipient);
+    match crate::notification_delivery::reserve_budget(
+        &state.redis_pool,
+        &recipient,
+        &format!("campaign:{}", delivery.idempotency_key),
+        &state.settings.service.delivery,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::Suppressed, "recipient_frequency_capped");
+        }
+        Err(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(
+                DeliveryStatus::RetryableFailure,
+                "frequency_budget_unavailable",
+            );
+        }
+    }
+    let mut payload = campaign_payload(delivery, &recipient);
+    crate::notification_delivery::immediate_delivery(&mut payload);
     let outcomes = state.fcm_client.send_batch(&tokens, payload).await;
 
     let mut delivered_tokens = Vec::new();
@@ -1066,16 +1089,33 @@ mod tests {
         let noon_utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
             .unwrap()
             .timestamp();
-        assert_eq!(quiet_hours_retry_after(0, noon_utc), None);
+        assert_eq!(
+            quiet_hours_retry_after(
+                0,
+                noon_utc,
+                &crate::notification_delivery::DeliverySettings::default()
+            ),
+            None
+        );
 
         // `Z`, not `+00:00`: divine-engagement parses retryAfter with zod's
         // `z.iso.datetime()`, which rejects an offset-form UTC timestamp and
         // then rejects the entire results batch.
-        let retry = quiet_hours_retry_after(600, noon_utc).expect("22:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T21:00:00Z");
+        let retry = quiet_hours_retry_after(
+            600,
+            noon_utc,
+            &crate::notification_delivery::DeliverySettings::default(),
+        )
+        .expect("22:00 local is quiet");
+        assert_eq!(retry, "2026-01-01T22:00:00Z");
 
-        let retry = quiet_hours_retry_after(-480, noon_utc).expect("04:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T15:00:00Z");
+        let retry = quiet_hours_retry_after(
+            -480,
+            noon_utc,
+            &crate::notification_delivery::DeliverySettings::default(),
+        )
+        .expect("04:00 local is quiet");
+        assert_eq!(retry, "2026-01-01T16:00:00Z");
     }
 
     #[test]
@@ -1086,8 +1126,20 @@ mod tests {
         let at_twenty_one = chrono::DateTime::parse_from_rfc3339("2026-01-01T21:00:00Z")
             .unwrap()
             .timestamp();
-        assert_eq!(quiet_hours_retry_after(0, at_seven), None);
-        assert!(quiet_hours_retry_after(0, at_twenty_one).is_some());
+        assert!(quiet_hours_retry_after(
+            0,
+            at_seven,
+            &crate::notification_delivery::DeliverySettings::default()
+        )
+        .is_some());
+        assert_eq!(
+            quiet_hours_retry_after(
+                0,
+                at_twenty_one,
+                &crate::notification_delivery::DeliverySettings::default()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1759,7 +1811,7 @@ mod tests {
         let result = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Deferred);
         assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
-        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T21:00:00Z"));
+        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T22:00:00Z"));
         assert_eq!(
             claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
             -2,

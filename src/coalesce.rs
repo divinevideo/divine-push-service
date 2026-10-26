@@ -1199,7 +1199,12 @@ pub(crate) async fn flush_group(
         });
     }
 
-    let tokens = redis_store::get_tokens_for_pubkey(&state.redis_pool, &owner).await?;
+    let tokens = crate::notification_delivery::social_tokens(
+        &state.redis_pool,
+        &owner,
+        &state.settings.service.delivery,
+    )
+    .await?;
     if tokens.is_empty() {
         complete_group(&state.redis_pool, claim, None).await?;
         crate::metrics::coalesce_skipped("no_tokens", 1);
@@ -1285,6 +1290,21 @@ pub(crate) async fn flush_group(
             .await;
     }
 
+    if !crate::notification_delivery::reserve_budget(
+        &state.redis_pool,
+        &owner,
+        &format!("summary:{}", claim.group_id),
+        &state.settings.service.delivery,
+    )
+    .await?
+    {
+        complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("frequency_capped", 1);
+        return Ok(FlushOutcome::Suppressed {
+            reason: "frequency_capped",
+        });
+    }
+
     let sample_name = match (&state.mention_parser_service, &snapshot.first_actor) {
         (Some(parser), Some(actor)) => match parser.get_display_name(actor).await {
             Ok(Some(name)) => name,
@@ -1299,7 +1319,8 @@ pub(crate) async fn flush_group(
     };
 
     let collapse_key = collapse_key_for_group(&claim.group_id);
-    let payload = build_summary_payload(&snapshot, &owner, &sample_name, &collapse_key);
+    let mut payload = build_summary_payload(&snapshot, &owner, &sample_name, &collapse_key);
+    crate::notification_delivery::immediate_delivery(&mut payload);
 
     info!(
         group_id = %claim.group_id,
@@ -1310,6 +1331,23 @@ pub(crate) async fn flush_group(
         "Flushing coalesced notification group"
     );
 
+    let awake = crate::notification_delivery::social_tokens(
+        &state.redis_pool,
+        &owner,
+        &state.settings.service.delivery,
+    )
+    .await?;
+    let tokens: Vec<String> = tokens
+        .into_iter()
+        .filter(|token| awake.contains(token))
+        .collect();
+    if tokens.is_empty() {
+        complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("quiet_hours", 1);
+        return Ok(FlushOutcome::Suppressed {
+            reason: "quiet_hours",
+        });
+    }
     let results = state.fcm_client.send_batch(&tokens, payload).await;
 
     let mut delivered = Vec::new();

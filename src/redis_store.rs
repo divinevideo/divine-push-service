@@ -24,6 +24,7 @@ pub type RedisPool = Pool<PrimaryConnectionManager>;
 // Redis key constants
 const STALE_TOKENS_ZSET: &str = "stale_tokens";
 const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
+const TOKEN_TIMEZONE_NAMES_HASH: &str = "token_timezone_names";
 const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 const USER_TOKENS_PREFIX: &str = "user_tokens:";
@@ -91,7 +92,24 @@ pub async fn get_tokens_with_timezone_offsets(
         .await
         .map_err(ServiceError::Redis)?;
 
-    Ok(tokens.into_iter().zip(offsets).collect())
+    let names: Vec<Option<String>> = redis::cmd("HMGET")
+        .arg(TOKEN_TIMEZONE_NAMES_HASH)
+        .arg(&tokens)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    let now = chrono::Utc::now();
+    Ok(tokens
+        .into_iter()
+        .zip(offsets)
+        .zip(names)
+        .map(|((token, offset), name)| {
+            let effective = name
+                .and_then(|name| timezone_offset_at(&name, now.timestamp()))
+                .or(offset);
+            (token, effective)
+        })
+        .collect())
 }
 
 /// Every pubkey that has at least one registered device token.
@@ -157,6 +175,17 @@ pub async fn add_or_update_token_with_timezone(
     token: &str,
     timezone_offset_minutes: Option<i32>,
 ) -> Result<()> {
+    add_or_update_token_with_timezone_name(pool, pubkey, token, timezone_offset_minutes, None).await
+}
+
+/// Store device timezone and offset together with the registration.
+pub async fn add_or_update_token_with_timezone_name(
+    pool: &RedisPool,
+    pubkey: &PublicKey,
+    token: &str,
+    timezone_offset_minutes: Option<i32>,
+    timezone: Option<&str>,
+) -> Result<()> {
     let now_timestamp = Timestamp::now().as_secs();
     let pubkey_hex = pubkey.to_hex();
     let user_tokens_key = build_user_tokens_key(pubkey);
@@ -198,6 +227,14 @@ pub async fn add_or_update_token_with_timezone(
     pipe.sadd(&user_tokens_key, token) // Add token to user's set
         .zadd(STALE_TOKENS_ZSET, token, now_timestamp) // Track for cleanup
         .hset(TOKEN_TO_PUBKEY_HASH, token, &pubkey_hex); // Map token back to pubkey
+    match timezone.filter(|name| name.parse::<chrono_tz::Tz>().is_ok()) {
+        Some(name) => {
+            pipe.hset(TOKEN_TIMEZONE_NAMES_HASH, token, name);
+        }
+        None => {
+            pipe.hdel(TOKEN_TIMEZONE_NAMES_HASH, token);
+        }
+    }
     match timezone_offset_minutes {
         Some(offset) => {
             pipe.hset(TOKEN_TIMEZONE_OFFSETS_HASH, token, offset);
@@ -244,9 +281,10 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
                 .srem(&user_tokens_key, token) // Remove from user's set
                 .zrem(STALE_TOKENS_ZSET, token) // Remove from stale tracking
                 .hdel(TOKEN_TO_PUBKEY_HASH, token) // Remove from token->pubkey map
-                .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token);
+                .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token)
+                .hdel(TOKEN_TIMEZONE_NAMES_HASH, token);
 
-            let _result: RedisResult<(usize, usize, usize, usize)> =
+            let _result: RedisResult<(usize, usize, usize, usize, usize)> =
                 pipe.query_async(&mut *conn).await;
             _result.map(|_| ()).map_err(ServiceError::Redis)?;
             Ok(true)
@@ -493,6 +531,7 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
     // 3b. Remove tokens from the HASH
     pipe.hdel(TOKEN_TO_PUBKEY_HASH, &stale_tokens);
     pipe.hdel(TOKEN_TIMEZONE_OFFSETS_HASH, &stale_tokens);
+    pipe.hdel(TOKEN_TIMEZONE_NAMES_HASH, &stale_tokens);
 
     // 3c. Remove tokens from individual user sets
     let mut actual_removed_count = 0;
@@ -1122,6 +1161,21 @@ pub async fn set_cached_string(
         .map_err(ServiceError::Redis)?;
 
     Ok(())
+}
+
+/// Resolve an IANA zone at the delivery instant, including DST transitions.
+pub fn timezone_offset_at(name: &str, now: i64) -> Option<i32> {
+    use chrono::Offset;
+    let timezone: chrono_tz::Tz = name.parse().ok()?;
+    let instant = chrono::DateTime::from_timestamp(now, 0)?;
+    Some(
+        instant
+            .with_timezone(&timezone)
+            .offset()
+            .fix()
+            .local_minus_utc()
+            / 60,
+    )
 }
 
 #[cfg(test)]
