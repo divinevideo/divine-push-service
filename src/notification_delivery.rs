@@ -1,8 +1,8 @@
 //! Shared delivery limits for social pushes, summaries, and campaigns.
 //!
-//! Suppression affects pushes only; activity remains in the in-app inbox. Missing
-//! offsets retain social delivery for old clients. Campaign consent/timezone
-//! requirements are enforced separately and are never relaxed by this module.
+//! Suppression affects pushes only; it does not create durable inbox entries.
+//! Missing offsets retain social delivery for old clients. Campaign consent/
+//! timezone requirements are enforced separately and are never relaxed here.
 
 use crate::{
     error::{Result, ServiceError},
@@ -101,8 +101,8 @@ pub async fn reserve_budget(
 
 /// Keep provider storage short so offline devices do not replay old activity.
 /// Zero TTL asks both providers to deliver immediately or discard the push;
-/// social history is always available in the inbox. This also prevents a push
-/// accepted just before quiet hours from waiting at the provider overnight.
+/// this does not create a durable inbox entry. This also prevents a push accepted
+/// just before quiet hours from waiting at the provider overnight.
 pub fn immediate_delivery(payload: &mut FcmPayload) {
     if payload
         .data
