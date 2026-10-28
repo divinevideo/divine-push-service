@@ -13,6 +13,7 @@ pub mod health;
 pub mod metrics;
 pub mod models;
 pub mod nostr_listener;
+pub mod notification_delivery;
 pub mod preferences;
 pub mod redis_connection;
 pub mod redis_store;

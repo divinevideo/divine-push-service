@@ -309,10 +309,9 @@ fn build_apns_config(payload: &FcmPayload) -> Option<serde_json::Value> {
         .or_else(|| data.get("body").cloned());
 
     if title.is_some() || body.is_some() {
-        // Alert push: the OS presents this single banner (NSE may enrich it via
-        // mutable-content). Deliberately NO content-available — that flag wakes the
-        // app's background isolate, which renders a *second*, duplicate banner. An
-        // alert push reaches terminated iOS apps without it. See divine-push-service#20.
+        // The OS owns the banner. Only public-content pushes request a
+        // background warmup; the mobile handler checks RemoteMessage.notification
+        // before rendering so that wake cannot produce a second banner (#20).
         let mut alert = serde_json::Map::new();
         if let Some(title) = title {
             alert.insert("title".to_string(), serde_json::Value::String(title));
@@ -334,6 +333,19 @@ fn build_apns_config(payload: &FcmPayload) -> Option<serde_json::Value> {
                 "mutable-content": 1,
             }),
         );
+
+        if payload
+            .data
+            .as_ref()
+            .and_then(|data| data.get("prefetchContent"))
+            .is_some_and(|value| value == "true")
+        {
+            apns_payload
+                .get_mut("aps")
+                .and_then(|aps| aps.as_object_mut())
+                .expect("aps is an object")
+                .insert("content-available".into(), serde_json::json!(1));
+        }
 
         return Some(serde_json::json!({
             "payload": apns_payload,
@@ -372,6 +384,13 @@ fn apns_headers(payload: &FcmPayload, push_type: &str, priority: &str) -> serde_
         "apns-priority".to_string(),
         serde_json::Value::String(priority.to_string()),
     );
+    if payload
+        .data
+        .as_ref()
+        .is_some_and(|data| data.get("deliveryTtlSeconds").is_some_and(|ttl| ttl == "0"))
+    {
+        headers.insert("apns-expiration".into(), serde_json::json!("0"));
+    }
     if let Some(collapse_key) = &payload.collapse_key {
         headers.insert(
             "apns-collapse-id".to_string(),
@@ -412,6 +431,14 @@ fn build_android_config(payload: &FcmPayload) -> Option<serde_json::Value> {
             "collapse_key".to_string(),
             serde_json::Value::String(collapse_key.clone()),
         );
+    }
+
+    if payload
+        .data
+        .as_ref()
+        .is_some_and(|data| data.get("deliveryTtlSeconds").is_some_and(|ttl| ttl == "0"))
+    {
+        android.insert("ttl".into(), serde_json::json!("0s"));
     }
 
     Some(serde_json::Value::Object(android))
@@ -1281,6 +1308,29 @@ mod tests {
             apns: None,
             collapse_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn public_prefetch_keeps_one_os_alert_and_expires_at_the_provider() {
+        let (client, captured) = stub_fcm(200, &[], r#"{"name":"projects/test/messages/1"}"#).await;
+        let mut payload = social_payload();
+        payload
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("type".into(), "like".into());
+        crate::notification_delivery::immediate_delivery(&mut payload);
+        client
+            .send_single("synthetic-device", payload)
+            .await
+            .unwrap();
+        let requests = captured.lock().unwrap();
+        let message = &requests[0].0["message"];
+        assert_eq!(message["android"]["ttl"], "0s");
+        assert_eq!(message["apns"]["headers"]["apns-expiration"], "0");
+        assert_eq!(message["apns"]["payload"]["aps"]["content-available"], 1);
+        assert!(message["apns"]["payload"]["aps"].get("alert").is_some());
+        assert!(message.get("notification").is_none());
     }
 
     #[tokio::test]

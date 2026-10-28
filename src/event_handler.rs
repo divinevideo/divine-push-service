@@ -310,11 +310,8 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         return Ok(());
     }
 
-    // The offset is optional and only campaign delivery reads it. An
-    // out-of-range value is treated as absent rather than as a reason to drop
-    // the registration: returning here would silence every social push for a
-    // field that social delivery never consults, and campaign delivery already
-    // suppresses a device with no valid offset.
+    // An invalid optional timezone must not drop the registration. Legacy
+    // social delivery remains available without it; campaigns still require it.
     let timezone_offset_minutes = token_payload
         .timezone_offset_minutes
         .filter(|offset| (-720..=840).contains(offset));
@@ -322,16 +319,16 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         warn!(
             event_id = %event.id,
             pubkey = %event.pubkey,
-            "Ignoring an out-of-range timezone offset; campaign delivery stays \
-             suppressed for this device"
+            "Ignoring an out-of-range optional timezone offset"
         );
     }
 
-    match redis_store::add_or_update_token_with_timezone(
+    match redis_store::add_or_update_token_with_timezone_name(
         &state.redis_pool,
         &event.pubkey,
         fcm_token,
         timezone_offset_minutes,
+        token_payload.timezone.as_deref(),
     )
     .await
     {
@@ -1701,6 +1698,16 @@ async fn send_notification_trigger_to_user(
 ) -> Result<()> {
     let event_id = trigger.event_id();
     let pubkey_hex = target_pubkey.to_hex();
+    if let Some(event) = trigger.nostr_event() {
+        if Timestamp::now()
+            .as_secs()
+            .saturating_sub(event.created_at.as_secs())
+            > state.settings.service.delivery.max_event_age_secs
+        {
+            crate::notification_delivery::outcome("expired");
+            return Ok(());
+        }
+    }
 
     // Check pubkey allowlist (for non-production environments)
     let allowed = &state.settings.service.allowed_pubkeys;
@@ -1720,7 +1727,9 @@ async fn send_notification_trigger_to_user(
             info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while fetching tokens.");
             return Err(crate::error::ServiceError::Cancelled);
         }
-        res = redis_store::get_tokens_for_pubkey(&state.redis_pool, target_pubkey) => {
+        res = crate::notification_delivery::social_tokens(
+            &state.redis_pool, target_pubkey, &state.settings.service.delivery,
+        ) => {
             res?
         }
     };
@@ -1729,7 +1738,7 @@ async fn send_notification_trigger_to_user(
         info!(
             event_id = %event_id,
             target_pubkey = %target_pubkey.to_bech32().unwrap_or_else(|_| "unknown".to_string()),
-            "No FCM tokens registered for recipient - skipping notification"
+            "No eligible FCM tokens for recipient (unregistered or quiet) - skipping notification"
         );
         return Ok(());
     }
@@ -1951,7 +1960,7 @@ async fn send_notification_trigger_to_user(
     };
 
     // Create FCM payload
-    let payload = match trigger.nostr_event() {
+    let mut payload = match trigger.nostr_event() {
         Some(event) => create_fcm_payload(
             event,
             target_pubkey,
@@ -1961,6 +1970,54 @@ async fn send_notification_trigger_to_user(
         ),
         None => create_direct_message_payload(event_id, target_pubkey),
     };
+
+    let preflight = async {
+        let awake = crate::notification_delivery::social_tokens(
+            &state.redis_pool,
+            target_pubkey,
+            &state.settings.service.delivery,
+        )
+        .await?;
+        let eligible: Vec<String> = tokens
+            .into_iter()
+            .filter(|token| awake.contains(token))
+            .collect();
+        if eligible.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !crate::notification_delivery::reserve_budget(
+            &state.redis_pool,
+            target_pubkey,
+            &format!("event:{event_id}"),
+            &state.settings.service.delivery,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        Ok::<_, crate::error::ServiceError>(eligible)
+    }
+    .await;
+    // Ingest charged the like/repost emission window before these final
+    // policy gates. A push suppressed before FCM must not occupy that window.
+    if collapse_key.is_some() && matches!(&preflight, Ok(tokens) if tokens.is_empty()) {
+        coalesce::refund_recipient_token(
+            &state.redis_pool,
+            &pubkey_hex,
+            &event_id.to_hex(),
+            &state.settings.service,
+        )
+        .await?;
+    }
+    let tokens = match preflight {
+        Ok(tokens) if tokens.is_empty() => return Ok(()),
+        Ok(tokens) => tokens,
+        Err(error) => {
+            redis_store::release_recipient_event_claim(&state.redis_pool, &recipient_claim).await?;
+            return Err(error);
+        }
+    };
+    crate::notification_delivery::immediate_delivery(&mut payload);
 
     // Send to all tokens
     info!(
@@ -5686,6 +5743,70 @@ mod tests {
     /// summary sharing their collapse key. iOS replaces the earlier banner from
     /// that key; Android banner replacement depends on the client (see the
     /// plan's accepted losses), so this asserts the wire contract only.
+    #[tokio::test]
+    async fn frequency_capped_like_refunds_its_coalescing_charge() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.delivery.hourly_cap = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        let owner = Keys::generate().public_key();
+        let device = format!("capped-like-{}", owner.to_hex());
+        redis_store::add_or_update_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+        assert!(crate::notification_delivery::reserve_budget(
+            &pool,
+            &owner,
+            "event:earlier-comment",
+            &settings.service.delivery,
+        )
+        .await
+        .unwrap());
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let like = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::event(test_event_id(987)))
+            .tag(Tag::public_key(owner))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &like,
+            &owner,
+            NotificationType::Like,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(mock.get_sent_messages().is_empty());
+        let mut conn = pool.get().await.unwrap();
+        let emitted: u64 = redis::cmd("ZCARD")
+            .arg(format!("{}{}", coalesce::EMITTED_PREFIX, owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(emitted, 0, "a capped like emitted no notification");
+        let remaining: f64 = redis::cmd("HGET")
+            .arg(format!("{}{}", coalesce::THROTTLE_PREFIX, owner.to_hex()))
+            .arg("tokens")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 100.0);
+        drop(conn);
+        redis_store::remove_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn like_bursts_coalesce_after_the_immediate_limit() {
         let _guard = crate::coalesce::test_lock().lock().await;

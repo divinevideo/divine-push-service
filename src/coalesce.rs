@@ -1199,14 +1199,19 @@ pub(crate) async fn flush_group(
         });
     }
 
-    let tokens = redis_store::get_tokens_for_pubkey(&state.redis_pool, &owner).await?;
+    let tokens = crate::notification_delivery::social_tokens(
+        &state.redis_pool,
+        &owner,
+        &state.settings.service.delivery,
+    )
+    .await?;
     if tokens.is_empty() {
         complete_group(&state.redis_pool, claim, None).await?;
         crate::metrics::coalesce_skipped("no_tokens", 1);
         info!(
             group_id = %claim.group_id,
             owner = %snapshot.owner,
-            "Suppressed a coalesced summary; the recipient has no registered tokens"
+            "Suppressed a coalesced summary; no eligible tokens (unregistered or quiet)"
         );
         return Ok(FlushOutcome::Suppressed {
             reason: "no_tokens",
@@ -1285,6 +1290,30 @@ pub(crate) async fn flush_group(
             .await;
     }
 
+    let budget = crate::notification_delivery::reserve_budget(
+        &state.redis_pool,
+        &owner,
+        &format!("summary:{}", claim.group_id),
+        &state.settings.service.delivery,
+    )
+    .await;
+    if !matches!(&budget, Ok(true)) {
+        refund_recipient_token(
+            &state.redis_pool,
+            &recipient,
+            &claim.group_id,
+            &state.settings.service,
+        )
+        .await?;
+    }
+    if !budget? {
+        complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("frequency_capped", 1);
+        return Ok(FlushOutcome::Suppressed {
+            reason: "frequency_capped",
+        });
+    }
+
     let sample_name = match (&state.mention_parser_service, &snapshot.first_actor) {
         (Some(parser), Some(actor)) => match parser.get_display_name(actor).await {
             Ok(Some(name)) => name,
@@ -1299,7 +1328,8 @@ pub(crate) async fn flush_group(
     };
 
     let collapse_key = collapse_key_for_group(&claim.group_id);
-    let payload = build_summary_payload(&snapshot, &owner, &sample_name, &collapse_key);
+    let mut payload = build_summary_payload(&snapshot, &owner, &sample_name, &collapse_key);
+    crate::notification_delivery::immediate_delivery(&mut payload);
 
     info!(
         group_id = %claim.group_id,
@@ -1310,6 +1340,40 @@ pub(crate) async fn flush_group(
         "Flushing coalesced notification group"
     );
 
+    let awake = crate::notification_delivery::social_tokens(
+        &state.redis_pool,
+        &owner,
+        &state.settings.service.delivery,
+    )
+    .await;
+    if awake.is_err() {
+        refund_recipient_token(
+            &state.redis_pool,
+            &recipient,
+            &claim.group_id,
+            &state.settings.service,
+        )
+        .await?;
+    }
+    let awake = awake?;
+    let tokens: Vec<String> = tokens
+        .into_iter()
+        .filter(|token| awake.contains(token))
+        .collect();
+    if tokens.is_empty() {
+        refund_recipient_token(
+            &state.redis_pool,
+            &recipient,
+            &claim.group_id,
+            &state.settings.service,
+        )
+        .await?;
+        complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("quiet_hours", 1);
+        return Ok(FlushOutcome::Suppressed {
+            reason: "quiet_hours",
+        });
+    }
     let results = state.fcm_client.send_batch(&tokens, payload).await;
 
     let mut delivered = Vec::new();
@@ -1538,7 +1602,7 @@ pub(crate) fn test_lock() -> &'static tokio::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fcm_sender::{FcmClient, FcmSend};
+    use crate::fcm_sender::{FcmClient, FcmSend, MockFcmSender};
     use crate::models::FcmPayload;
     use async_trait::async_trait;
     use nostr_sdk::{Keys, Timestamp};
@@ -2919,6 +2983,97 @@ mod tests {
         );
         drop(conn);
         redis_store::remove_token(&pool, &owner, "coalesce-invalid-token")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn frequency_capped_summary_refunds_its_coalescing_charge() {
+        let _guard = test_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.coalesce_immediate_limit = 1;
+        settings.service.recipient_throttle_capacity = 100;
+        settings.service.delivery.hourly_cap = 1;
+        let owner = Keys::generate().public_key();
+        let target = random_target();
+        let _ = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let second = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &Uuid::new_v4().to_string(),
+            &random_actor(),
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = second else {
+            panic!("the second interaction must buffer");
+        };
+        make_claimable(&pool, &group_id).await;
+        let device = format!("capped-summary-{}", owner.to_hex());
+        redis_store::add_or_update_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+        assert!(crate::notification_delivery::reserve_budget(
+            &pool,
+            &owner,
+            "event:earlier-comment",
+            &settings.service.delivery,
+        )
+        .await
+        .unwrap());
+        let mock = MockFcmSender::new();
+        let state = test_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let claim = claim_due_group(&pool, 30).await.unwrap().unwrap();
+        assert_eq!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Suppressed {
+                reason: "frequency_capped"
+            }
+        );
+        assert!(mock.get_sent_messages().is_empty());
+        let mut conn = pool.get().await.unwrap();
+        let emitted: Option<u64> = redis::cmd("ZSCORE")
+            .arg(format!("{EMITTED_PREFIX}{}", owner.to_hex()))
+            .arg(&group_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            emitted.is_none(),
+            "a capped summary emitted no notification"
+        );
+        let remaining: f64 = redis::cmd("HGET")
+            .arg(format!("{THROTTLE_PREFIX}{}", owner.to_hex()))
+            .arg("tokens")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            remaining >= 99.0,
+            "only the original immediate spent a token"
+        );
+        drop(conn);
+        redis_store::remove_token(&pool, &owner, &device)
             .await
             .unwrap();
     }

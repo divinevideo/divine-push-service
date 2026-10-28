@@ -29,6 +29,8 @@ pub enum CryptoError {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenPayload {
+    #[serde(rename = "timezone", default)]
+    pub timezone: Option<String>,
     pub token: String,
     #[serde(rename = "timezoneOffsetMinutes", default)]
     pub timezone_offset_minutes: Option<i32>,
