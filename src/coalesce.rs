@@ -109,6 +109,8 @@ pub enum CoalesceDecision {
     },
     /// Recorded in the bucket; no push now.
     Buffered { group_id: String },
+    /// An authenticated visit invalidated this work before ingest committed.
+    StaleVisit,
 }
 
 /// Data the ingest script needs from the trigger event.
@@ -388,6 +390,20 @@ pub async fn ingest(
     recipient: &PublicKey,
     ingest: &Ingest<'_>,
 ) -> Result<CoalesceDecision> {
+    let generation = crate::activity::current_generation(pool, recipient).await?;
+    ingest_for_generation(pool, settings, recipient, generation, ingest).await
+}
+
+/// Ingest work using the generation retained before asynchronous preflight.
+/// The Lua fence precedes disposition reads and every mutation, so a visit
+/// cannot relabel stale work or charge a legacy immediate emission.
+pub async fn ingest_for_generation(
+    pool: &RedisPool,
+    settings: &ServiceSettings,
+    recipient: &PublicKey,
+    expected_generation: u64,
+    ingest: &Ingest<'_>,
+) -> Result<CoalesceDecision> {
     const INGEST_SCRIPT: &str = r#"
         local disp_key = KEYS[1]
         local due_key = KEYS[2]
@@ -425,6 +441,8 @@ pub async fn ingest(
         local emitted_ttl = tonumber(ARGV[27])
         local action_limit = tonumber(ARGV[28])
         local action_hash = ARGV[29]
+        local generation = redis.call('HGET', activity_key, 'generation') or '0'
+        if generation ~= ARGV[30] then return {4, ''} end
 
         -- Replay: the same decision and therefore the same collapse id.
         local stored = redis.call('GET', disp_key)
@@ -437,7 +455,6 @@ pub async fn ingest(
         local now = tonumber(redis.call('TIME')[1])
         local bucket = math.floor(now / window)
         local due_at = (bucket + 1) * window
-        local generation = redis.call('HGET', activity_key, 'generation') or '0'
         local digest = limit == 0
         local gid = ntype .. ':' .. owner .. ':' .. target .. ':' .. bucket
         if digest then
@@ -638,12 +655,14 @@ pub async fn ingest(
         .arg(emitted_key_ttl(settings))
         .arg(MAX_ACTIONS_PER_CATEGORY)
         .arg(action_hash)
+        .arg(expected_generation)
         .invoke_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
 
     let collapse_key = collapse_key_for_group(&decision.1);
     match decision.0 {
+        4 => Ok(CoalesceDecision::StaleVisit),
         1 => Ok(CoalesceDecision::Immediate {
             group_id: decision.1,
             collapse_key,
@@ -1577,6 +1596,7 @@ pub(crate) async fn flush_group(
         &state.redis_pool,
         &owner,
         &identity,
+        &state.settings.service.delivery,
         Some(snapshot.generation),
     )
     .await;
@@ -2349,6 +2369,67 @@ mod tests {
         );
         drop(conn);
         cleanup_group(&pool, &group_id).await;
+    }
+
+    #[tokio::test]
+    async fn visit_race_ingest_rejects_generation_captured_before_preflight() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for generation race tests");
+        reset_indexes(&pool).await;
+        for immediate_limit in [0, 1] {
+            let mut settings = test_settings();
+            settings.coalesce_immediate_limit = immediate_limit;
+            let owner = Keys::generate().public_key();
+            let generation = crate::activity::current_generation(&pool, &owner)
+                .await
+                .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("HSET")
+                .arg(format!(
+                    "{}{}",
+                    crate::activity::STATE_PREFIX,
+                    owner.to_hex()
+                ))
+                .arg("generation")
+                .arg(1)
+                .query_async::<()>(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+            let event_id = "b".repeat(64);
+            let actor = random_actor();
+            let target = CoalesceTarget::event("c".repeat(64));
+            ingest_for_generation(
+                &pool,
+                &settings,
+                &owner,
+                generation,
+                &Ingest {
+                    event_id: &event_id,
+                    event_kind: 7,
+                    actor: &actor,
+                    created_at: Timestamp::now().as_secs(),
+                    notification_type: NotificationType::Like,
+                    target: &target,
+                },
+            )
+            .await
+            .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let groups: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("{GROUP_PREFIX}*{}:*", owner.to_hex()))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert!(
+                groups.is_empty(),
+                "an event from before the visit must create neither an old nor a new group"
+            );
+            drop(conn);
+            assert!(stored_disposition(&pool, &event_id, &owner).await.is_none());
+        }
     }
 
     #[tokio::test]

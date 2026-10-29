@@ -1698,8 +1698,21 @@ async fn send_notification_trigger_to_user(
 ) -> Result<()> {
     let event_id = trigger.event_id();
     let pubkey_hex = target_pubkey.to_hex();
-    let visit_generation =
-        crate::activity::current_generation(&state.redis_pool, target_pubkey).await?;
+    let work_identity = format!("event:{event_id}");
+    let retention_secs = state
+        .settings
+        .service
+        .delivery
+        .max_event_age_secs
+        .max(state.settings.service.coalesce_group_ttl_secs)
+        .max(86_400);
+    let visit_generation = crate::activity::generation_for_work(
+        &state.redis_pool,
+        target_pubkey,
+        &work_identity,
+        retention_secs,
+    )
+    .await?;
     if let Some(event) = trigger.nostr_event() {
         if Timestamp::now()
             .as_secs()
@@ -1870,10 +1883,9 @@ async fn send_notification_trigger_to_user(
         return Ok(());
     };
 
-    // Like and repost pushes coalesce per (recipient, type, target, bucket).
-    // Buffered events are recorded here and summarized later by the flush
-    // worker; immediate events continue down the normal path carrying a
-    // collapse key so the summary can replace their banner.
+    // Carry the generation retained before preflight into the atomic ingest.
+    // A visit during an awaited lookup must suppress the old work, rather than
+    // treating it as activity in the new account generation.
     let mut collapse_key = None;
     if matches!(
         delivery_type,
@@ -1891,10 +1903,11 @@ async fn send_notification_trigger_to_user(
             if let Some(target) = coalesce_target(event) {
                 let event_id_hex = event.id.to_hex();
                 let actor_hex = event.pubkey.to_hex();
-                let decision = coalesce::ingest(
+                let decision = coalesce::ingest_for_generation(
                     &state.redis_pool,
                     &state.settings.service,
                     target_pubkey,
+                    visit_generation,
                     &coalesce::Ingest {
                         event_id: &event_id_hex,
                         event_kind: event.kind.as_u16(),
@@ -1907,6 +1920,10 @@ async fn send_notification_trigger_to_user(
                 .await;
 
                 match decision {
+                    Ok(coalesce::CoalesceDecision::StaleVisit) => {
+                        crate::notification_delivery::outcome("stale_visit");
+                        return Ok(());
+                    }
                     Ok(coalesce::CoalesceDecision::Immediate {
                         collapse_key: key, ..
                     }) => {
@@ -1998,7 +2015,7 @@ async fn send_notification_trigger_to_user(
         if crate::notification_delivery::reserve_budget_for_generation(
             &state.redis_pool,
             target_pubkey,
-            &format!("event:{event_id}"),
+            &work_identity,
             &state.settings.service.delivery,
             Some(visit_generation),
         )
@@ -2010,7 +2027,8 @@ async fn send_notification_trigger_to_user(
         if !crate::notification_delivery::validate_reservation(
             &state.redis_pool,
             target_pubkey,
-            &format!("event:{event_id}"),
+            &work_identity,
+            &state.settings.service.delivery,
             Some(visit_generation),
         )
         .await?
@@ -3939,6 +3957,138 @@ mod tests {
         assert!(
             targets.is_empty(),
             "the mention already covers this recipient, so no bell is owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn visit_race_durable_fanout_retry_keeps_generation_after_failed_preflight() {
+        let pool = test_redis_pool()
+            .await
+            .expect("Redis is required for generation race tests");
+        let _guard = fanout_test_lock().lock().await;
+        let creator = Keys::generate();
+        let owner = Keys::generate().public_key();
+        let device = format!("synthetic-preflight-retry-{}", owner.to_hex());
+        add_awake_test_token(&pool, &owner, &device).await.unwrap();
+        let token_key = format!("user_tokens:{}", owner.to_hex());
+        let watcher_key = format!("notify_watchers:{}", creator.public_key().to_hex());
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let event = EventBuilder::new(Kind::Custom(KIND_VIDEO), "synthetic visit race")
+            .tag(Tag::identifier("synthetic-visit-race"))
+            .sign_with_keys(&creator)
+            .unwrap();
+        let job = NewPostFanoutJob {
+            event_json: serde_json::to_string(&event).unwrap(),
+            cursor: 0,
+            sender_name: Some("tester".to_string()),
+            attempt: 0,
+            expires_at: Timestamp::now().as_secs() + 3600,
+        };
+        let job_json = serde_json::to_string(&job).unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::pipe()
+            .atomic()
+            .cmd("SADD")
+            .arg(&watcher_key)
+            .arg(owner.to_hex())
+            .ignore()
+            .cmd("DEL")
+            .arg(&token_key)
+            .ignore()
+            .cmd("SET")
+            .arg(&token_key)
+            .arg("synthetic-wrong-type")
+            .ignore()
+            .cmd("ZADD")
+            .arg("new_post_fanout_jobs")
+            .arg(0)
+            .arg(&job_json)
+            .ignore()
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        process_fanout_job(&state, &job_json, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "the failed token lookup must happen before provider submission"
+        );
+        let mut conn = pool.get().await.unwrap();
+        let jobs: Vec<String> = redis::cmd("ZRANGE")
+            .arg("new_post_fanout_jobs")
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let retry_json = jobs
+            .into_iter()
+            .find(|json| {
+                serde_json::from_str::<NewPostFanoutJob>(json)
+                    .is_ok_and(|retry| retry.event_json == job.event_json)
+            })
+            .expect("preflight failure must durably reschedule the page");
+        assert_eq!(
+            serde_json::from_str::<NewPostFanoutJob>(&retry_json)
+                .unwrap()
+                .attempt,
+            1
+        );
+        redis::cmd("DEL")
+            .arg(&token_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        add_awake_test_token(&pool, &owner, &device).await.unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        for (sequence, state) in [
+            (1, crate::activity::ActivityState::Foreground),
+            (2, crate::activity::ActivityState::Background),
+        ] {
+            crate::activity::record_activity(
+                &pool,
+                &owner,
+                &crate::activity::ActivityUpdate {
+                    session_id,
+                    sequence,
+                    visit: 1,
+                    state,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        process_fanout_job(&state, &retry_json, CancellationToken::new())
+            .await
+            .unwrap();
+        let messages = mock.get_sent_messages();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&watcher_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis::cmd("ZREM")
+            .arg("new_post_fanout_jobs")
+            .arg(&retry_json)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        redis_store::remove_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "a rescheduled page must not relabel its already-started recipient work after a visit"
         );
     }
 
