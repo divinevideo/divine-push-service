@@ -1,6 +1,51 @@
 # Like and Repost notification coalescing
 
-Status: Revision 11 — implementation plan. Supersedes revision 10.
+Status: Revision 12 — account digests and visit interruption budget.
+
+## Current account digest behavior
+
+With `coalesce_immediate_limit = 0` (the default), every like and repost buffers
+from the first interaction. All posts and both types share one recipient,
+visit-generation, and Redis-clock bucket. The existing leased outbox flushes
+one data-only `activityDigest` push with title `New activity` and copy such as
+`Your videos got 3 likes and 2 reposts.` Counts describe interactions, with
+singular forms for one like or repost. One actor acting on two posts counts
+twice; repeated actor/canonical-target/category actions across different signed
+event IDs count once within the group. The payload carries the full recipient
+hex/npub, the first real trigger event ID, and the latest trigger timestamp.
+It carries no invented Nostr event, actor requirement, or per-post reference;
+tapping it opens the notification inbox. Inbox and read state are independent.
+
+The ingest Lua script reads `notification_activity:{owner}`'s `generation`
+atomically with choosing `activity:{owner}:{generation}:{bucket}`. The group
+hash stores `generation`, `likes`, `reposts`, `first_event`, and `last_at`.
+Its disposition records live for the full group lifetime plus cleanup grace,
+so a delayed replay cannot recount an interaction while the digest is pending.
+No per-post routing fields or actor HyperLogLog are needed for account digests.
+The group retains at most 1024 full BLAKE3 action identities for each category
+(2048 fields total), computed from length-prefixed category, actor, and canonical
+target. This bounds exact deduplication storage without retaining raw actor or
+target lists. At saturation, a category stops adding identities and reports its
+proven lower bound, such as `at least 1024 likes`, instead of inventing an exact
+larger count. The other category has its own independent capacity. The bound is
+per account/generation/bucket, and cleanup uses the existing group lifetime.
+
+Flush rechecks like and repost preferences independently and removes disabled
+categories from the copy. If neither category remains, only the pending push
+is suppressed. The shared delivery authority enforces active presence, visit
+generation, two pushes per absence, the six-hour cooldown across visits,
+quiet hours (21:00–06:59 recipient-local time), and known timezone. A cooldown
+requeues for its full remaining delay, unless that crosses logical expiry.
+Active presence, an obsolete generation, or an exhausted allowance discards
+the queued push. Final authorization rechecks presence and generation just
+before provider submission without spending the allowance again. A current
+Redis-clock check also drops a group that expired while its lease was held.
+
+Account digests skip the old like/repost token bucket and emission window;
+the shared interruption policy is their send authority. Existing queued groups
+still retain their original per-post copy and legacy throttle, and missing
+generation means zero, so a later visit fences them too. Setting a positive
+immediate limit keeps the legacy ingest behavior documented below.
 
 Scope: kinds 7 (Like) and 16 (Repost) only. Comments (1111), mentions
 (30023/34236), and new-post ("bell") notifications are not coalesced; they
@@ -76,7 +121,7 @@ with 500 likes produces 500 pushes. The service currently bounds this with a
 production allowlist; removing the allowlist without coalescing exposes the
 full registered user base to one-push-per-event behavior.
 
-## Behavior and copy rules
+## Legacy behavior and copy rules (positive immediate limit)
 
 For each `(recipient, notification type, target)` pair, time is divided into
 fixed `coalesce_window_secs` buckets aligned to the Redis server clock.
@@ -136,6 +181,7 @@ without re-reading the buffered set.
 
 | Key | Type | Purpose |
 |-----|------|---------|
+| `coalesce:g:activity:{owner}:{generation}:{bucket}` | Hash | Account digest: `due`, `expires_at`, `pending`, `generation`, `likes`, `reposts`, `first_event`, `last_at`, `owner`, `type=activityDigest`, and lease. No target or actor fields; physical TTL is logical lifetime plus grace |
 | `coalesce:g:{type}:{owner}:{target}:{bucket}` | Hash | Bucket group state: `due`, `expires_at`, `pending`, `immediate`, `first_actor`, `first_event`, `last_at`, `event_kind`, `owner`, `type`, `target`, reference fields, and the current `lease` token. Physical TTL `coalesce_group_ttl_secs + coalesce_logical_expiry_grace_secs` once it has buffered work; window + grace while it has only immediate traffic |
 | `coalesce:hll:{type}:{owner}:{target}:{bucket}` | HyperLogLog | Distinct buffered actors. Same physical TTL |
 | `coalesce:disp:{event_id}:{recipient}` | String | Per-event disposition, `i:{gid}` or `b:{gid}`, so a replay reproduces the original decision and collapse id. TTL `coalesce_window_secs + coalesce_logical_expiry_grace_secs` |
@@ -356,7 +402,7 @@ New `service` settings, each rejected at zero:
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `coalesce_window_secs` | 7200 | Bucket length |
-| `coalesce_immediate_limit` | 3 | Immediate pushes per bucket per group |
+| `coalesce_immediate_limit` | 0 | Zero selects account digests; positive values retain immediate pushes per legacy group |
 | `coalesce_lease_secs` | 300 | Flush lease; must exceed twice the flush timeout |
 | `coalesce_retry_secs` | 5 | Requeue delay after an all-token retryable failure |
 | `coalesce_poll_millis` | 250 | Idle poll interval |
