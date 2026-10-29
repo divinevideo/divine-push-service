@@ -212,9 +212,11 @@ async fn a_visit_invalidates_a_reserved_job_before_provider_submission() {
         spend(&pool, &owner, "leased", 0, &settings).await,
         BudgetDecision::Allowed
     );
-    assert!(validate_reservation(&pool, &owner, "leased", Some(0))
-        .await
-        .unwrap());
+    assert!(
+        validate_reservation(&pool, &owner, "leased", &settings, Some(0))
+            .await
+            .unwrap()
+    );
     update(
         &pool,
         &owner,
@@ -224,9 +226,11 @@ async fn a_visit_invalidates_a_reserved_job_before_provider_submission() {
         ActivityState::Foreground,
     )
     .await;
-    assert!(!validate_reservation(&pool, &owner, "leased", Some(0))
-        .await
-        .unwrap());
+    assert!(
+        !validate_reservation(&pool, &owner, "leased", &settings, Some(0))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -277,5 +281,123 @@ async fn missed_background_does_not_prevent_the_next_visit_reset() {
     assert_eq!(
         activity::current_generation(&pool, &owner).await.unwrap(),
         2
+    );
+}
+
+#[tokio::test]
+async fn delayed_retry_cannot_bypass_a_newer_notifications_cooldown() {
+    let (pool, owner) = setup().await;
+    let settings = DeliverySettings::default();
+    assert_eq!(
+        spend(&pool, &owner, "old-retry", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_budget:{}", owner.to_hex()))
+        .arg(now.0 - 21601)
+        .arg("old-retry")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(&pool, &owner, "newer-send", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert!(matches!(
+        spend(&pool, &owner, "old-retry", 0, &settings).await,
+        BudgetDecision::Cooldown {
+            retry_after_secs: 21599..=21600
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_delayed_retry_refreshes_the_gap_for_the_next_notification() {
+    let (pool, owner) = setup().await;
+    let settings = DeliverySettings::default();
+    assert_eq!(
+        spend(&pool, &owner, "retry", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_budget:{}", owner.to_hex()))
+        .arg(now.0 - 21601)
+        .arg("retry")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(&pool, &owner, "retry", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert!(matches!(
+        spend(&pool, &owner, "next", 0, &settings).await,
+        BudgetDecision::Cooldown {
+            retry_after_secs: 21599..=21600
+        }
+    ));
+}
+
+#[tokio::test]
+async fn preflight_retries_keep_the_first_work_generation_without_spending_allowance() {
+    let (pool, owner) = setup().await;
+    let first = activity::generation_for_work(&pool, &owner, "campaign:pending", 86400)
+        .await
+        .unwrap();
+    assert_eq!(first, 0);
+    let session = Uuid::new_v4();
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    let retry = activity::generation_for_work(&pool, &owner, "campaign:pending", 86400)
+        .await
+        .unwrap();
+    assert_eq!(retry, first);
+    let settings = DeliverySettings::default();
+    assert_eq!(
+        spend(&pool, &owner, "campaign:pending", retry, &settings).await,
+        BudgetDecision::StaleVisit
+    );
+    let new_work = activity::generation_for_work(&pool, &owner, "campaign:new", 86400)
+        .await
+        .unwrap();
+    assert_eq!(new_work, 1);
+    assert_eq!(
+        spend(&pool, &owner, "campaign:new", new_work, &settings).await,
+        BudgetDecision::Allowed
+    );
+}
+
+#[tokio::test]
+async fn provider_preflight_rejects_an_old_reservation_after_a_newer_send() {
+    let (pool, owner) = setup().await;
+    let settings = DeliverySettings::default();
+    assert_eq!(
+        spend(&pool, &owner, "old", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_budget:{}", owner.to_hex()))
+        .arg(now.0 - 21601)
+        .arg("old")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(&pool, &owner, "new", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert!(
+        !validate_reservation(&pool, &owner, "old", &settings, Some(0))
+            .await
+            .unwrap()
     );
 }

@@ -65,6 +65,13 @@ An accepted or ambiguous attempt retains its identity and spent allowance.
 Activity never erases historical reservations. Old worker groups are fenced by
 the same current policy before sending.
 
+The first recipient attempt durably binds its work identity to a generation
+before fallible eligibility lookups. A later retry cannot acquire a newer visit
+after an earlier preflight failure. Ingest rejects a changed generation before
+creating group state. Retry authorization preserves its allowance but respects
+other notifications' cooldowns and refreshes its attempt timestamp for later
+sends. The final provider preflight repeats that cooldown check.
+
 ## Rollout dependencies
 
 Deploy the activity receiver and gateway before enabling mobile lifecycle

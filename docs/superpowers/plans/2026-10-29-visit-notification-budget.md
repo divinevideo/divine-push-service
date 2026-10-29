@@ -81,11 +81,11 @@ provider; startup side effects; existing push tap handling and targeted tests.
 **Interfaces:** Public activity contract from the spec. Process/account UUID; monotonic
 sequence and explicit visit counter across visits in one process; foreground heartbeat 60 seconds; no heartbeat after background/dispose.
 
-- [ ] Run baseline and write failing lifecycle, account-switch, retry/signing,
+- [x] Run baseline and write failing lifecycle, account-switch, retry/signing,
   background-fetch, and combined-summary routing tests.
-- [ ] Implement owner-bound authenticated activity; preserve transient inactive
+- [x] Implement owner-bound authenticated activity; preserve transient inactive
   state without generating visits; route account digests to Notifications.
-- [ ] Run focused Flutter/package tests, formatting, and analyze; commit.
+- [x] Run focused Flutter/package tests, formatting, and analyze; commit.
 
 ### Task 5: Review and delivery
 
@@ -98,7 +98,7 @@ sequence and explicit visit counter across visits in one process; foreground hea
 ## Validation record
 
 Push service: `CARGO_INCREMENTAL=0 REDIS_URL=redis://127.0.0.1:6388 cargo test --all-targets`
-passed 352 tests. `CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings`,
+passed 360 tests after independent-review repairs (352 before those repairs). `CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings`,
 `cargo fmt --all -- --check`, and `git diff --check` passed.
 
 Gateway: 17 focused integration tests, focused Clippy with warnings denied,
@@ -107,7 +107,22 @@ suite exposed an existing profile-search failure and a long-running archive
 provenance test; all-target Clippy reports 14 existing errors in unchanged
 legacy tests. See the gateway checkpoint for exact commands and logs.
 
-Mobile: initial checks passed; independent review found interactive signer
-prompts and first-visit recovery after offline startup. Fixes and final review
-are in progress. The mobile PR must remain draft until real base/head simulator
+Mobile: independent review findings for interactive signer prompts, offline first-visit
+recovery, and superseded timestamp retries are fixed. Final verification passed
+343 related app tests and full lib/test/integration_test analysis; the lifecycle
+fix also passed 199 focused app tests and the full 477-test API client suite.
+Five NIP-55 channel tests passed before the final transport/test-fake fixes.
+Final whole-diff independent review found no actionable code findings. The mobile PR must remain draft until real base/head simulator
 screenshots demonstrate lifecycle and digest tap behavior with safe test data.
+
+Independent push review exposed retry cooldown bypasses, inverted quiet-hour
+configuration, ingest rebinding during a visit, and pre-reservation delivery
+retry rebinding. Regression tests reproduced each bug before repair. Final
+360-test output is in /tmp/visit-push-reviewed-all-tests.log; strict Clippy is
+in /tmp/visit-push-reviewed-clippy.log. Build debug symbols and incremental
+artifacts were disabled for the final checks to fit the shared machine's disk.
+
+Delivery targets: push PR #88, Funnelcake PR #1410, mobile PR #10567. Push and
+mobile remain draft pending actual safe-data base/head device evidence. Gateway
+CI explicitly runs the new endpoint integration target. Current-head independent
+push re-review and final live CI inspection are still required.

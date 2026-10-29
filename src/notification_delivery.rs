@@ -121,6 +121,19 @@ pub async fn reserve_budget_for_generation(
         if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
           local reserved_generation = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
           if reserved_generation ~= generation then return {2, 0} end
+          -- A retry keeps its original allowance, but cannot jump a newer
+          -- notification. Refresh its attempt time so subsequent sends wait
+          -- a full interval after this provider submission as well.
+          local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+          for i = 1, #latest, 2 do
+            if latest[i] ~= ARGV[1] then
+              local remaining = tonumber(latest[i + 1]) + tonumber(ARGV[4]) - now
+              if remaining > 0 then return {4, remaining} end
+            end
+          end
+          redis.call('ZADD', KEYS[1], now, ARGV[1])
+          redis.call('EXPIRE', KEYS[1], 86400)
+          redis.call('EXPIRE', KEYS[4], 86400)
           return {0, 0}
         end
         local used = tonumber(redis.call('HGET', KEYS[2], 'absence_used'))
@@ -167,6 +180,7 @@ pub async fn validate_reservation(
     pool: &RedisPool,
     recipient: &PublicKey,
     identity: &str,
+    settings: &DeliverySettings,
     generation: Option<u64>,
 ) -> Result<bool> {
     let mut conn = pool
@@ -183,7 +197,17 @@ pub async fn validate_reservation(
         local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
         if not score or tonumber(score) <= now - 86400 then return 0 end
         local reserved_generation = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
-        return generation == reserved_generation
+        if generation ~= reserved_generation then return 0 end
+        local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+        for i = 1, #latest, 2 do
+          if latest[i] ~= ARGV[1] and tonumber(latest[i + 1]) + tonumber(ARGV[3]) > now then
+            return 0
+          end
+        end
+        redis.call('ZADD', KEYS[1], now, ARGV[1])
+        redis.call('EXPIRE', KEYS[1], 86400)
+        redis.call('EXPIRE', KEYS[4], 86400)
+        return 1
     "#,
     )
     .key(format!("delivery_budget:{}", recipient.to_hex()))
@@ -204,6 +228,7 @@ pub async fn validate_reservation(
             .map(|generation| generation.to_string())
             .unwrap_or_default(),
     )
+    .arg(settings.min_interval_secs)
     .invoke_async(&mut *conn)
     .await
     .map_err(ServiceError::Redis)

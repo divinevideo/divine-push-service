@@ -553,7 +553,7 @@ impl Settings {
         let delivery = &self.service.delivery;
         if delivery.quiet_start_hour > 23
             || delivery.quiet_end_hour > 23
-            || delivery.quiet_start_hour == delivery.quiet_end_hour
+            || delivery.quiet_start_hour <= delivery.quiet_end_hour
             || delivery.hourly_cap == 0
             || delivery.daily_cap == 0
             || delivery.max_event_age_secs == 0
@@ -825,6 +825,27 @@ mod tests {
             assert!(
                 load_runtime_settings(filename).validate().is_ok(),
                 "{filename} must load"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_settings_must_cover_the_overnight_quiet_period() {
+        let mut settings = load_runtime_settings("settings.yaml");
+        for (start, end) in [(10, 20), (7, 21), (0, 7), (21, 6), (22, 7), (7, 7)] {
+            settings.service.delivery.quiet_start_hour = start;
+            settings.service.delivery.quiet_end_hour = end;
+            assert!(
+                settings.validate().is_err(),
+                "{start} to {end} must not weaken overnight quiet hours"
+            );
+        }
+        for (start, end) in [(21, 7), (20, 8), (12, 11)] {
+            settings.service.delivery.quiet_start_hour = start;
+            settings.service.delivery.quiet_end_hour = end;
+            assert!(
+                settings.validate().is_ok(),
+                "{start} to {end} covers overnight quiet hours"
             );
         }
     }

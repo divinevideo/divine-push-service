@@ -118,6 +118,43 @@ pub async fn current_generation(pool: &RedisPool, recipient: &PublicKey) -> Resu
     Ok(generation.unwrap_or(0))
 }
 
+/// Bind a recipient/work identity before fallible preflight. A retry must retain
+/// its first generation even when no interruption slot was reserved yet.
+/// Retain at least a week, and longer when the work's expiry requires it.
+pub async fn generation_for_work(
+    pool: &RedisPool,
+    recipient: &PublicKey,
+    identity: &str,
+    retention_secs: u64,
+) -> Result<u64> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    redis::Script::new(
+        r#"
+        local generation = redis.call('GET', KEYS[1])
+        if not generation then
+          generation = redis.call('HGET', KEYS[2], 'generation') or '0'
+          redis.call('SET', KEYS[1], generation, 'EX', ARGV[1])
+        elseif redis.call('TTL', KEYS[1]) < tonumber(ARGV[1]) then
+          redis.call('EXPIRE', KEYS[1], ARGV[1])
+        end
+        return tonumber(generation)
+    "#,
+    )
+    .key(format!(
+        "notification_work_generation:{}:{}",
+        recipient.to_hex(),
+        blake3::hash(identity.as_bytes()).to_hex()
+    ))
+    .key(format!("{STATE_PREFIX}{}", recipient.to_hex()))
+    .arg(retention_secs.max(SESSION_TTL_SECS))
+    .invoke_async(&mut *conn)
+    .await
+    .map_err(ServiceError::Redis)
+}
+
 /// Presence is account-wide: a background device cannot clear another lease.
 pub async fn is_active(pool: &RedisPool, recipient: &PublicKey) -> Result<bool> {
     let mut conn = pool
