@@ -8,7 +8,8 @@ With `coalesce_immediate_limit = 0` (the default), every like and repost buffers
 from the first interaction. All posts and both types share one recipient,
 visit-generation, and Redis-clock bucket. The existing leased outbox flushes
 one data-only `activityDigest` push with title `New activity` and copy such as
-`Your videos got 3 likes and 2 reposts.` Counts describe interactions, with
+`You received 3 likes and 2 reposts.` The generic wording also covers reactions
+to comments and notes. Counts describe interactions, with
 singular forms for one like or repost. One actor acting on two posts counts
 twice; repeated actor/canonical-target/category actions across different signed
 event IDs count once within the group. The payload carries the full recipient

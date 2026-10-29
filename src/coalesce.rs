@@ -1038,7 +1038,7 @@ pub fn build_summary_payload(
         data.insert("title".to_string(), "New activity".to_string());
         data.insert(
             "body".to_string(),
-            format!("Your videos got {}.", activities.join(" and ")),
+            format!("You received {}.", activities.join(" and ")),
         );
         data.insert(
             "eventId".to_string(),
@@ -2157,7 +2157,7 @@ mod tests {
         let data = build_summary_payload(&snapshot, &owner, "", "digest-collapse")
             .data
             .unwrap();
-        assert_eq!(data["body"], "Your videos got 3 likes and 2 reposts.");
+        assert_eq!(data["body"], "You received 3 likes and 2 reposts.");
         assert_eq!(data["title"], "New activity");
         assert_eq!(data["eventId"], first_event);
         assert_eq!(data["receiverPubkey"], owner.to_hex());
@@ -2238,7 +2238,7 @@ mod tests {
         let data = build_summary_payload(&snapshot, &owner, "", "digest")
             .data
             .unwrap();
-        assert_eq!(data["body"], "Your videos got 2 likes and 1 repost.");
+        assert_eq!(data["body"], "You received 2 likes and 1 repost.");
         cleanup_group(&pool, &group_id).await;
     }
 
@@ -2292,7 +2292,7 @@ mod tests {
             build_summary_payload(&snapshot, &owner, "", "digest")
                 .data
                 .unwrap()["body"],
-            "Your videos got 1024 likes and 1024 reposts."
+            "You received 1024 likes and 1024 reposts."
         );
         let mut conn = pool.get().await.unwrap();
         let fields_before: u64 = redis::cmd("HLEN")
@@ -2335,7 +2335,7 @@ mod tests {
             build_summary_payload(&snapshot, &owner, "", "digest")
                 .data
                 .unwrap()["body"],
-            "Your videos got at least 1024 likes and at least 1024 reposts."
+            "You received at least 1024 likes and at least 1024 reposts."
         );
         let mut conn = pool.get().await.unwrap();
         let fields_after: u64 = redis::cmd("HLEN")
@@ -2464,7 +2464,7 @@ mod tests {
         let messages = sender.get_sent_messages();
         let data = messages[0].1.data.as_ref().unwrap();
         assert_eq!(data["type"], "activityDigest");
-        assert_eq!(data["body"], "Your videos got 1 repost.");
+        assert_eq!(data["body"], "You received 1 repost.");
         assert!(!data.contains_key("senderPubkey"));
         assert!(load_group(&state.redis_pool, &group_id)
             .await
@@ -2496,7 +2496,7 @@ mod tests {
         ));
         assert_eq!(
             sender.get_sent_messages()[0].1.data.as_ref().unwrap()["body"],
-            "Your videos got 1 like."
+            "You received 1 like."
         );
     }
 
