@@ -347,6 +347,13 @@ async fn a_delayed_retry_refreshes_the_gap_for_the_next_notification() {
 #[tokio::test]
 async fn preflight_retries_keep_the_first_work_generation_without_spending_allowance() {
     let (pool, owner) = setup().await;
+    redis_store::add_or_update_token(
+        &pool,
+        &owner,
+        &format!("synthetic-bound-work-{}", owner.to_hex()),
+    )
+    .await
+    .unwrap();
     let first = activity::generation_for_work(&pool, &owner, "campaign:pending", 86400)
         .await
         .unwrap();

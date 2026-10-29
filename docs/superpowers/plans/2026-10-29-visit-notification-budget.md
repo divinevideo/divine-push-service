@@ -98,7 +98,7 @@ sequence and explicit visit counter across visits in one process; foreground hea
 ## Validation record
 
 Push service: `CARGO_INCREMENTAL=0 REDIS_URL=redis://127.0.0.1:6388 cargo test --all-targets`
-passed 360 tests after independent-review repairs (352 before those repairs). `CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings`,
+passed 361 tests after independent-review repairs (352 before those repairs). `CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings`,
 `cargo fmt --all -- --check`, and `git diff --check` passed.
 
 Gateway: 17 focused integration tests, focused Clippy with warnings denied,
@@ -118,7 +118,7 @@ screenshots demonstrate lifecycle and digest tap behavior with safe test data.
 Independent push review exposed retry cooldown bypasses, inverted quiet-hour
 configuration, ingest rebinding during a visit, and pre-reservation delivery
 retry rebinding. Regression tests reproduced each bug before repair. Final
-360-test output is in /tmp/visit-push-reviewed-all-tests.log; strict Clippy is
+361-test output is in /tmp/visit-push-reviewed-all-tests.log; strict Clippy is
 in /tmp/visit-push-reviewed-clippy.log. Build debug symbols and incremental
 artifacts were disabled for the final checks to fit the shared machine's disk.
 
@@ -126,3 +126,10 @@ Delivery targets: push PR #88, Funnelcake PR #1410, mobile PR #10567. Push and
 mobile remain draft pending actual safe-data base/head device evidence. Gateway
 CI explicitly runs the new endpoint integration target. Current-head independent
 push re-review and final live CI inspection are still required.
+
+A final review also found public events could create work markers for
+unregistered or statically ineligible recipients. The registration/age/allowlist
+regression failed before repair. Static checks now precede binding and the Lua
+binding writes/renews only for registered accounts. Final 361 tests and strict
+Clippy are recorded in /tmp/visit-push-final-registration-tests.log and
+/tmp/visit-push-final-registration-clippy.log.

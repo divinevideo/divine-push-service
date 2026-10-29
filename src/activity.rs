@@ -121,6 +121,7 @@ pub async fn current_generation(pool: &RedisPool, recipient: &PublicKey) -> Resu
 /// Bind a recipient/work identity before fallible preflight. A retry must retain
 /// its first generation even when no interruption slot was reserved yet.
 /// Retain at least a week, and longer when the work's expiry requires it.
+/// Public activity for an account without registered devices creates no marker.
 pub async fn generation_for_work(
     pool: &RedisPool,
     recipient: &PublicKey,
@@ -134,10 +135,11 @@ pub async fn generation_for_work(
     redis::Script::new(
         r#"
         local generation = redis.call('GET', KEYS[1])
+        local registered = redis.call('EXISTS', KEYS[3]) == 1
         if not generation then
           generation = redis.call('HGET', KEYS[2], 'generation') or '0'
-          redis.call('SET', KEYS[1], generation, 'EX', ARGV[1])
-        elseif redis.call('TTL', KEYS[1]) < tonumber(ARGV[1]) then
+          if registered then redis.call('SET', KEYS[1], generation, 'EX', ARGV[1]) end
+        elseif registered and redis.call('TTL', KEYS[1]) < tonumber(ARGV[1]) then
           redis.call('EXPIRE', KEYS[1], ARGV[1])
         end
         return tonumber(generation)
@@ -149,6 +151,7 @@ pub async fn generation_for_work(
         blake3::hash(identity.as_bytes()).to_hex()
     ))
     .key(format!("{STATE_PREFIX}{}", recipient.to_hex()))
+    .key(format!("user_tokens:{}", recipient.to_hex()))
     .arg(retention_secs.max(SESSION_TTL_SECS))
     .invoke_async(&mut *conn)
     .await

@@ -1698,21 +1698,6 @@ async fn send_notification_trigger_to_user(
 ) -> Result<()> {
     let event_id = trigger.event_id();
     let pubkey_hex = target_pubkey.to_hex();
-    let work_identity = format!("event:{event_id}");
-    let retention_secs = state
-        .settings
-        .service
-        .delivery
-        .max_event_age_secs
-        .max(state.settings.service.coalesce_group_ttl_secs)
-        .max(86_400);
-    let visit_generation = crate::activity::generation_for_work(
-        &state.redis_pool,
-        target_pubkey,
-        &work_identity,
-        retention_secs,
-    )
-    .await?;
     if let Some(event) = trigger.nostr_event() {
         if Timestamp::now()
             .as_secs()
@@ -1735,6 +1720,21 @@ async fn send_notification_trigger_to_user(
         return Ok(());
     }
 
+    let work_identity = format!("event:{event_id}");
+    let retention_secs = state
+        .settings
+        .service
+        .delivery
+        .max_event_age_secs
+        .max(state.settings.service.coalesce_group_ttl_secs)
+        .max(86_400);
+    let visit_generation = crate::activity::generation_for_work(
+        &state.redis_pool,
+        target_pubkey,
+        &work_identity,
+        retention_secs,
+    )
+    .await?;
     // Check if user has tokens registered
     let tokens = tokio::select! {
         biased;
@@ -6027,6 +6027,64 @@ mod tests {
         redis_store::remove_token(&pool, &owner, &device)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ineligible_public_activity_does_not_persist_work_markers() {
+        let pool = test_redis_pool().await.expect("Redis is required");
+        for (registered, expired, blocked) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let owner = Keys::generate().public_key();
+            let device = format!("synthetic-static-gate-{}", owner.to_hex());
+            if registered {
+                add_awake_test_token(&pool, &owner, &device).await.unwrap();
+            }
+            let mut settings = crate::config::Settings::new().unwrap();
+            settings.service.allowed_pubkeys = if blocked {
+                vec![Keys::generate().public_key().to_hex()]
+            } else {
+                vec![]
+            };
+            let state = test_app_state(
+                settings,
+                pool.clone(),
+                FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+            );
+            let event = EventBuilder::new(Kind::Reaction, "+")
+                .tag(Tag::public_key(owner))
+                .tag(Tag::event(EventId::all_zeros()))
+                .custom_created_at(Timestamp::from(
+                    Timestamp::now().as_secs() - if expired { 7200 } else { 0 },
+                ))
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            send_notification_to_user(
+                &state,
+                &event,
+                &owner,
+                NotificationType::Like,
+                &test_copy(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let markers: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("notification_work_generation:{}:*", owner.to_hex()))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert!(markers.is_empty(), "registered={registered}, expired={expired}, blocked={blocked} must not persist delivery work");
+            drop(conn);
+            if registered {
+                redis_store::remove_token(&pool, &owner, &device)
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     #[tokio::test]
