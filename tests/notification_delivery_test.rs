@@ -7,13 +7,13 @@ use nostr_sdk::Keys;
 #[test]
 fn quiet_hours_follow_device_offset_and_midnight_boundaries() {
     let settings = DeliverySettings::default();
-    // 22:00 UTC, 21:59 UTC, 08:00 UTC, 07:59 UTC.
-    assert!(in_quiet_hours(0, 79_200, &settings));
-    assert!(!in_quiet_hours(0, 79_199, &settings));
-    assert!(!in_quiet_hours(0, 28_800, &settings));
-    assert!(in_quiet_hours(0, 28_799, &settings));
-    assert!(in_quiet_hours(330, 59_400, &settings));
-    assert!(!in_quiet_hours(-480, 59_400, &settings));
+    // 21:00 UTC, 20:59 UTC, 07:00 UTC, 06:59 UTC.
+    assert!(in_quiet_hours(0, 75_600, &settings));
+    assert!(!in_quiet_hours(0, 75_599, &settings));
+    assert!(!in_quiet_hours(0, 25_200, &settings));
+    assert!(in_quiet_hours(0, 25_199, &settings));
+    assert!(in_quiet_hours(330, 55_800, &settings));
+    assert!(!in_quiet_hours(-480, 55_800, &settings));
 }
 
 #[tokio::test]
@@ -26,6 +26,8 @@ async fn recipient_budget_is_atomic_shared_and_retry_idempotent() {
     let settings = DeliverySettings {
         hourly_cap: 2,
         daily_cap: 3,
+        min_interval_secs: 0,
+        absence_cap: 100,
         ..Default::default()
     };
     let (a, b, c) = tokio::join!(
@@ -106,7 +108,7 @@ fn named_timezone_follows_dst_without_a_new_registration() {
 }
 
 #[tokio::test]
-async fn quiet_device_does_not_silence_awake_or_legacy_devices() {
+async fn quiet_and_unknown_devices_do_not_silence_an_awake_device() {
     use divine_push_service::notification_delivery::social_tokens;
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let pool = redis_store::create_pool(&url, 5).await.unwrap();
@@ -136,10 +138,7 @@ async fn quiet_device_does_not_silence_awake_or_legacy_devices() {
         .await
         .unwrap();
     tokens.sort();
-    assert_eq!(
-        tokens,
-        ["synthetic-awake-device", "synthetic-legacy-device"]
-    );
+    assert_eq!(tokens, ["synthetic-awake-device"]);
     for token in [
         "synthetic-quiet-device",
         "synthetic-awake-device",

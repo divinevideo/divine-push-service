@@ -320,8 +320,8 @@ fn default_coalesce_window() -> u64 {
 }
 
 fn default_coalesce_immediate_limit() -> u64 {
-    // The first interaction is immediate; the rest are summarized.
-    1
+    // Every interaction belongs to the account summary, including the first.
+    0
 }
 
 fn default_coalesce_lease() -> u64 {
@@ -557,12 +557,17 @@ impl Settings {
             || delivery.hourly_cap == 0
             || delivery.daily_cap == 0
             || delivery.max_event_age_secs == 0
+            || delivery.min_interval_secs < 21600
+            || delivery.absence_cap == 0
+            || delivery.absence_cap > 2
+            || delivery.quiet_start_hour > 21
+            || delivery.quiet_end_hour < 7
         {
             return Err(ConfigError::Message(
-                "service.delivery requires distinct hours in 0..23 and positive caps/age".into(),
+                "service.delivery requires quiet hours covering 21:00-07:00, a six-hour minimum gap, and an absence cap of 1 or 2".into(),
             ));
         }
-        let must_be_positive: [(&str, u64, &str); 24] = [
+        let must_be_positive: [(&str, u64, &str); 23] = [
             (
                 "nostr.event_silence_timeout_secs",
                 self.nostr.event_silence_timeout_secs,
@@ -627,11 +632,6 @@ impl Settings {
                 "service.coalesce_window_secs",
                 self.service.coalesce_window_secs,
                 "bucket identifiers divide by zero and no like or repost can be buffered",
-            ),
-            (
-                "service.coalesce_immediate_limit",
-                self.service.coalesce_immediate_limit,
-                "every like and repost is buffered and no summary ever has an immediate predecessor",
             ),
             (
                 "service.coalesce_lease_secs",
@@ -836,7 +836,7 @@ mod tests {
 
         // One case per field, because a loop over the same setter would pass
         // just as well against a `validate` that only checks the first.
-        let cases: [ZeroCase; 24] = [
+        let cases: [ZeroCase; 23] = [
             ("nostr.event_silence_timeout_secs", |s| {
                 s.nostr.event_silence_timeout_secs = 0
             }),
@@ -875,9 +875,6 @@ mod tests {
             }),
             ("service.coalesce_window_secs", |s| {
                 s.service.coalesce_window_secs = 0
-            }),
-            ("service.coalesce_immediate_limit", |s| {
-                s.service.coalesce_immediate_limit = 0
             }),
             ("service.coalesce_lease_secs", |s| {
                 s.service.coalesce_lease_secs = 0
@@ -1004,7 +1001,7 @@ mod tests {
 
             let settings = load_runtime_settings(filename);
             assert_eq!(settings.service.coalesce_window_secs, 7200);
-            assert_eq!(settings.service.coalesce_immediate_limit, 1);
+            assert_eq!(settings.service.coalesce_immediate_limit, 0);
             assert_eq!(settings.service.coalesce_lease_secs, 300);
             assert_eq!(settings.service.coalesce_retry_secs, 5);
             assert_eq!(settings.service.coalesce_poll_millis, 250);

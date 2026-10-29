@@ -341,6 +341,16 @@ async fn deliver(
     let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
     };
+    let visit_generation =
+        match crate::activity::current_generation(&state.redis_pool, &recipient).await {
+            Ok(generation) => generation,
+            Err(_) => {
+                return refuse(
+                    DeliveryStatus::RetryableFailure,
+                    "activity_authority_unavailable",
+                )
+            }
+        };
 
     let recipient_hex = recipient.to_hex();
     let allowed = &state.settings.service.allowed_pubkeys;
@@ -455,16 +465,17 @@ async fn deliver(
         );
     }
 
-    match crate::notification_delivery::reserve_budget(
+    match crate::notification_delivery::reserve_budget_for_generation(
         &state.redis_pool,
         &recipient,
         &format!("campaign:{}", delivery.idempotency_key),
         &state.settings.service.delivery,
+        Some(visit_generation),
     )
     .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(crate::notification_delivery::BudgetDecision::Allowed) => {}
+        Ok(_) => {
             release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
             return refuse(DeliveryStatus::Suppressed, "recipient_frequency_capped");
         }
@@ -478,6 +489,27 @@ async fn deliver(
     }
     let mut payload = campaign_payload(delivery, &recipient);
     crate::notification_delivery::immediate_delivery(&mut payload);
+    match crate::notification_delivery::validate_reservation(
+        &state.redis_pool,
+        &recipient,
+        &format!("campaign:{}", delivery.idempotency_key),
+        Some(visit_generation),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::Suppressed, "recipient_returned");
+        }
+        Err(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(
+                DeliveryStatus::RetryableFailure,
+                "activity_authority_unavailable",
+            );
+        }
+    }
     let outcomes = state.fcm_client.send_batch(&tokens, payload).await;
 
     let mut delivered_tokens = Vec::new();
@@ -1107,7 +1139,7 @@ mod tests {
             &crate::notification_delivery::DeliverySettings::default(),
         )
         .expect("22:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T22:00:00Z");
+        assert_eq!(retry, "2026-01-01T21:00:00Z");
 
         let retry = quiet_hours_retry_after(
             -480,
@@ -1115,7 +1147,7 @@ mod tests {
             &crate::notification_delivery::DeliverySettings::default(),
         )
         .expect("04:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T16:00:00Z");
+        assert_eq!(retry, "2026-01-01T15:00:00Z");
     }
 
     #[test]
@@ -1126,19 +1158,21 @@ mod tests {
         let at_twenty_one = chrono::DateTime::parse_from_rfc3339("2026-01-01T21:00:00Z")
             .unwrap()
             .timestamp();
-        assert!(quiet_hours_retry_after(
-            0,
-            at_seven,
-            &crate::notification_delivery::DeliverySettings::default()
-        )
-        .is_some());
+        assert_eq!(
+            quiet_hours_retry_after(
+                0,
+                at_seven,
+                &crate::notification_delivery::DeliverySettings::default()
+            ),
+            None
+        );
         assert_eq!(
             quiet_hours_retry_after(
                 0,
                 at_twenty_one,
                 &crate::notification_delivery::DeliverySettings::default()
             ),
-            None
+            Some("2026-01-02T07:00:00Z".into())
         );
     }
 
@@ -1811,7 +1845,7 @@ mod tests {
         let result = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Deferred);
         assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
-        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T22:00:00Z"));
+        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T21:00:00Z"));
         assert_eq!(
             claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
             -2,

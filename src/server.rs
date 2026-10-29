@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use axum::{
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -57,6 +57,7 @@ pub struct ServerState {
     metrics: PrometheusHandle,
     internal_api_token: Option<String>,
     direct_message_delivery: Arc<dyn DirectMessageDelivery>,
+    activity_pool: Option<crate::redis_store::RedisPool>,
 }
 
 impl ServerState {
@@ -71,6 +72,7 @@ impl ServerState {
             health,
             metrics,
             internal_api_token: app_state.settings.server.internal_api_token.clone(),
+            activity_pool: Some(app_state.redis_pool.clone()),
             direct_message_delivery: Arc::new(AppDirectMessageDelivery { app_state, token }),
         }
     }
@@ -89,6 +91,77 @@ struct DirectMessageRequest {
 enum DirectMessageType {
     ModerationNotice,
     ReportOutcome,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActivityRequest {
+    recipient_pubkey: String,
+    session_id: uuid::Uuid,
+    sequence: u32,
+    visit: u32,
+    state: crate::activity::ActivityState,
+}
+
+async fn activity(
+    State(state): State<ServerState>,
+    Json(request): Json<ActivityRequest>,
+) -> Response {
+    let recipient = match PublicKey::from_hex(&request.recipient_pubkey) {
+        Ok(recipient) => recipient,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid recipientPubkey"),
+    };
+    let update = crate::activity::ActivityUpdate {
+        session_id: request.session_id,
+        sequence: request.sequence,
+        visit: request.visit,
+        state: request.state,
+    };
+    if !update.is_valid() {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid activity sequence");
+    }
+    let Some(pool) = state.activity_pool.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Activity authority unavailable",
+        );
+    };
+    match crate::activity::record_activity(pool, &recipient, &update).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(error=%error,"Activity update failed");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Activity authority unavailable",
+            )
+        }
+    }
+}
+
+async fn require_activity_token(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected_token) = state.internal_api_token.as_deref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Internal push endpoint is not configured",
+        );
+    };
+    if !has_bearer_token(request.headers(), expected_token) {
+        return error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    next.run(request).await
+}
+
+async fn activity_no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    response
 }
 
 /// Reports `503` when any critical task has died, so a pod whose delivery
@@ -221,6 +294,16 @@ pub fn router(state: ServerState) -> Router {
         .route("/health", get(health_check))
         .route("/metrics", get(metrics))
         .route(
+            "/internal/v1/activity",
+            post(activity)
+                .layer(DefaultBodyLimit::max(4096))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_activity_token,
+                ))
+                .layer(middleware::from_fn(activity_no_store)),
+        )
+        .route(
             "/internal/v1/direct-message",
             post(direct_message).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -326,8 +409,99 @@ mod tests {
             health,
             metrics,
             internal_api_token: Some("test-token".to_string()),
+            activity_pool: None,
             direct_message_delivery: Arc::new(MockDelivery::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn activity_endpoint_requires_the_internal_bearer() {
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/activity")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn authenticated_activity_applies_once_and_acks_duplicate_messages() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let pool = crate::redis_store::create_pool(&url, 2).await.unwrap();
+        let owner = nostr_sdk::Keys::generate().public_key();
+        let session = uuid::Uuid::new_v4();
+        let mut state = server_state(Arc::new(TaskHealth::new()));
+        state.activity_pool = Some(pool.clone());
+        let app = router(state);
+        for (sequence, presence) in [
+            (1, "foreground"),
+            (1, "foreground"),
+            (2, "background"),
+            (1, "foreground"),
+        ] {
+            let body = serde_json::json!({"recipientPubkey":owner.to_hex(),"sessionId":session,"sequence":sequence,"visit":1,"state":presence});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/v1/activity")
+                        .header(header::AUTHORIZATION, "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(
+                crate::activity::current_generation(&pool, &owner)
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        assert!(!crate::activity::is_active(&pool, &owner).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn activity_endpoint_rejects_invalid_sequence_and_oversized_body() {
+        let owner = nostr_sdk::Keys::generate().public_key().to_hex();
+        for body in [
+            serde_json::json!({"recipientPubkey":owner,"sessionId":uuid::Uuid::new_v4(),"sequence":0,"visit":1,"state":"foreground"}).to_string(),
+            serde_json::json!({"recipientPubkey":owner,"sessionId":uuid::Uuid::new_v4(),"sequence":2147483648_u64,"visit":1,"state":"foreground"}).to_string(),
+            serde_json::json!({"recipientPubkey":owner,"sessionId":uuid::Uuid::new_v4(),"sequence":1,"visit":1,"state":"foreground","unknown":true}).to_string(),
+        ] {
+            let response = router(server_state(Arc::new(TaskHealth::new())))
+                .oneshot(Request::builder().method("POST").uri("/internal/v1/activity")
+                    .header(header::AUTHORIZATION,"Bearer test-token")
+                    .header("content-type","application/json").body(Body::from(body)).unwrap())
+                .await.unwrap();
+            assert!(response.status().is_client_error());
+            assert_ne!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CACHE_CONTROL],"no-store");
+        }
+        let response = router(server_state(Arc::new(TaskHealth::new())))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/activity")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(" ".repeat(4097)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
@@ -448,6 +622,7 @@ mod tests {
             health: Arc::new(TaskHealth::new()),
             metrics: handle,
             internal_api_token: Some("test-token".to_string()),
+            activity_pool: None,
             direct_message_delivery: Arc::new(MockDelivery::default()),
         })
         .oneshot(
@@ -560,6 +735,7 @@ mod tests {
             health: Arc::new(TaskHealth::new()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
             internal_api_token: Some("test-token".to_string()),
+            activity_pool: None,
             direct_message_delivery: delivery.clone(),
         };
         let response = router(state)
@@ -581,6 +757,7 @@ mod tests {
             health: Arc::new(TaskHealth::new()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
             internal_api_token: Some("test-token".to_string()),
+            activity_pool: None,
             direct_message_delivery: Arc::new(FailingDelivery(ServiceError::Internal(
                 "private Redis host".to_string(),
             ))),
@@ -608,6 +785,7 @@ mod tests {
             health: Arc::new(TaskHealth::new()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
             internal_api_token: Some("test-token".to_string()),
+            activity_pool: None,
             direct_message_delivery: Arc::new(FailingDelivery(ServiceError::Cancelled)),
         };
         let response = router(state)
