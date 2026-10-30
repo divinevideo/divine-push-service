@@ -96,6 +96,21 @@ pub enum BudgetDecision {
     Capped,
 }
 
+impl BudgetDecision {
+    /// Policy outcome label for a refusal. Each cause keeps its own label so an
+    /// exhausted absence allowance is not reported as an hourly/daily cap.
+    fn refusal_outcome(self) -> Option<&'static str> {
+        match self {
+            Self::Allowed => None,
+            Self::Active => Some("active"),
+            Self::StaleVisit => Some("stale_visit"),
+            Self::AllowanceExhausted => Some("allowance_exhausted"),
+            Self::Cooldown { .. } => Some("cooldown"),
+            Self::Capped => Some("frequency_capped"),
+        }
+    }
+}
+
 /// Atomically authorize one account interruption. Generation-aware queued work
 /// is fenced by a foreground transition, including a transition after leasing.
 pub async fn reserve_budget_for_generation(
@@ -168,8 +183,8 @@ pub async fn reserve_budget_for_generation(
         (4, retry_after_secs) => BudgetDecision::Cooldown { retry_after_secs },
         _ => BudgetDecision::Capped,
     };
-    if decision != BudgetDecision::Allowed {
-        outcome("frequency_capped");
+    if let Some(reason) = decision.refusal_outcome() {
+        outcome(reason);
     }
     Ok(decision)
 }
@@ -264,4 +279,29 @@ pub fn immediate_delivery(payload: &mut FcmPayload) {
 
 pub(crate) fn outcome(reason: &'static str) {
     metrics::counter!("push_delivery_policy_total", "outcome" => reason).increment(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BudgetDecision;
+
+    #[test]
+    fn each_budget_refusal_reports_its_own_policy_outcome() {
+        assert_eq!(BudgetDecision::Allowed.refusal_outcome(), None);
+        let refusals = [
+            (BudgetDecision::Active, "active"),
+            (BudgetDecision::StaleVisit, "stale_visit"),
+            (BudgetDecision::AllowanceExhausted, "allowance_exhausted"),
+            (
+                BudgetDecision::Cooldown {
+                    retry_after_secs: 60,
+                },
+                "cooldown",
+            ),
+            (BudgetDecision::Capped, "frequency_capped"),
+        ];
+        for (decision, label) in refusals {
+            assert_eq!(decision.refusal_outcome(), Some(label), "{decision:?}");
+        }
+    }
 }
