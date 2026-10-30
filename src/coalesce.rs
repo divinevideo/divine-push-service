@@ -1,9 +1,9 @@
 //! Like and repost coalescing.
 //!
-//! One popular post must not buzz its author once per like. The first few
-//! interactions in a two-hour bucket still send immediately; the rest collect
-//! in a per-`(recipient, type, target, bucket)` group and flush once as a
-//! summary. Bucket boundaries and deadlines come from the Redis server clock
+//! Likes and reposts buffer from the first interaction into one account digest
+//! per visit generation and bucket. A nonzero immediate limit retains the
+//! legacy per-`(recipient, type, target, bucket)` behavior. Bucket boundaries
+//! and deadlines come from the Redis server clock
 //! (`TIME`) inside the ingest script, so every replica agrees and no client
 //! clock participates.
 //!
@@ -48,6 +48,10 @@ pub const DUE_KEY: &str = "coalesce:due";
 pub const LEASES_KEY: &str = "coalesce:leases";
 pub const THROTTLE_PREFIX: &str = "coalesce:throttle:";
 pub const EMITTED_PREFIX: &str = "coalesce:emitted:";
+const ACTIVITY_DIGEST: &str = "activityDigest";
+/// Exact identities retained per category in one digest. At saturation the
+/// count remains a proven lower bound instead of growing Redis without limit.
+const MAX_ACTIONS_PER_CATEGORY: u64 = 1024;
 
 /// Expired leases reconciled in one claim call. Bounded so one claim cannot
 /// stall Redis behind an unbounded recovery pass.
@@ -55,8 +59,8 @@ const MAX_RECOVERY_PER_CLAIM: usize = 64;
 /// Dangling due members removed in one claim call, bounded for the same reason.
 const MAX_DANGLING_SKIPS: usize = 8;
 
-/// Where a like/repost points. A summary can only be built for a group with a
-/// stable target, so events without one keep the immediate path.
+/// Target routing for legacy per-post summaries. Account digests use its
+/// canonical key only to deduplicate an actor's action on the same post.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoalesceTarget {
     /// Redis-safe target identity: `e:{event-id-hex}` or
@@ -105,6 +109,8 @@ pub enum CoalesceDecision {
     },
     /// Recorded in the bucket; no push now.
     Buffered { group_id: String },
+    /// An authenticated visit invalidated this work before ingest committed.
+    StaleVisit,
 }
 
 /// Data the ingest script needs from the trigger event.
@@ -142,6 +148,13 @@ pub struct GroupSnapshot {
     pub pending: u64,
     /// Immediate sends already spent in this bucket.
     pub immediate: u64,
+    /// Visit generation captured atomically at creation. Old groups default to 0.
+    pub generation: u64,
+    /// Interaction totals for an account digest; legacy groups leave these zero.
+    pub likes: u64,
+    pub reposts: u64,
+    pub likes_lower_bound: bool,
+    pub reposts_lower_bound: bool,
     pub first_actor: Option<String>,
     pub first_event: Option<String>,
     pub last_at: Option<u64>,
@@ -377,9 +390,24 @@ pub async fn ingest(
     recipient: &PublicKey,
     ingest: &Ingest<'_>,
 ) -> Result<CoalesceDecision> {
+    let generation = crate::activity::current_generation(pool, recipient).await?;
+    ingest_for_generation(pool, settings, recipient, generation, ingest).await
+}
+
+/// Ingest work using the generation retained before asynchronous preflight.
+/// The Lua fence precedes disposition reads and every mutation, so a visit
+/// cannot relabel stale work or charge a legacy immediate emission.
+pub async fn ingest_for_generation(
+    pool: &RedisPool,
+    settings: &ServiceSettings,
+    recipient: &PublicKey,
+    expected_generation: u64,
+    ingest: &Ingest<'_>,
+) -> Result<CoalesceDecision> {
     const INGEST_SCRIPT: &str = r#"
         local disp_key = KEYS[1]
         local due_key = KEYS[2]
+        local activity_key = KEYS[3]
 
         local window = tonumber(ARGV[1])
         local limit = tonumber(ARGV[2])
@@ -411,6 +439,10 @@ pub async fn ingest(
         local daily_window = tonumber(ARGV[25])
         local daily_cap = tonumber(ARGV[26])
         local emitted_ttl = tonumber(ARGV[27])
+        local action_limit = tonumber(ARGV[28])
+        local action_hash = ARGV[29]
+        local generation = redis.call('HGET', activity_key, 'generation') or '0'
+        if generation ~= ARGV[30] then return {4, ''} end
 
         -- Replay: the same decision and therefore the same collapse id.
         local stored = redis.call('GET', disp_key)
@@ -423,8 +455,16 @@ pub async fn ingest(
         local now = tonumber(redis.call('TIME')[1])
         local bucket = math.floor(now / window)
         local due_at = (bucket + 1) * window
+        local digest = limit == 0
         local gid = ntype .. ':' .. owner .. ':' .. target .. ':' .. bucket
+        if digest then
+          gid = 'activity:' .. owner .. ':' .. generation .. ':' .. bucket
+          -- A cooldown can retain a digest beyond the bucket. Its event
+          -- dispositions must live as long as the pending group.
+          disp_ttl = ttl
+        end
         local gkey = group_prefix .. gid
+        local new_group = redis.call('EXISTS', gkey) == 0
 
         local immediate = tonumber(redis.call('HGET', gkey, 'immediate') or '0')
         local send_immediately = false
@@ -464,17 +504,45 @@ pub async fn ingest(
         redis.call('HSETNX', gkey, 'due', due_at)
         redis.call('HSETNX', gkey, 'expires_at', now + logical_ttl)
         redis.call('HSETNX', gkey, 'owner', owner)
-        redis.call('HSETNX', gkey, 'type', ntype)
-        redis.call('HSETNX', gkey, 'target', target)
-        redis.call('HSETNX', gkey, 'event_kind', event_kind)
-        if ref_event_id ~= '' then
-          redis.call('HSETNX', gkey, 'ref_event_id', ref_event_id)
-        end
-        if ref_address ~= '' then
-          redis.call('HSETNX', gkey, 'ref_address', ref_address)
-          redis.call('HSETNX', gkey, 'ref_kind', ref_kind)
-          redis.call('HSETNX', gkey, 'ref_author', ref_author)
-          redis.call('HSETNX', gkey, 'ref_dtag', ref_dtag)
+        if new_group then redis.call('HSET', gkey, 'generation', generation) end
+        local counted = true
+        if digest then
+          redis.call('HSETNX', gkey, 'type', 'activityDigest')
+          local category = nil
+          if ntype == 'like' then category = 'likes' end
+          if ntype == 'repost' then category = 'reposts' end
+          if category then
+            local action_field = 'action:' .. ntype .. ':' .. action_hash
+            if redis.call('HEXISTS', gkey, action_field) == 1 then
+              -- Different signed events can describe the same action. Keep
+              -- its disposition, but count an actor/target/category only once.
+              redis.call('SET', disp_key, 'b:' .. gid, 'EX', disp_ttl)
+              return {2, gid}
+            end
+            local total = tonumber(redis.call('HGET', gkey, category) or '0')
+            if total < action_limit then
+              redis.call('HSET', gkey, action_field, 1)
+              redis.call('HINCRBY', gkey, category, 1)
+            else
+              -- Bounded exact storage: do not retain more identities or claim
+              -- an exact larger count that retries could inflate.
+              redis.call('HSET', gkey, category .. '_lower_bound', 1)
+              counted = false
+            end
+          end
+        else
+          redis.call('HSETNX', gkey, 'type', ntype)
+          redis.call('HSETNX', gkey, 'target', target)
+          redis.call('HSETNX', gkey, 'event_kind', event_kind)
+          if ref_event_id ~= '' then
+            redis.call('HSETNX', gkey, 'ref_event_id', ref_event_id)
+          end
+          if ref_address ~= '' then
+            redis.call('HSETNX', gkey, 'ref_address', ref_address)
+            redis.call('HSETNX', gkey, 'ref_kind', ref_kind)
+            redis.call('HSETNX', gkey, 'ref_author', ref_author)
+            redis.call('HSETNX', gkey, 'ref_dtag', ref_dtag)
+          end
         end
 
         if send_immediately then
@@ -492,14 +560,14 @@ pub async fn ingest(
           return {1, gid}
         end
 
-        redis.call('HINCRBY', gkey, 'pending', 1)
-        redis.call('HSETNX', gkey, 'first_actor', actor)
+        if counted then redis.call('HINCRBY', gkey, 'pending', 1) end
+        if not digest then redis.call('HSETNX', gkey, 'first_actor', actor) end
         redis.call('HSETNX', gkey, 'first_event', event_id)
         local last_at = tonumber(redis.call('HGET', gkey, 'last_at') or '0')
         if created_at > last_at then
           redis.call('HSET', gkey, 'last_at', created_at)
         end
-        redis.call('PFADD', hll_prefix .. gid, actor)
+        if not digest then redis.call('PFADD', hll_prefix .. gid, actor) end
         redis.call('EXPIRE', gkey, ttl)
         redis.call('EXPIRE', hll_prefix .. gid, ttl)
         redis.call('ZADD', due_key, 'NX', due_at, gid)
@@ -524,6 +592,20 @@ pub async fn ingest(
     let physical_ttl = logical_ttl.saturating_add(grace);
     let disp_ttl = window.saturating_add(grace);
     let throttle_ttl = throttle_key_ttl(settings);
+    let action_hash = if settings.coalesce_immediate_limit == 0 {
+        let mut hasher = blake3::Hasher::new();
+        for component in [
+            ingest.notification_type.display_name(),
+            ingest.actor,
+            &ingest.target.key,
+        ] {
+            hasher.update(&(component.len() as u64).to_be_bytes());
+            hasher.update(component.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    } else {
+        String::new()
+    };
 
     let ref_event_id = ingest.target.event_id.clone().unwrap_or_default();
     let (ref_address, ref_kind, ref_author, ref_dtag) = match &ingest.target.address {
@@ -539,6 +621,11 @@ pub async fn ingest(
     let decision: (i64, String) = redis::Script::new(INGEST_SCRIPT)
         .key(disposition_key(ingest.event_id, recipient))
         .key(DUE_KEY)
+        .key(format!(
+            "{}{}",
+            crate::activity::STATE_PREFIX,
+            recipient.to_hex()
+        ))
         .arg(window)
         .arg(settings.coalesce_immediate_limit)
         .arg(physical_ttl)
@@ -566,12 +653,16 @@ pub async fn ingest(
         .arg(settings.recipient_daily_window_secs)
         .arg(settings.recipient_daily_cap)
         .arg(emitted_key_ttl(settings))
+        .arg(MAX_ACTIONS_PER_CATEGORY)
+        .arg(action_hash)
+        .arg(expected_generation)
         .invoke_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
 
     let collapse_key = collapse_key_for_group(&decision.1);
     match decision.0 {
+        4 => Ok(CoalesceDecision::StaleVisit),
         1 => Ok(CoalesceDecision::Immediate {
             group_id: decision.1,
             collapse_key,
@@ -876,6 +967,11 @@ pub async fn load_group(pool: &RedisPool, group_id: &str) -> Result<Option<Group
         expires_at: number("expires_at"),
         pending: number("pending"),
         immediate: number("immediate"),
+        generation: number("generation"),
+        likes: number("likes"),
+        reposts: number("reposts"),
+        likes_lower_bound: number("likes_lower_bound") != 0,
+        reposts_lower_bound: number("reposts_lower_bound") != 0,
         first_actor: get("first_actor"),
         first_event: get("first_event"),
         last_at: get("last_at").and_then(|value| value.parse::<u64>().ok()),
@@ -937,6 +1033,54 @@ pub fn build_summary_payload(
     collapse_key: &str,
 ) -> FcmPayload {
     let mut data = HashMap::new();
+
+    if snapshot.notification_type == ACTIVITY_DIGEST {
+        let count = |amount, singular: &str, lower_bound| {
+            format!(
+                "{}{amount} {singular}{}",
+                if lower_bound { "at least " } else { "" },
+                if amount == 1 { "" } else { "s" }
+            )
+        };
+        let mut activities = Vec::new();
+        if snapshot.likes > 0 {
+            activities.push(count(snapshot.likes, "like", snapshot.likes_lower_bound));
+        }
+        if snapshot.reposts > 0 {
+            activities.push(count(
+                snapshot.reposts,
+                "repost",
+                snapshot.reposts_lower_bound,
+            ));
+        }
+        data.insert("type".to_string(), ACTIVITY_DIGEST.to_string());
+        data.insert("title".to_string(), "New activity".to_string());
+        data.insert(
+            "body".to_string(),
+            format!("You received {}.", activities.join(" and ")),
+        );
+        data.insert(
+            "eventId".to_string(),
+            snapshot.first_event.clone().unwrap_or_default(),
+        );
+        data.insert("receiverPubkey".to_string(), recipient.to_hex());
+        data.insert(
+            "receiverNpub".to_string(),
+            recipient.to_bech32().unwrap_or_default(),
+        );
+        data.insert(
+            "timestamp".to_string(),
+            snapshot.last_at.unwrap_or(snapshot.due).to_string(),
+        );
+        return FcmPayload {
+            notification: None,
+            data: Some(data),
+            android: None,
+            webpush: None,
+            apns: None,
+            collapse_key: Some(collapse_key.to_string()),
+        };
+    }
 
     data.insert("type".to_string(), snapshot.notification_type.clone());
     data.insert(
@@ -1111,7 +1255,7 @@ pub(crate) async fn flush_group(
     claim: &GroupClaim,
     token: &CancellationToken,
 ) -> Result<FlushOutcome> {
-    let Some(snapshot) = load_group(&state.redis_pool, &claim.group_id).await? else {
+    let Some(mut snapshot) = load_group(&state.redis_pool, &claim.group_id).await? else {
         complete_group(&state.redis_pool, claim, None).await?;
         crate::metrics::coalesce_skipped("missing_group", 1);
         info!(
@@ -1131,8 +1275,9 @@ pub(crate) async fn flush_group(
         return Ok(FlushOutcome::Expired);
     }
 
-    let Some(notification_type) = NotificationType::from_display_name(&snapshot.notification_type)
-    else {
+    let activity_digest = snapshot.notification_type == ACTIVITY_DIGEST;
+    let notification_type = NotificationType::from_display_name(&snapshot.notification_type);
+    if notification_type.is_none() && !activity_digest {
         warn!(
             group_id = %claim.group_id,
             ntype = %snapshot.notification_type,
@@ -1143,7 +1288,7 @@ pub(crate) async fn flush_group(
         return Ok(FlushOutcome::Empty {
             reason: "unknown_type",
         });
-    };
+    }
 
     if snapshot.pending == 0 {
         // Routine reconciliation: every event was sent immediately, or the
@@ -1154,7 +1299,7 @@ pub(crate) async fn flush_group(
             reason: "no_pending",
         });
     }
-    if snapshot.actor_count == 0 {
+    if !activity_digest && snapshot.actor_count == 0 {
         // The hyperloglog is written and expired with the group, so this means
         // it was evicted or lost independently. Dropping the summary loses no
         // notification: the individual events remain in the recipient's inbox.
@@ -1224,7 +1369,20 @@ pub(crate) async fn flush_group(
         &state.settings.notification.default_preferences,
     )
     .await?;
-    if !notification_type.is_enabled(&prefs) {
+    let preference_disabled = if activity_digest {
+        if !NotificationType::Like.is_enabled(&prefs) {
+            snapshot.likes = 0;
+        }
+        if !NotificationType::Repost.is_enabled(&prefs) {
+            snapshot.reposts = 0;
+        }
+        snapshot.likes == 0 && snapshot.reposts == 0
+    } else {
+        !notification_type
+            .expect("legacy group type was validated")
+            .is_enabled(&prefs)
+    };
+    if preference_disabled {
         complete_group(&state.redis_pool, claim, None).await?;
         crate::metrics::coalesce_skipped("preference_disabled", 1);
         info!(
@@ -1252,37 +1410,44 @@ pub(crate) async fn flush_group(
     // aging out for a full window, so a capped group does not re-poll the
     // serial drain every minute for as long as its lifetime.
     let recipient = snapshot.owner.clone();
-    let deferral_secs = match consume_recipient_token(
-        &state.redis_pool,
-        &recipient,
-        &claim.group_id,
-        &state.settings.service,
-    )
-    .await?
-    {
-        SpendOutcome::Spent => None,
-        SpendOutcome::BucketEmpty { retry_after_secs } => {
-            crate::metrics::coalesce_deferred("recipient_throttled", 1);
-            info!(
-                group_id = %claim.group_id,
-                owner = %snapshot.owner,
-                ntype = %snapshot.notification_type,
-                retry_after_secs,
-                "Deferring a coalesced summary; the recipient token bucket is empty"
-            );
-            Some(retry_after_secs)
-        }
-        SpendOutcome::DailyCapped { retry_after_secs } => {
-            crate::metrics::coalesce_deferred("recipient_daily_capped", 1);
-            info!(
-                group_id = %claim.group_id,
-                owner = %snapshot.owner,
-                ntype = %snapshot.notification_type,
-                retry_after_secs,
-                daily_cap = state.settings.service.recipient_daily_cap,
-                "Deferring a coalesced summary; the recipient is at the rolling emission cap"
-            );
-            Some(retry_after_secs)
+    let deferral_secs = if activity_digest {
+        // The shared visit policy is the account digest's send authority.
+        // Charging the legacy per-like limiter as well would strand a digest
+        // behind unrelated old groups and complicate conservative retries.
+        None
+    } else {
+        match consume_recipient_token(
+            &state.redis_pool,
+            &recipient,
+            &claim.group_id,
+            &state.settings.service,
+        )
+        .await?
+        {
+            SpendOutcome::Spent => None,
+            SpendOutcome::BucketEmpty { retry_after_secs } => {
+                crate::metrics::coalesce_deferred("recipient_throttled", 1);
+                info!(
+                    group_id = %claim.group_id,
+                    owner = %snapshot.owner,
+                    ntype = %snapshot.notification_type,
+                    retry_after_secs,
+                    "Deferring a coalesced summary; the recipient token bucket is empty"
+                );
+                Some(retry_after_secs)
+            }
+            SpendOutcome::DailyCapped { retry_after_secs } => {
+                crate::metrics::coalesce_deferred("recipient_daily_capped", 1);
+                info!(
+                    group_id = %claim.group_id,
+                    owner = %snapshot.owner,
+                    ntype = %snapshot.notification_type,
+                    retry_after_secs,
+                    daily_cap = state.settings.service.recipient_daily_cap,
+                    "Deferring a coalesced summary; the recipient is at the rolling emission cap"
+                );
+                Some(retry_after_secs)
+            }
         }
     };
     if let Some(delay_secs) = deferral_secs {
@@ -1290,14 +1455,21 @@ pub(crate) async fn flush_group(
             .await;
     }
 
-    let budget = crate::notification_delivery::reserve_budget(
+    let identity = format!("summary:{}", claim.group_id);
+    let budget = crate::notification_delivery::reserve_budget_for_generation(
         &state.redis_pool,
         &owner,
-        &format!("summary:{}", claim.group_id),
+        &identity,
         &state.settings.service.delivery,
+        Some(snapshot.generation),
     )
     .await;
-    if !matches!(&budget, Ok(true)) {
+    if !activity_digest
+        && !matches!(
+            &budget,
+            Ok(crate::notification_delivery::BudgetDecision::Allowed)
+        )
+    {
         refund_recipient_token(
             &state.redis_pool,
             &recipient,
@@ -1306,25 +1478,46 @@ pub(crate) async fn flush_group(
         )
         .await?;
     }
-    if !budget? {
+    use crate::notification_delivery::BudgetDecision;
+    let suppression_reason = match budget? {
+        BudgetDecision::Allowed => None,
+        BudgetDecision::Cooldown { retry_after_secs } => {
+            crate::metrics::coalesce_deferred("cooldown", 1);
+            return requeue_or_expire(
+                state,
+                claim,
+                &snapshot,
+                FlushOutcome::Throttled,
+                retry_after_secs,
+            )
+            .await;
+        }
+        BudgetDecision::Active => Some("active"),
+        BudgetDecision::StaleVisit => Some("stale_visit"),
+        BudgetDecision::AllowanceExhausted => Some("allowance_exhausted"),
+        BudgetDecision::Capped => Some("frequency_capped"),
+    };
+    if let Some(reason) = suppression_reason {
         complete_group(&state.redis_pool, claim, None).await?;
-        crate::metrics::coalesce_skipped("frequency_capped", 1);
-        return Ok(FlushOutcome::Suppressed {
-            reason: "frequency_capped",
-        });
+        crate::metrics::coalesce_skipped(reason, 1);
+        return Ok(FlushOutcome::Suppressed { reason });
     }
 
-    let sample_name = match (&state.mention_parser_service, &snapshot.first_actor) {
-        (Some(parser), Some(actor)) => match parser.get_display_name(actor).await {
-            Ok(Some(name)) => name,
-            Ok(None) => short_npub(actor),
-            Err(e) => {
-                warn!(group_id = %claim.group_id, error = %e, "Failed to resolve summary actor name");
-                short_npub(actor)
-            }
-        },
-        (_, Some(actor)) => short_npub(actor),
-        (_, None) => "Someone".to_string(),
+    let sample_name = if activity_digest {
+        String::new()
+    } else {
+        match (&state.mention_parser_service, &snapshot.first_actor) {
+            (Some(parser), Some(actor)) => match parser.get_display_name(actor).await {
+                Ok(Some(name)) => name,
+                Ok(None) => short_npub(actor),
+                Err(e) => {
+                    warn!(group_id = %claim.group_id, error = %e, "Failed to resolve summary actor name");
+                    short_npub(actor)
+                }
+            },
+            (_, Some(actor)) => short_npub(actor),
+            (_, None) => "Someone".to_string(),
+        }
     };
 
     let collapse_key = collapse_key_for_group(&claim.group_id);
@@ -1346,7 +1539,7 @@ pub(crate) async fn flush_group(
         &state.settings.service.delivery,
     )
     .await;
-    if awake.is_err() {
+    if !activity_digest && awake.is_err() {
         refund_recipient_token(
             &state.redis_pool,
             &recipient,
@@ -1361,6 +1554,53 @@ pub(crate) async fn flush_group(
         .filter(|token| awake.contains(token))
         .collect();
     if tokens.is_empty() {
+        if !activity_digest {
+            refund_recipient_token(
+                &state.redis_pool,
+                &recipient,
+                &claim.group_id,
+                &state.settings.service,
+            )
+            .await?;
+        }
+        complete_group(&state.redis_pool, claim, None).await?;
+        crate::metrics::coalesce_skipped("quiet_hours", 1);
+        return Ok(FlushOutcome::Suppressed {
+            reason: "quiet_hours",
+        });
+    }
+    if snapshot.expires_at > 0 {
+        let mut conn = state.redis_pool.get().await.map_err(|error| {
+            ServiceError::Internal(format!("Failed to get Redis connection: {error}"))
+        })?;
+        let (now, _): (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut *conn)
+            .await
+            .map_err(ServiceError::Redis)?;
+        drop(conn);
+        if now >= snapshot.expires_at {
+            if !activity_digest {
+                refund_recipient_token(
+                    &state.redis_pool,
+                    &recipient,
+                    &claim.group_id,
+                    &state.settings.service,
+                )
+                .await?;
+            }
+            drop_expired_group(state, claim, &snapshot).await?;
+            return Ok(FlushOutcome::Expired);
+        }
+    }
+    let valid = crate::notification_delivery::validate_reservation(
+        &state.redis_pool,
+        &owner,
+        &identity,
+        &state.settings.service.delivery,
+        Some(snapshot.generation),
+    )
+    .await;
+    if !activity_digest && !matches!(&valid, Ok(true)) {
         refund_recipient_token(
             &state.redis_pool,
             &recipient,
@@ -1368,10 +1608,12 @@ pub(crate) async fn flush_group(
             &state.settings.service,
         )
         .await?;
+    }
+    if !valid? {
         complete_group(&state.redis_pool, claim, None).await?;
-        crate::metrics::coalesce_skipped("quiet_hours", 1);
+        crate::metrics::coalesce_skipped("activity_changed", 1);
         return Ok(FlushOutcome::Suppressed {
-            reason: "quiet_hours",
+            reason: "activity_changed",
         });
     }
     let results = state.fcm_client.send_batch(&tokens, payload).await;
@@ -1428,15 +1670,17 @@ pub(crate) async fn flush_group(
         // failure was retryable or terminal. Charging for a notification nobody
         // received would hold budget the recipient can spend on a push that
         // does arrive.
-        if let Err(e) = refund_recipient_token(
-            &state.redis_pool,
-            &recipient,
-            &claim.group_id,
-            &state.settings.service,
-        )
-        .await
-        {
-            error!(group_id = %claim.group_id, error = %e, "Failed to refund the recipient throttle token after a summary failure that delivered nothing");
+        if !activity_digest {
+            if let Err(e) = refund_recipient_token(
+                &state.redis_pool,
+                &recipient,
+                &claim.group_id,
+                &state.settings.service,
+            )
+            .await
+            {
+                error!(group_id = %claim.group_id, error = %e, "Failed to refund the recipient throttle token after a summary failure that delivered nothing");
+            }
         }
         if let Some(delay) = retryable_failure {
             // FCM's Retry-After wins when it asks for more than the configured
@@ -1475,7 +1719,13 @@ pub(crate) async fn flush_group(
     }
 
     complete_group(&state.redis_pool, claim, None).await?;
-    crate::metrics::coalesced_send(notification_type.display_name());
+    crate::metrics::coalesced_send(if activity_digest {
+        ACTIVITY_DIGEST
+    } else {
+        notification_type
+            .expect("legacy group type was validated")
+            .display_name()
+    });
     Ok(FlushOutcome::Sent {
         delivered: delivered.len(),
         failed,
@@ -1626,7 +1876,23 @@ mod tests {
             .expect("runtime settings load")
             .service;
         service.allowed_pubkeys.clear();
+        service.coalesce_immediate_limit = 3;
+        service.delivery.min_interval_secs = 0;
+        service.delivery.absence_cap = 100;
         service
+    }
+
+    fn legacy_runtime_settings() -> crate::config::Settings {
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.delivery.min_interval_secs = 0;
+        settings.service.delivery.absence_cap = 100;
+        settings
+    }
+
+    async fn register_awake_token(pool: &RedisPool, owner: &PublicKey, token: &str) -> Result<()> {
+        let minute = (chrono::Utc::now().timestamp().rem_euclid(86_400) / 60) as i32;
+        redis_store::add_or_update_token_with_timezone(pool, owner, token, Some(720 - minute)).await
     }
 
     fn random_target() -> CoalesceTarget {
@@ -1805,6 +2071,11 @@ mod tests {
             expires_at: 1_700_086_400,
             pending: 4,
             immediate: 3,
+            generation: 0,
+            likes: 0,
+            reposts: 0,
+            likes_lower_bound: false,
+            reposts_lower_bound: false,
             first_actor: Some("a".repeat(64)),
             first_event: Some("b".repeat(64)),
             last_at: Some(1_699_999_999),
@@ -1830,6 +2101,741 @@ mod tests {
         assert_eq!(data.get("referencedEventId"), Some(&"c".repeat(64)));
         assert_eq!(data.get("eventKind"), Some(&"7".to_string()));
         assert_eq!(data.get("receiverPubkey"), Some(&recipient.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn account_digest_buffers_from_first_event_across_targets_and_types_without_recounting() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for account digest tests");
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 0;
+        let owner = Keys::generate().public_key();
+        let actor = random_actor();
+        let first_event = "1".repeat(64);
+        let first_target = CoalesceTarget::event("2".repeat(64));
+        let first = ingest_one(
+            &pool,
+            &settings,
+            &owner,
+            &first_target,
+            &first_event,
+            &actor,
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = &first else {
+            panic!("the first interaction must buffer, with no immediate buzz");
+        };
+        for (event, target_id, notification_type) in [
+            ("3", "5", NotificationType::Like),
+            ("4", "6", NotificationType::Repost),
+            ("9", "7", NotificationType::Like),
+            ("a", "8", NotificationType::Repost),
+        ] {
+            let target = CoalesceTarget::event(target_id.repeat(64));
+            let event_id = event.repeat(64);
+            let decision = ingest(
+                &pool,
+                &settings,
+                &owner,
+                &Ingest {
+                    event_id: &event_id,
+                    event_kind: notification_type.kind(),
+                    actor: &actor,
+                    created_at: 1_700_000_000,
+                    notification_type,
+                    target: &target,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                decision, first,
+                "posts and types must share one account digest"
+            );
+        }
+        assert_eq!(
+            ingest_one(
+                &pool,
+                &settings,
+                &owner,
+                &first_target,
+                &first_event,
+                &actor
+            )
+            .await,
+            first
+        );
+        let snapshot = load_group(&pool, group_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.pending, 5, "replay cannot add another interaction");
+        assert_eq!(snapshot.immediate, 0);
+        assert_eq!(snapshot.likes, 3);
+        assert_eq!(snapshot.reposts, 2);
+        assert_eq!(snapshot.notification_type, "activityDigest");
+        let data = build_summary_payload(&snapshot, &owner, "", "digest-collapse")
+            .data
+            .unwrap();
+        assert_eq!(data["body"], "You received 3 likes and 2 reposts.");
+        assert_eq!(data["title"], "New activity");
+        assert_eq!(data["eventId"], first_event);
+        assert_eq!(data["receiverPubkey"], owner.to_hex());
+        assert!(
+            !data.contains_key("referencedEventId"),
+            "digest taps must open the inbox"
+        );
+        assert!(
+            !data.contains_key("senderPubkey"),
+            "an account digest does not need an actor"
+        );
+        cleanup_group(&pool, group_id).await;
+    }
+
+    #[tokio::test]
+    async fn account_digest_counts_one_actor_once_per_canonical_target_and_category() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for account digest tests");
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 0;
+        let owner = Keys::generate().public_key();
+        let actor = random_actor();
+        let target = CoalesceTarget::event("a".repeat(64));
+        let first = ingest_one(&pool, &settings, &owner, &target, &"b".repeat(64), &actor).await;
+        assert_eq!(
+            ingest_one(&pool, &settings, &owner, &target, &"c".repeat(64), &actor).await,
+            first
+        );
+        let other_target = CoalesceTarget::event("d".repeat(64));
+        assert_eq!(
+            ingest_one(
+                &pool,
+                &settings,
+                &owner,
+                &other_target,
+                &"e".repeat(64),
+                &actor
+            )
+            .await,
+            first
+        );
+        for event_id in ["f".repeat(64), "0".repeat(64)] {
+            assert_eq!(
+                ingest(
+                    &pool,
+                    &settings,
+                    &owner,
+                    &Ingest {
+                        event_id: &event_id,
+                        event_kind: 16,
+                        actor: &actor,
+                        created_at: Timestamp::now().as_secs(),
+                        notification_type: NotificationType::Repost,
+                        target: &target
+                    }
+                )
+                .await
+                .unwrap(),
+                first
+            );
+        }
+        let CoalesceDecision::Buffered { group_id } = first else {
+            panic!("account activity must buffer");
+        };
+        let snapshot = load_group(&pool, &group_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.likes, 2,
+            "one actor liking two targets counts twice; repeated actions do not"
+        );
+        assert_eq!(
+            snapshot.reposts, 1,
+            "a repost is distinct from a like on the same target"
+        );
+        assert_eq!(snapshot.pending, 3);
+        let data = build_summary_payload(&snapshot, &owner, "", "digest")
+            .data
+            .unwrap();
+        assert_eq!(data["body"], "You received 2 likes and 1 repost.");
+        cleanup_group(&pool, &group_id).await;
+    }
+
+    #[tokio::test]
+    async fn account_digest_bounds_each_category_and_reports_overflow_as_a_lower_bound() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for account digest tests");
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 0;
+        // Keep a large fixture away from a real Redis-clock bucket boundary.
+        let now = Timestamp::now().as_secs();
+        while settings.coalesce_window_secs - now % settings.coalesce_window_secs < 300 {
+            settings.coalesce_window_secs += 1;
+        }
+        let owner = Keys::generate().public_key();
+        let actor = random_actor();
+        let mut group_id = String::new();
+        for notification_type in [NotificationType::Like, NotificationType::Repost] {
+            for index in 0..1024_u64 {
+                let target = CoalesceTarget::event(format!("{index:064x}"));
+                let event_id = format!(
+                    "{:064x}",
+                    index + 65_536 + u64::from(notification_type.kind()) * 65_536
+                );
+                let decision = ingest(
+                    &pool,
+                    &settings,
+                    &owner,
+                    &Ingest {
+                        event_id: &event_id,
+                        event_kind: notification_type.kind(),
+                        actor: &actor,
+                        created_at: Timestamp::now().as_secs(),
+                        notification_type,
+                        target: &target,
+                    },
+                )
+                .await
+                .unwrap();
+                let CoalesceDecision::Buffered { group_id: gid } = decision else {
+                    panic!("every interaction must buffer");
+                };
+                group_id = gid;
+            }
+        }
+        let snapshot = load_group(&pool, &group_id).await.unwrap().unwrap();
+        assert_eq!(
+            build_summary_payload(&snapshot, &owner, "", "digest")
+                .data
+                .unwrap()["body"],
+            "You received 1024 likes and 1024 reposts."
+        );
+        let mut conn = pool.get().await.unwrap();
+        let fields_before: u64 = redis::cmd("HLEN")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        for notification_type in [NotificationType::Like, NotificationType::Repost] {
+            for index in 1024..1040_u64 {
+                let target = CoalesceTarget::event(format!("{index:064x}"));
+                let event_id = format!(
+                    "{:064x}",
+                    index + 65_536 + u64::from(notification_type.kind()) * 65_536
+                );
+                ingest(
+                    &pool,
+                    &settings,
+                    &owner,
+                    &Ingest {
+                        event_id: &event_id,
+                        event_kind: notification_type.kind(),
+                        actor: &actor,
+                        created_at: Timestamp::now().as_secs(),
+                        notification_type,
+                        target: &target,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let snapshot = load_group(&pool, &group_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.likes, 1024);
+        assert_eq!(
+            snapshot.reposts, 1024,
+            "like saturation must not consume repost capacity"
+        );
+        assert_eq!(
+            build_summary_payload(&snapshot, &owner, "", "digest")
+                .data
+                .unwrap()["body"],
+            "You received at least 1024 likes and at least 1024 reposts."
+        );
+        let mut conn = pool.get().await.unwrap();
+        let fields_after: u64 = redis::cmd("HLEN")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            fields_after <= fields_before + 2,
+            "overflow only adds one flag per category, never more action identities"
+        );
+        drop(conn);
+        cleanup_group(&pool, &group_id).await;
+    }
+
+    #[tokio::test]
+    async fn visit_race_ingest_rejects_generation_captured_before_preflight() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for generation race tests");
+        reset_indexes(&pool).await;
+        for immediate_limit in [0, 1] {
+            let mut settings = test_settings();
+            settings.coalesce_immediate_limit = immediate_limit;
+            let owner = Keys::generate().public_key();
+            let generation = crate::activity::current_generation(&pool, &owner)
+                .await
+                .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            redis::cmd("HSET")
+                .arg(format!(
+                    "{}{}",
+                    crate::activity::STATE_PREFIX,
+                    owner.to_hex()
+                ))
+                .arg("generation")
+                .arg(1)
+                .query_async::<()>(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+            let event_id = "b".repeat(64);
+            let actor = random_actor();
+            let target = CoalesceTarget::event("c".repeat(64));
+            ingest_for_generation(
+                &pool,
+                &settings,
+                &owner,
+                generation,
+                &Ingest {
+                    event_id: &event_id,
+                    event_kind: 7,
+                    actor: &actor,
+                    created_at: Timestamp::now().as_secs(),
+                    notification_type: NotificationType::Like,
+                    target: &target,
+                },
+            )
+            .await
+            .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let groups: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("{GROUP_PREFIX}*{}:*", owner.to_hex()))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert!(
+                groups.is_empty(),
+                "an event from before the visit must create neither an old nor a new group"
+            );
+            drop(conn);
+            assert!(stored_disposition(&pool, &event_id, &owner).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn account_digest_captures_each_visit_and_replay_stays_with_its_original_generation() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for account digest tests");
+        reset_indexes(&pool).await;
+        let mut settings = test_settings();
+        settings.coalesce_immediate_limit = 0;
+        let owner = Keys::generate().public_key();
+        let actor = random_actor();
+        let target = CoalesceTarget::event("b".repeat(64));
+        let event_id = "c".repeat(64);
+        let activity_key = format!("{}{}", crate::activity::STATE_PREFIX, owner.to_hex());
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("HSET")
+            .arg(&activity_key)
+            .arg("generation")
+            .arg(4)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let first = ingest_one(&pool, &settings, &owner, &target, &event_id, &actor).await;
+        let CoalesceDecision::Buffered { group_id } = &first else {
+            panic!("first event must buffer");
+        };
+        assert!(group_id.starts_with(&format!("activity:{}:4:", owner.to_hex())));
+        assert_eq!(
+            load_group(&pool, group_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            4
+        );
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("HINCRBY")
+            .arg(&activity_key)
+            .arg("generation")
+            .arg(1)
+            .query_async::<u64>(&mut *conn)
+            .await
+            .unwrap();
+        let ttl: u64 = redis::cmd("TTL")
+            .arg(disposition_key(&event_id, &owner))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            ttl >= settings.coalesce_group_ttl_secs,
+            "replay protection must survive cooldown deferrals"
+        );
+        drop(conn);
+        assert_eq!(
+            ingest_one(&pool, &settings, &owner, &target, &event_id, &actor).await,
+            first
+        );
+        let CoalesceDecision::Buffered {
+            group_id: next_group,
+        } = ingest_one(&pool, &settings, &owner, &target, &"d".repeat(64), &actor).await
+        else {
+            panic!("new visit work must buffer");
+        };
+        assert_ne!(&next_group, group_id);
+        assert_eq!(
+            load_group(&pool, &next_group)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            5
+        );
+        assert_eq!(
+            load_group(&pool, group_id).await.unwrap().unwrap().pending,
+            1
+        );
+        cleanup_group(&pool, group_id).await;
+        cleanup_group(&pool, &next_group).await;
+    }
+
+    #[tokio::test]
+    async fn account_digest_flush_filters_disabled_categories_without_using_legacy_throttle() {
+        let _guard = test_lock().lock().await;
+        let (state, sender, group_id, owner) = account_digest_fixture().await;
+        preferences::set_user_preferences_with_campaign_consent(
+            &state.redis_pool,
+            &owner.to_hex(),
+            &preferences::UserPreferences { kinds: vec![16] },
+            false,
+        )
+        .await
+        .unwrap();
+        set_throttle_state(
+            &state.redis_pool,
+            &owner,
+            0.0,
+            Timestamp::now().as_secs() * 1000 + 60_000,
+        )
+        .await;
+        let claim = claim_due_group(&state.redis_pool, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Sent { delivered: 1, .. }
+        ));
+        let messages = sender.get_sent_messages();
+        let data = messages[0].1.data.as_ref().unwrap();
+        assert_eq!(data["type"], "activityDigest");
+        assert_eq!(data["body"], "You received 1 repost.");
+        assert!(!data.contains_key("senderPubkey"));
+        assert!(load_group(&state.redis_pool, &group_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn account_digest_flush_omits_reposts_disabled_after_ingest() {
+        let _guard = test_lock().lock().await;
+        let (state, sender, _, owner) = account_digest_fixture().await;
+        preferences::set_user_preferences_with_campaign_consent(
+            &state.redis_pool,
+            &owner.to_hex(),
+            &preferences::UserPreferences { kinds: vec![7] },
+            false,
+        )
+        .await
+        .unwrap();
+        let claim = claim_due_group(&state.redis_pool, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Sent { delivered: 1, .. }
+        ));
+        assert_eq!(
+            sender.get_sent_messages()[0].1.data.as_ref().unwrap()["body"],
+            "You received 1 like."
+        );
+    }
+
+    #[tokio::test]
+    async fn account_digest_flush_suppresses_when_both_categories_are_disabled() {
+        let _guard = test_lock().lock().await;
+        let (state, sender, group_id, owner) = account_digest_fixture().await;
+        preferences::set_user_preferences_with_campaign_consent(
+            &state.redis_pool,
+            &owner.to_hex(),
+            &preferences::UserPreferences { kinds: vec![] },
+            false,
+        )
+        .await
+        .unwrap();
+        let claim = claim_due_group(&state.redis_pool, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Suppressed {
+                reason: "preference_disabled"
+            }
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        assert!(load_group(&state.redis_pool, &group_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn account_digest_visit_after_lease_suppresses_the_pending_push() {
+        let _guard = test_lock().lock().await;
+        let (state, sender, group_id, owner) = account_digest_fixture().await;
+        let claim = claim_due_group(&state.redis_pool, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut conn = state.redis_pool.get().await.unwrap();
+        redis::cmd("HSET")
+            .arg(format!("notification_activity:{}", owner.to_hex()))
+            .arg("generation")
+            .arg(1)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Suppressed {
+                reason: "stale_visit"
+            }
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        assert!(load_group(&state.redis_pool, &group_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn account_digest_that_expires_after_lease_is_not_submitted_to_provider() {
+        let _guard = test_lock().lock().await;
+        let (state, sender, group_id, _) = account_digest_fixture().await;
+        let mut claim = claim_due_group(&state.redis_pool, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = Timestamp::now().as_secs();
+        claim.claimed_at = now.saturating_sub(2);
+        let mut conn = state.redis_pool.get().await.unwrap();
+        redis::cmd("HSET")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .arg("expires_at")
+            .arg(now.saturating_sub(1))
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Expired
+        );
+        assert!(sender.get_sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_digest_cooldown_defers_for_the_remaining_gap() {
+        let _guard = test_lock().lock().await;
+        let (state, sender, group_id, owner) = account_digest_fixture().await;
+        assert!(crate::notification_delivery::reserve_budget(
+            &state.redis_pool,
+            &owner,
+            "event:earlier",
+            &state.settings.service.delivery
+        )
+        .await
+        .unwrap());
+        let claim = claim_due_group(&state.redis_pool, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Throttled
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        let mut conn = state.redis_pool.get().await.unwrap();
+        let due: u64 = redis::cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(&group_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_secs();
+        assert!(
+            due >= now + 21_590 && due <= now + 21_610,
+            "cooldown must not poll every minute: due={due}, now={now}"
+        );
+        drop(conn);
+        cleanup_group(&state.redis_pool, &group_id).await;
+    }
+
+    async fn account_digest_fixture() -> (AppState, MockFcmSender, String, PublicKey) {
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for account digest tests");
+        reset_indexes(&pool).await;
+        let mut settings = crate::config::Settings::new().unwrap();
+        settings.service.allowed_pubkeys.clear();
+        settings.service.coalesce_immediate_limit = 0;
+        let owner = Keys::generate().public_key();
+        let actor = random_actor();
+        let target = CoalesceTarget::event("6".repeat(64));
+        let CoalesceDecision::Buffered { group_id } = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &"7".repeat(64),
+            &actor,
+        )
+        .await
+        else {
+            panic!("first interaction must buffer");
+        };
+        ingest(
+            &pool,
+            &settings.service,
+            &owner,
+            &Ingest {
+                event_id: &"8".repeat(64),
+                event_kind: 16,
+                actor: &actor,
+                created_at: Timestamp::now().as_secs(),
+                notification_type: NotificationType::Repost,
+                target: &target,
+            },
+        )
+        .await
+        .unwrap();
+        make_claimable(&pool, &group_id).await;
+        let minute = (chrono::Utc::now().timestamp().rem_euclid(86_400) / 60) as i32;
+        let device = format!("digest-device-{}", owner.to_hex());
+        redis_store::add_or_update_token_with_timezone(&pool, &owner, &device, Some(720 - minute))
+            .await
+            .unwrap();
+        let sender = MockFcmSender::new();
+        let state = test_state(
+            settings,
+            pool,
+            FcmClient::new_with_impl(Box::new(sender.clone())),
+        );
+        (state, sender, group_id, owner)
+    }
+
+    #[tokio::test]
+    async fn legacy_group_without_generation_is_fenced_by_a_visit() {
+        let _guard = test_lock().lock().await;
+        let pool = test_pool()
+            .await
+            .expect("Redis is required for generation fencing tests");
+        reset_indexes(&pool).await;
+        let mut settings = legacy_runtime_settings();
+        settings.service.coalesce_immediate_limit = 1;
+        let owner = Keys::generate().public_key();
+        let actor = random_actor();
+        let target = CoalesceTarget::event("e".repeat(64));
+        ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &"f".repeat(64),
+            &actor,
+        )
+        .await;
+        let CoalesceDecision::Buffered { group_id } = ingest_one(
+            &pool,
+            &settings.service,
+            &owner,
+            &target,
+            &"0".repeat(64),
+            &actor,
+        )
+        .await
+        else {
+            panic!("second legacy event must buffer");
+        };
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("HDEL")
+            .arg(format!("{GROUP_PREFIX}{group_id}"))
+            .arg("generation")
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        redis::cmd("HSET")
+            .arg(format!(
+                "{}{}",
+                crate::activity::STATE_PREFIX,
+                owner.to_hex()
+            ))
+            .arg("generation")
+            .arg(1)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        make_claimable(&pool, &group_id).await;
+        register_awake_token(&pool, &owner, "legacy-generation-device")
+            .await
+            .unwrap();
+        let sender = MockFcmSender::new();
+        let state = test_state(
+            settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(sender.clone())),
+        );
+        let claim = claim_due_group(&pool, 30).await.unwrap().unwrap();
+        assert_eq!(
+            flush_group(&state, &claim, &CancellationToken::new())
+                .await
+                .unwrap(),
+            FlushOutcome::Suppressed {
+                reason: "stale_visit"
+            }
+        );
+        assert!(sender.get_sent_messages().is_empty());
     }
 
     #[tokio::test]
@@ -2421,8 +3427,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.service.allowed_pubkeys.clear();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 1;
         settings.service.recipient_throttle_capacity = 100;
         let owner = Keys::generate().public_key();
@@ -2556,8 +3561,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.service.allowed_pubkeys.clear();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 1;
         settings.service.recipient_throttle_capacity = 100;
         settings.service.recipient_throttle_refill_secs = 60;
@@ -2586,7 +3590,7 @@ mod tests {
             panic!("the second interaction must buffer");
         };
         make_claimable(&pool, &group_id).await;
-        redis_store::add_or_update_token(&pool, &owner, "coalesce-throttle-token")
+        register_awake_token(&pool, &owner, "coalesce-throttle-token")
             .await
             .unwrap();
 
@@ -2677,8 +3681,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.service.allowed_pubkeys.clear();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 3;
         // The bucket is deliberately not the binding bound here: the rolling
         // emission window is, and its slide (an hour) must be far from the
@@ -2730,7 +3733,7 @@ mod tests {
 
         // A summary for the same recipient is deferred, not dropped, while the
         // group is inside its logical lifetime.
-        redis_store::add_or_update_token(&pool, &owner, "coalesce-daily-cap-token")
+        register_awake_token(&pool, &owner, "coalesce-daily-cap-token")
             .await
             .unwrap();
         make_claimable(&pool, group_id).await;
@@ -2910,8 +3913,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.service.allowed_pubkeys.clear();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 1;
         settings.service.recipient_throttle_capacity = 100;
         let owner = Keys::generate().public_key();
@@ -2939,7 +3941,7 @@ mod tests {
             panic!("the second interaction must buffer");
         };
         make_claimable(&pool, &group_id).await;
-        redis_store::add_or_update_token(&pool, &owner, "coalesce-invalid-token")
+        register_awake_token(&pool, &owner, "coalesce-invalid-token")
             .await
             .unwrap();
 
@@ -2994,8 +3996,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.service.allowed_pubkeys.clear();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 1;
         settings.service.recipient_throttle_capacity = 100;
         settings.service.delivery.hourly_cap = 1;
@@ -3024,9 +4025,7 @@ mod tests {
         };
         make_claimable(&pool, &group_id).await;
         let device = format!("capped-summary-{}", owner.to_hex());
-        redis_store::add_or_update_token(&pool, &owner, &device)
-            .await
-            .unwrap();
+        register_awake_token(&pool, &owner, &device).await.unwrap();
         assert!(crate::notification_delivery::reserve_budget(
             &pool,
             &owner,
@@ -3228,8 +4227,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
-        settings.service.allowed_pubkeys.clear();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 1;
         settings.service.recipient_throttle_capacity = 100;
         settings.service.recipient_throttle_refill_secs = 60;
@@ -3258,7 +4256,7 @@ mod tests {
             panic!("the second interaction must buffer");
         };
         make_claimable(&pool, &group_id).await;
-        redis_store::add_or_update_token(&pool, &owner, "coalesce-retry-token")
+        register_awake_token(&pool, &owner, "coalesce-retry-token")
             .await
             .unwrap();
 
@@ -3390,7 +4388,7 @@ mod tests {
             return;
         };
         reset_indexes(&pool).await;
-        let mut settings = crate::config::Settings::new().unwrap();
+        let mut settings = legacy_runtime_settings();
         settings.service.coalesce_immediate_limit = 1;
         settings.service.recipient_throttle_capacity = 100;
         let owner = Keys::generate().public_key();
@@ -3419,10 +4417,10 @@ mod tests {
         };
         make_claimable(&pool, &group_id).await;
 
-        redis_store::add_or_update_token(&pool, &owner, "coalesce-panic-good")
+        register_awake_token(&pool, &owner, "coalesce-panic-good")
             .await
             .unwrap();
-        redis_store::add_or_update_token(&pool, &owner, "coalesce-panic-bad")
+        register_awake_token(&pool, &owner, "coalesce-panic-bad")
             .await
             .unwrap();
 

@@ -61,8 +61,10 @@ The content field contains the NIP-44 encrypted token payload. Example plaintext
 - `p` and `app` MUST be present. `expiration` MAY be present.
 - `content` MUST be NIP-44 ciphertext; services MUST reject plaintext.
 - This service does not use `expiration` to accept, reject, or remove a token.
-- `timezoneOffsetMinutes` is optional for social pushes, but campaign delivery
-  suppresses devices that did not provide a valid offset from UTC.
+- Timezone data is optional for registration, but this service sends no social,
+  direct-message, or campaign push to a device that provided no valid
+  `timezone` (IANA name) or `timezoneOffsetMinutes`. Such a token stays registered and
+  receives nothing until the client registers again with timezone data.
 
 ### Deregistration (kind 3080)
 

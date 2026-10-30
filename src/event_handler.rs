@@ -1720,6 +1720,21 @@ async fn send_notification_trigger_to_user(
         return Ok(());
     }
 
+    let work_identity = format!("event:{event_id}");
+    let retention_secs = state
+        .settings
+        .service
+        .delivery
+        .max_event_age_secs
+        .max(state.settings.service.coalesce_group_ttl_secs)
+        .max(86_400);
+    let visit_generation = crate::activity::generation_for_work(
+        &state.redis_pool,
+        target_pubkey,
+        &work_identity,
+        retention_secs,
+    )
+    .await?;
     // Check if user has tokens registered
     let tokens = tokio::select! {
         biased;
@@ -1868,23 +1883,31 @@ async fn send_notification_trigger_to_user(
         return Ok(());
     };
 
-    // Like and repost pushes coalesce per (recipient, type, target, bucket).
-    // Buffered events are recorded here and summarized later by the flush
-    // worker; immediate events continue down the normal path carrying a
-    // collapse key so the summary can replace their banner.
+    // Carry the generation retained before preflight into the atomic ingest.
+    // A visit during an awaited lookup must suppress the old work, rather than
+    // treating it as activity in the new account generation.
     let mut collapse_key = None;
     if matches!(
         delivery_type,
         NotificationType::Like | NotificationType::Repost
     ) {
         if let Some(event) = trigger.nostr_event() {
+            if state.settings.service.coalesce_immediate_limit == 0
+                && coalesce_target(event).is_none()
+            {
+                // A reaction without a canonical target cannot establish an
+                // activity count and must not fall through to an immediate push.
+                crate::notification_delivery::outcome("missing_activity_target");
+                return Ok(());
+            }
             if let Some(target) = coalesce_target(event) {
                 let event_id_hex = event.id.to_hex();
                 let actor_hex = event.pubkey.to_hex();
-                let decision = coalesce::ingest(
+                let decision = coalesce::ingest_for_generation(
                     &state.redis_pool,
                     &state.settings.service,
                     target_pubkey,
+                    visit_generation,
                     &coalesce::Ingest {
                         event_id: &event_id_hex,
                         event_kind: event.kind.as_u16(),
@@ -1897,6 +1920,10 @@ async fn send_notification_trigger_to_user(
                 .await;
 
                 match decision {
+                    Ok(coalesce::CoalesceDecision::StaleVisit) => {
+                        crate::notification_delivery::outcome("stale_visit");
+                        return Ok(());
+                    }
                     Ok(coalesce::CoalesceDecision::Immediate {
                         collapse_key: key, ..
                     }) => {
@@ -1985,11 +2012,24 @@ async fn send_notification_trigger_to_user(
         if eligible.is_empty() {
             return Ok(Vec::new());
         }
-        if !crate::notification_delivery::reserve_budget(
+        if crate::notification_delivery::reserve_budget_for_generation(
             &state.redis_pool,
             target_pubkey,
-            &format!("event:{event_id}"),
+            &work_identity,
             &state.settings.service.delivery,
+            Some(visit_generation),
+        )
+        .await?
+            != crate::notification_delivery::BudgetDecision::Allowed
+        {
+            return Ok(Vec::new());
+        }
+        if !crate::notification_delivery::validate_reservation(
+            &state.redis_pool,
+            target_pubkey,
+            &work_identity,
+            &state.settings.service.delivery,
+            Some(visit_generation),
         )
         .await?
         {
@@ -2590,10 +2630,17 @@ mod tests {
     }
 
     fn test_app_state(
-        settings: crate::config::Settings,
+        mut settings: crate::config::Settings,
         redis_pool: redis_store::RedisPool,
         fcm_client: FcmClient,
     ) -> AppState {
+        // These fixtures isolate event delivery from visit/cooldown policy,
+        // which has its own Redis-backed integration tests.
+        settings.service.delivery.min_interval_secs = 0;
+        settings.service.delivery.absence_cap = 100;
+        if settings.service.coalesce_immediate_limit == 0 {
+            settings.service.coalesce_immediate_limit = 1;
+        }
         AppState {
             settings,
             redis_pool,
@@ -2604,6 +2651,16 @@ mod tests {
             profile_client: Arc::new(Client::default()),
             mention_parser_service: None,
         }
+    }
+
+    async fn add_awake_test_token(
+        pool: &redis_store::RedisPool,
+        recipient: &PublicKey,
+        token: &str,
+    ) -> Result<()> {
+        let hour = (chrono::Utc::now().timestamp().rem_euclid(86400) / 3600) as i32;
+        let offset = ((12 - hour + 12).rem_euclid(24) - 12) * 60;
+        redis_store::add_or_update_token_with_timezone(pool, recipient, token, Some(offset)).await
     }
 
     /// Event-scoped copy for tests that exercise delivery rather than copy.
@@ -2647,7 +2704,7 @@ mod tests {
         let expected_preferences = preferences::UserPreferences { kinds: vec![7] };
         let settings = crate::config::Settings::new().unwrap();
 
-        redis_store::add_or_update_token(&pool, &user.public_key(), &token)
+        add_awake_test_token(&pool, &user.public_key(), &token)
             .await
             .unwrap();
         preferences::set_user_preferences(
@@ -2705,7 +2762,7 @@ mod tests {
         let expected_preferences = preferences::UserPreferences { kinds: vec![16] };
         let settings = crate::config::Settings::new().unwrap();
 
-        redis_store::add_or_update_token(&pool, &first_user.public_key(), &token)
+        add_awake_test_token(&pool, &first_user.public_key(), &token)
             .await
             .unwrap();
         preferences::set_user_preferences(
@@ -2715,7 +2772,7 @@ mod tests {
         )
         .await
         .unwrap();
-        redis_store::add_or_update_token(&pool, &current_owner.public_key(), &token)
+        add_awake_test_token(&pool, &current_owner.public_key(), &token)
             .await
             .unwrap();
 
@@ -3264,7 +3321,7 @@ mod tests {
         let author = Keys::generate();
         let recipient = Keys::generate();
         let fcm_token = format!("lazy-copy-{}", recipient.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &recipient.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -3340,7 +3397,7 @@ mod tests {
         let author = Keys::generate();
         let recipient = Keys::generate();
         let fcm_token = format!("staleness-live-{}", recipient.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &recipient.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -3395,7 +3452,7 @@ mod tests {
         let author = Keys::generate();
         let recipient = Keys::generate();
         let fcm_token = format!("staleness-failed-{}", recipient.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &recipient.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -3539,7 +3596,7 @@ mod tests {
         let recipient = Keys::generate().public_key();
         let event_id = test_event_id(10_591);
         let fcm_token = format!("direct-message-{}", recipient.to_hex());
-        redis_store::add_or_update_token(&pool, &recipient, &fcm_token)
+        add_awake_test_token(&pool, &recipient, &fcm_token)
             .await
             .unwrap();
 
@@ -3587,7 +3644,7 @@ mod tests {
         let recipient = Keys::generate().public_key();
         let event_id = test_event_id(10_592);
         let fcm_token = format!("direct-message-disabled-{}", recipient.to_hex());
-        redis_store::add_or_update_token(&pool, &recipient, &fcm_token)
+        add_awake_test_token(&pool, &recipient, &fcm_token)
             .await
             .unwrap();
         preferences::set_user_preferences(
@@ -3650,7 +3707,7 @@ mod tests {
         let recipient = Keys::generate().public_key();
         let event_id = test_event_id(10_593);
         let fcm_token = format!("direct-message-retry-{}", recipient.to_hex());
-        redis_store::add_or_update_token(&pool, &recipient, &fcm_token)
+        add_awake_test_token(&pool, &recipient, &fcm_token)
             .await
             .unwrap();
 
@@ -3759,7 +3816,7 @@ mod tests {
         let author = Keys::generate();
         let mentioned = Keys::generate().public_key();
         let fcm_token = format!("mention_token_{}", EventId::all_zeros().to_hex());
-        redis_store::add_or_update_token(&pool, &mentioned, &fcm_token)
+        add_awake_test_token(&pool, &mentioned, &fcm_token)
             .await
             .expect("register token");
         let event = EventBuilder::new(Kind::from(KIND_VIDEO), "video")
@@ -3904,6 +3961,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn visit_race_durable_fanout_retry_keeps_generation_after_failed_preflight() {
+        let pool = test_redis_pool()
+            .await
+            .expect("Redis is required for generation race tests");
+        let _guard = fanout_test_lock().lock().await;
+        let creator = Keys::generate();
+        let owner = Keys::generate().public_key();
+        let device = format!("synthetic-preflight-retry-{}", owner.to_hex());
+        add_awake_test_token(&pool, &owner, &device).await.unwrap();
+        let token_key = format!("user_tokens:{}", owner.to_hex());
+        let watcher_key = format!("notify_watchers:{}", creator.public_key().to_hex());
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let event = EventBuilder::new(Kind::Custom(KIND_VIDEO), "synthetic visit race")
+            .tag(Tag::identifier("synthetic-visit-race"))
+            .sign_with_keys(&creator)
+            .unwrap();
+        let job = NewPostFanoutJob {
+            event_json: serde_json::to_string(&event).unwrap(),
+            cursor: 0,
+            sender_name: Some("tester".to_string()),
+            attempt: 0,
+            expires_at: Timestamp::now().as_secs() + 3600,
+        };
+        let job_json = serde_json::to_string(&job).unwrap();
+        let mut conn = pool.get().await.unwrap();
+        redis::pipe()
+            .atomic()
+            .cmd("SADD")
+            .arg(&watcher_key)
+            .arg(owner.to_hex())
+            .ignore()
+            .cmd("DEL")
+            .arg(&token_key)
+            .ignore()
+            .cmd("SET")
+            .arg(&token_key)
+            .arg("synthetic-wrong-type")
+            .ignore()
+            .cmd("ZADD")
+            .arg("new_post_fanout_jobs")
+            .arg(0)
+            .arg(&job_json)
+            .ignore()
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        process_fanout_job(&state, &job_json, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "the failed token lookup must happen before provider submission"
+        );
+        let mut conn = pool.get().await.unwrap();
+        let jobs: Vec<String> = redis::cmd("ZRANGE")
+            .arg("new_post_fanout_jobs")
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let retry_json = jobs
+            .into_iter()
+            .find(|json| {
+                serde_json::from_str::<NewPostFanoutJob>(json)
+                    .is_ok_and(|retry| retry.event_json == job.event_json)
+            })
+            .expect("preflight failure must durably reschedule the page");
+        assert_eq!(
+            serde_json::from_str::<NewPostFanoutJob>(&retry_json)
+                .unwrap()
+                .attempt,
+            1
+        );
+        redis::cmd("DEL")
+            .arg(&token_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        add_awake_test_token(&pool, &owner, &device).await.unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        for (sequence, state) in [
+            (1, crate::activity::ActivityState::Foreground),
+            (2, crate::activity::ActivityState::Background),
+        ] {
+            crate::activity::record_activity(
+                &pool,
+                &owner,
+                &crate::activity::ActivityUpdate {
+                    session_id,
+                    sequence,
+                    visit: 1,
+                    state,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        process_fanout_job(&state, &retry_json, CancellationToken::new())
+            .await
+            .unwrap();
+        let messages = mock.get_sent_messages();
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&watcher_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        redis::cmd("ZREM")
+            .arg("new_post_fanout_jobs")
+            .arg(&retry_json)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        redis_store::remove_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "a rescheduled page must not relabel its already-started recipient work after a visit"
+        );
+    }
+
+    #[tokio::test]
     async fn test_the_fan_out_reaches_watchers_past_the_first_page() {
         // The paging loop is the point of the fan-out bound, and nothing failed
         // when it was broken: stopping after page one, or never advancing the
@@ -3924,7 +4113,7 @@ mod tests {
         let watchers: Vec<Keys> = (0..WATCHERS).map(|_| Keys::generate()).collect();
 
         for (idx, watcher) in watchers.iter().enumerate() {
-            redis_store::add_or_update_token(
+            add_awake_test_token(
                 &pool,
                 &watcher.public_key(),
                 &format!("fanout_token_{}", idx),
@@ -4046,10 +4235,10 @@ mod tests {
         let second = Keys::generate().public_key();
         let first_token = format!("partial-first-{}", first.to_hex());
         let second_token = format!("partial-second-{}", second.to_hex());
-        redis_store::add_or_update_token(&pool, &first, &first_token)
+        add_awake_test_token(&pool, &first, &first_token)
             .await
             .unwrap();
-        redis_store::add_or_update_token(&pool, &second, &second_token)
+        add_awake_test_token(&pool, &second, &second_token)
             .await
             .unwrap();
 
@@ -4118,10 +4307,10 @@ mod tests {
         let second = Keys::generate().public_key();
         let first_token = format!("retry-first-{}", first.to_hex());
         let second_token = format!("retry-second-{}", second.to_hex());
-        redis_store::add_or_update_token(&pool, &first, &first_token)
+        add_awake_test_token(&pool, &first, &first_token)
             .await
             .unwrap();
-        redis_store::add_or_update_token(&pool, &second, &second_token)
+        add_awake_test_token(&pool, &second, &second_token)
             .await
             .unwrap();
 
@@ -4211,10 +4400,10 @@ mod tests {
         let recipient = Keys::generate().public_key();
         let live_token = format!("mixed-live-{}", recipient.to_hex());
         let retryable_token = format!("mixed-retryable-{}", recipient.to_hex());
-        redis_store::add_or_update_token(&pool, &recipient, &live_token)
+        add_awake_test_token(&pool, &recipient, &live_token)
             .await
             .unwrap();
-        redis_store::add_or_update_token(&pool, &recipient, &retryable_token)
+        add_awake_test_token(&pool, &recipient, &retryable_token)
             .await
             .unwrap();
 
@@ -4538,7 +4727,7 @@ mod tests {
         let owner = Keys::generate();
         let recipient = Keys::generate();
         let fcm_token = format!("video-dedup-token-{}", recipient.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &recipient.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &recipient.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -4672,7 +4861,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("mention-then-bell-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -4758,7 +4947,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("legacy-claim-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -4814,7 +5003,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("mention-fallback-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
         preferences::set_user_preferences(
@@ -4898,7 +5087,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("rate-limited-claim-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -4991,7 +5180,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("bookkeeping-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -5063,7 +5252,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("claim-write-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -5135,10 +5324,10 @@ mod tests {
         // claim write this test needs to fail never runs at all.
         let live_token = format!("live-{}", watcher.public_key().to_hex());
         let stale_token = format!("stale-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &live_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &live_token)
             .await
             .unwrap();
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &stale_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &stale_token)
             .await
             .unwrap();
 
@@ -5211,7 +5400,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("bell-then-mention-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -5325,7 +5514,7 @@ mod tests {
         let owner = Keys::generate();
         let watcher = Keys::generate();
         let fcm_token = format!("failed-send-{}", watcher.public_key().to_hex());
-        redis_store::add_or_update_token(&pool, &watcher.public_key(), &fcm_token)
+        add_awake_test_token(&pool, &watcher.public_key(), &fcm_token)
             .await
             .unwrap();
 
@@ -5754,9 +5943,7 @@ mod tests {
         settings.service.recipient_throttle_capacity = 100;
         let owner = Keys::generate().public_key();
         let device = format!("capped-like-{}", owner.to_hex());
-        redis_store::add_or_update_token(&pool, &owner, &device)
-            .await
-            .unwrap();
+        add_awake_test_token(&pool, &owner, &device).await.unwrap();
         assert!(crate::notification_delivery::reserve_budget(
             &pool,
             &owner,
@@ -5808,6 +5995,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targetless_like_cannot_bypass_buffer_from_first_policy() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let owner = Keys::generate().public_key();
+        let device = format!("synthetic-targetless-{}", owner.to_hex());
+        add_awake_test_token(&pool, &owner, &device).await.unwrap();
+        let mock = MockFcmSender::new();
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        state.settings.service.coalesce_immediate_limit = 0;
+        let like = EventBuilder::new(Kind::Reaction, "+")
+            .tag(Tag::public_key(owner))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        send_notification_to_user(
+            &state,
+            &like,
+            &owner,
+            NotificationType::Like,
+            &test_copy(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(mock.get_sent_messages().is_empty());
+        redis_store::remove_token(&pool, &owner, &device)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ineligible_public_activity_does_not_persist_work_markers() {
+        let pool = test_redis_pool().await.expect("Redis is required");
+        for (registered, expired, blocked) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let owner = Keys::generate().public_key();
+            let device = format!("synthetic-static-gate-{}", owner.to_hex());
+            if registered {
+                add_awake_test_token(&pool, &owner, &device).await.unwrap();
+            }
+            let mut settings = crate::config::Settings::new().unwrap();
+            settings.service.allowed_pubkeys = if blocked {
+                vec![Keys::generate().public_key().to_hex()]
+            } else {
+                vec![]
+            };
+            let state = test_app_state(
+                settings,
+                pool.clone(),
+                FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+            );
+            let event = EventBuilder::new(Kind::Reaction, "+")
+                .tag(Tag::public_key(owner))
+                .tag(Tag::event(EventId::all_zeros()))
+                .custom_created_at(Timestamp::from(
+                    Timestamp::now().as_secs() - if expired { 7200 } else { 0 },
+                ))
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            send_notification_to_user(
+                &state,
+                &event,
+                &owner,
+                NotificationType::Like,
+                &test_copy(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let markers: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("notification_work_generation:{}:*", owner.to_hex()))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert!(markers.is_empty(), "registered={registered}, expired={expired}, blocked={blocked} must not persist delivery work");
+            drop(conn);
+            if registered {
+                redis_store::remove_token(&pool, &owner, &device)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn like_bursts_coalesce_after_the_immediate_limit() {
         let _guard = crate::coalesce::test_lock().lock().await;
         let Some(pool) = test_redis_pool().await else {
@@ -5830,9 +6110,7 @@ mod tests {
         let author = Keys::generate();
         let owner = author.public_key();
         let token = format!("coalesce-e2e-{}", owner.to_hex());
-        redis_store::add_or_update_token(&pool, &owner, &token)
-            .await
-            .unwrap();
+        add_awake_test_token(&pool, &owner, &token).await.unwrap();
 
         let mock = MockFcmSender::new();
         let state = test_app_state(

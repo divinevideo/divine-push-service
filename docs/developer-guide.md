@@ -55,6 +55,7 @@ authenticated internal hook; all other rows are watched in production config.
 | Repost | 16 | Repost of user's note (p-tag) |
 | DirectMessage | 1059 | Triggered only by the authenticated internal hook. The relay listener deliberately does not ingest gift wraps because a raw wrap does not reveal whether it is chat, a sender self-copy, a reaction, or a file message |
 | NewPost | 34236 | A creator the user belled published a video. The only type whose recipients do not come from a `p` tag — see [New-post subscriptions](#new-post-subscriptions-bells) |
+| activityDigest | 7, 16 | One push summarizing buffered likes and reposts across posts; replaces per-event Like and Repost pushes by default — see [Like and Repost coalescing](#like-and-repost-coalescing) |
 
 > **Note:** Divine video comments are NIP-22 `kind:1111`, not `kind:1`. They notify both the **root author** (uppercase `P` — the video owner, so they hear about comments on their video) and the **direct parent author** (lowercase `p` — for a reply, the parent comment's author). The two coincide for a top-level comment and are deduplicated. Every such push carries the authoritative root-video coordinate (see [Routing & attribution contract](#routing--attribution-contract)), so a reply to someone else's comment still routes to the correct video instead of a guessed one. The service does not subscribe to kind-1 text notes because Divine does not surface them in the notification Inbox.
 
@@ -108,7 +109,7 @@ When the triggering event is not addressable and carries no addressable referenc
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `like`, `comment`, `mention`, `repost`, `directMessage`, or `newPost`. Match the exact camelCase strings |
+| `type` | string | `like`, `comment`, `mention`, `repost`, `directMessage`, `newPost`, or `activityDigest`. Match the exact camelCase strings. An `activityDigest` has no sender, `eventKind`, or referenced-target fields, its `eventId` is the first buffered trigger, and a tap should open the notification inbox |
 | `eventId` | hex | The Nostr event that triggered the notification (the like/comment/mention/repost/video event itself); stable id for dedup and a routing fallback |
 | `senderPubkey` | hex | (omitted for `directMessage`) Pubkey of the actor who triggered the event; routes otherwise-unresolved taps |
 | `receiverPubkey` | hex | Pubkey of the notification recipient |
@@ -234,9 +235,21 @@ The `pubkey` field is present either way.
 
 ## Like and Repost coalescing
 
-One popular post must not buzz its author once per like. Kinds 7 (Like) and 16
-(Repost) are coalesced per `(recipient, type, target)` inside fixed
-`coalesce_window_secs` buckets (two hours by default):
+One popular post must not buzz its author once per like. With the default
+`coalesce_immediate_limit` of `0`, kinds 7 (Like) and 16 (Repost) buffer from
+the first interaction into one account digest per recipient, visit generation,
+and `coalesce_window_secs` bucket (two hours by default), across all posts and
+both types. The flush sends one data-only `activityDigest` push ("You received
+3 likes and 2 reposts.") with no actor or target; a tap opens the notification
+inbox. One actor's repeated like or repost of the same target counts once, and
+each category stops counting exactly at 1024 ("at least 1024 likes"). The
+digest is subject to the shared visit policy in
+[`notification-delivery.md`](notification-delivery.md) instead of the
+per-recipient token bucket and emission window below. A like or repost without
+an event reference or addressable coordinate is not pushed at all.
+
+A positive `coalesce_immediate_limit` restores the legacy per-post behavior,
+coalescing per `(recipient, type, target)` inside the same buckets:
 
 - The first `coalesce_immediate_limit` interactions in a bucket send
   immediately, with today's copy.
@@ -261,9 +274,9 @@ One popular post must not buzz its author once per like. Kinds 7 (Like) and 16
 
 Comments, mentions, and new-post ("bell") notifications are deliberately not
 coalesced: they have no reliably retrievable durable inbox row, so collapsing
-one can lose it permanently. Events with neither an event reference nor an
-addressable coordinate are not coalesced either, because a summary must not mix
-posts in one count.
+one can lose it permanently. In legacy mode, events with neither an event
+reference nor an addressable coordinate are not coalesced either, because a
+summary must not mix posts in one count.
 
 Ingest runs as one atomic Lua script that records a per-event disposition
 (`i:{group}` or `b:{group}`), so a replay reproduces the original decision and
@@ -522,10 +535,12 @@ The canonical registration and removal rules live in the push specification's
 | `notify_watchers:{creator}` | Set | Subscribers watching this creator. The hot read path walks this set with paged `SSCAN` reads. |
 | `notify_rate:{subscriber}:{creator}` | String | New-post rate-limit window marker, TTL `new_post_rate_limit_secs` (one hour by default). |
 | `coalesce:g:{type}:{owner}:{target}:{bucket}` | Hash | One bucket's like/repost group: deadline, pending and immediate counts, first buffered actor/event, latest timestamp, routing reference fields, and the current flush lease token. TTL `coalesce_window_secs + coalesce_logical_expiry_grace_secs` |
+| `coalesce:g:activity:{owner}:{generation}:{bucket}` | Hash | One account digest: deadline, `generation`, `likes`/`reposts` counts and their `_lower_bound` flags, up to 1024 hashed action identities per category, first event, latest timestamp, and the flush lease token. Its dispositions live as long as the group, because a cooldown can hold it past its bucket |
 | `coalesce:hll:{type}:{owner}:{target}:{bucket}` | HyperLogLog | Distinct buffered actors for the group. Same TTL as the group |
 | `coalesce:disp:{event_id}:{recipient}` | String | Per-event ingest disposition, `i:{group}` (immediate) or `b:{group}` (buffered), so a replay reproduces the original decision and collapse id. Same TTL as the group |
 | `coalesce:due` | Sorted Set | Bucket groups due for flush, scored by deadline. `{target}` is `e:{event-id}` or `a:{kind:pubkey:d-tag}` |
 | `coalesce:leases` | Sorted Set | Groups owned by an in-flight flush, scored by lease expiry. Reconciliation returns expired leases with pending work to `coalesce:due`, never re-adding a group with nothing pending |
 | `coalesce:throttle:{owner}` | Hash | Per-recipient immediate-push token bucket (`tokens`, `ts`) |
 | `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: one member per emitted like/repost notification scored by send time, pruned to `recipient_daily_window_secs` and counted against `recipient_daily_cap` before the bucket is spent |
+| `delivery_budget:{pubkey}`, `delivery_generations:{pubkey}`, `notification_activity:{pubkey}`, `notification_active:{pubkey}`, `notification_activity_session:{pubkey}:{session}`, `notification_work_generation:{pubkey}:{hash}` | Mixed | Shared interruption policy and visit state; see [notification-delivery.md](notification-delivery.md) |
 | `campaign_delivery:{idempotencyKey}` | String | Campaign delivery claim. Taken for the in-flight window (`CLAIM_TTL_SECS`, 600s) while a send is running, extended to `campaign_delivery.dedup_ttl_secs` (7 days by default) once FCM accepts a push, and dropped on the outcomes that send nothing. The key being present does not by itself mean the push was delivered; a TTL beyond the in-flight window does |

@@ -199,6 +199,12 @@ results influence work.
 - `coalesce:leases` - Sorted set of groups owned by an in-flight flush, scored by lease expiry; reconciliation never re-adds a group with nothing pending
 - `coalesce:throttle:{owner}` - Per-recipient token bucket shared by immediate like/repost pushes and summary flushes: a summary with an empty bucket defers to the next refill instead of sending
 - `coalesce:emitted:{owner}` - Per-recipient rolling emission window: one member per emitted like/repost notification (trigger event id for an immediate push, group id for a summary), scored by the Redis server time of the send. Reads drop members older than `recipient_daily_window_secs` and `ZCARD` is checked against `recipient_daily_cap` before either path spends, so immediates and summaries share the same 24-hour budget; a summary refused by the cap requeues for the moment the oldest member ages out, and a failure that emitted nothing removes its member again
+- `coalesce:g:activity:{owner}:{generation}:{bucket}` - Account digest group (like/repost counts, bounded hashed action identities, first event, flush lease) used when `coalesce_immediate_limit` is 0
+- `delivery_budget:{pubkey}` / `delivery_generations:{pubkey}` - Reserved push identities for the shared interruption policy, and the visit generation each was reserved under
+- `notification_activity:{pubkey}` - Visit `generation` and `absence_used` count; no expiry
+- `notification_active:{pubkey}` - Foreground sessions scored by presence expiry
+- `notification_activity_session:{pubkey}:{session}` - Last applied sequence and visit of one app session
+- `notification_work_generation:{pubkey}:{hash}` - Visit generation a notification was first attempted under, so a retry cannot adopt a later visit
 - `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
 
 ### Notification Types
@@ -210,8 +216,9 @@ results influence work.
 | Repost | 16 | Reposts of user's notes |
 | NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
 | Campaign | n/a | Approved campaign notifications collected from the campaign tool. Not triggered by a Nostr event; off by default. |
+| activityDigest | 7, 16 | One push summarizing buffered likes and reposts across posts (default) |
 
-Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes. Like and Repost are coalesced into bucket summaries (see `docs/plans/like-repost-coalescing.md`); Comment, Mention, and NewPost are not, because collapsing them can lose a notification with no durable inbox row.
+Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes. Like and Repost are coalesced into account digests by default (see `docs/plans/like-repost-coalescing.md`); Comment, Mention, and NewPost are not, because collapsing them can lose a notification with no durable inbox row. Every push type, direct messages included, shares the visit-based interruption policy in `docs/notification-delivery.md`.
 
 ## Unblocking Workflow
 

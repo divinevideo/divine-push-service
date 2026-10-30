@@ -1,8 +1,8 @@
 //! Shared delivery limits for social pushes, summaries, and campaigns.
 //!
 //! Suppression affects pushes only; it does not create durable inbox entries.
-//! Missing offsets retain social delivery for old clients. Campaign consent/
-//! timezone requirements are enforced separately and are never relaxed here.
+//! Unknown timezone suppresses nonessential delivery. Opening the application
+//! resets the absence allowance without erasing cooldown or send identities.
 
 use crate::{
     error::{Result, ServiceError},
@@ -21,16 +21,20 @@ pub struct DeliverySettings {
     pub hourly_cap: u64,
     pub daily_cap: u64,
     pub max_event_age_secs: u64,
+    pub min_interval_secs: u64,
+    pub absence_cap: u64,
 }
 
 impl Default for DeliverySettings {
     fn default() -> Self {
         Self {
-            quiet_start_hour: 22,
-            quiet_end_hour: 8,
+            quiet_start_hour: 21,
+            quiet_end_hour: 7,
             hourly_cap: 5,
             daily_cap: 20,
             max_event_age_secs: 3600,
+            min_interval_secs: 21600,
+            absence_cap: 2,
         }
     }
 }
@@ -45,7 +49,7 @@ pub fn in_quiet_hours(offset_minutes: i32, now: i64, settings: &DeliverySettings
     }
 }
 
-/// Social pushes remain eligible on legacy registrations without a timezone.
+/// Unknown timezone suppresses a nonessential social push.
 /// Quiet work is suppressed rather than replayed as a morning burst.
 pub async fn social_tokens(
     pool: &RedisPool,
@@ -56,12 +60,11 @@ pub async fn social_tokens(
     let devices = redis_store::get_tokens_with_timezone_offsets(pool, recipient).await?;
     let mut tokens = Vec::new();
     for (token, offset) in devices {
-        if offset.is_some_and(|offset| in_quiet_hours(offset, now, settings)) {
+        if offset.is_none() {
+            outcome("timezone_unknown");
+        } else if offset.is_some_and(|offset| in_quiet_hours(offset, now, settings)) {
             outcome("quiet_hours");
         } else {
-            if offset.is_none() {
-                outcome("legacy_timezone_unknown");
-            }
             tokens.push(token);
         }
     }
@@ -77,26 +80,173 @@ pub async fn reserve_budget(
     identity: &str,
     settings: &DeliverySettings,
 ) -> Result<bool> {
+    Ok(
+        reserve_budget_for_generation(pool, recipient, identity, settings, None).await?
+            == BudgetDecision::Allowed,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetDecision {
+    Allowed,
+    Active,
+    StaleVisit,
+    AllowanceExhausted,
+    Cooldown { retry_after_secs: u64 },
+    Capped,
+}
+
+impl BudgetDecision {
+    /// Policy outcome label for a refusal. Each cause keeps its own label so an
+    /// exhausted absence allowance is not reported as an hourly/daily cap.
+    fn refusal_outcome(self) -> Option<&'static str> {
+        match self {
+            Self::Allowed => None,
+            Self::Active => Some("active"),
+            Self::StaleVisit => Some("stale_visit"),
+            Self::AllowanceExhausted => Some("allowance_exhausted"),
+            Self::Cooldown { .. } => Some("cooldown"),
+            Self::Capped => Some("frequency_capped"),
+        }
+    }
+}
+
+/// Atomically authorize one account interruption. Generation-aware queued work
+/// is fenced by a foreground transition, including a transition after leasing.
+pub async fn reserve_budget_for_generation(
+    pool: &RedisPool,
+    recipient: &PublicKey,
+    identity: &str,
+    settings: &DeliverySettings,
+    generation: Option<u64>,
+) -> Result<BudgetDecision> {
     let mut conn = pool
         .get()
         .await
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
-    let allowed: bool = redis::Script::new(r#"
+    let decision: (u64, u64) = redis::Script::new(r#"
         local now = tonumber(redis.call('TIME')[1])
+        local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - 86400)
+        for _, id in ipairs(expired) do redis.call('HDEL', KEYS[4], id) end
         redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - 86400)
-        if redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 1 end
-        if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
-        if redis.call('ZCOUNT', KEYS[1], '(' .. (now - 3600), '+inf') >= tonumber(ARGV[2]) then return 0 end
+        redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+        local generation = tonumber(redis.call('HGET', KEYS[2], 'generation') or '0')
+        if ARGV[6] ~= '' and tonumber(ARGV[6]) ~= generation then return {2, 0} end
+        if redis.call('ZCARD', KEYS[3]) > 0 then return {1, 0} end
+        if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+          local reserved_generation = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
+          if reserved_generation ~= generation then return {2, 0} end
+          -- A retry keeps its original allowance, but cannot jump a newer
+          -- notification. Refresh its attempt time so subsequent sends wait
+          -- a full interval after this provider submission as well.
+          local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+          for i = 1, #latest, 2 do
+            if latest[i] ~= ARGV[1] then
+              local remaining = tonumber(latest[i + 1]) + tonumber(ARGV[4]) - now
+              if remaining > 0 then return {4, remaining} end
+            end
+          end
+          redis.call('ZADD', KEYS[1], now, ARGV[1])
+          redis.call('EXPIRE', KEYS[1], 86400)
+          redis.call('EXPIRE', KEYS[4], 86400)
+          return {0, 0}
+        end
+        local used = tonumber(redis.call('HGET', KEYS[2], 'absence_used'))
+        if used == nil then used = redis.call('ZCARD', KEYS[1]) end
+        if used >= tonumber(ARGV[5]) then return {3, 0} end
+        local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+        if #latest > 0 then
+          local remaining = tonumber(latest[2]) + tonumber(ARGV[4]) - now
+          if remaining > 0 then return {4, remaining} end
+        end
+        if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return {5, 0} end
+        if redis.call('ZCOUNT', KEYS[1], '(' .. (now - 3600), '+inf') >= tonumber(ARGV[2]) then return {5, 0} end
         redis.call('ZADD', KEYS[1], now, ARGV[1])
         redis.call('EXPIRE', KEYS[1], 86400)
-        return 1
+        redis.call('HSET', KEYS[4], ARGV[1], generation)
+        redis.call('EXPIRE', KEYS[4], 86400)
+        redis.call('HSET', KEYS[2], 'absence_used', used + 1)
+        return {0, 0}
     "#).key(format!("delivery_budget:{}", recipient.to_hex()))
+        .key(format!("{}{}", crate::activity::STATE_PREFIX, recipient.to_hex()))
+        .key(format!("{}{}", crate::activity::ACTIVE_PREFIX, recipient.to_hex()))
+        .key(format!("delivery_generations:{}",recipient.to_hex()))
         .arg(identity).arg(settings.hourly_cap).arg(settings.daily_cap)
+        .arg(settings.min_interval_secs).arg(settings.absence_cap)
+        .arg(generation.map(|generation|generation.to_string()).unwrap_or_default())
         .invoke_async(&mut *conn).await.map_err(ServiceError::Redis)?;
-    if !allowed {
-        outcome("frequency_capped");
+    let decision = match decision {
+        (0, _) => BudgetDecision::Allowed,
+        (1, _) => BudgetDecision::Active,
+        (2, _) => BudgetDecision::StaleVisit,
+        (3, _) => BudgetDecision::AllowanceExhausted,
+        (4, retry_after_secs) => BudgetDecision::Cooldown { retry_after_secs },
+        _ => BudgetDecision::Capped,
+    };
+    if let Some(reason) = decision.refusal_outcome() {
+        outcome(reason);
     }
-    Ok(allowed)
+    Ok(decision)
+}
+
+/// Revalidate an existing reservation immediately before a provider request.
+/// This check never spends another slot or relaxes historical idempotency.
+pub async fn validate_reservation(
+    pool: &RedisPool,
+    recipient: &PublicKey,
+    identity: &str,
+    settings: &DeliverySettings,
+    generation: Option<u64>,
+) -> Result<bool> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    redis::Script::new(
+        r#"
+        local now = tonumber(redis.call('TIME')[1])
+        redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+        if redis.call('ZCARD', KEYS[3]) > 0 then return 0 end
+        local generation = tonumber(redis.call('HGET', KEYS[2], 'generation') or '0')
+        if ARGV[2] ~= '' and tonumber(ARGV[2]) ~= generation then return 0 end
+        local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+        if not score or tonumber(score) <= now - 86400 then return 0 end
+        local reserved_generation = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
+        if generation ~= reserved_generation then return 0 end
+        local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+        for i = 1, #latest, 2 do
+          if latest[i] ~= ARGV[1] and tonumber(latest[i + 1]) + tonumber(ARGV[3]) > now then
+            return 0
+          end
+        end
+        redis.call('ZADD', KEYS[1], now, ARGV[1])
+        redis.call('EXPIRE', KEYS[1], 86400)
+        redis.call('EXPIRE', KEYS[4], 86400)
+        return 1
+    "#,
+    )
+    .key(format!("delivery_budget:{}", recipient.to_hex()))
+    .key(format!(
+        "{}{}",
+        crate::activity::STATE_PREFIX,
+        recipient.to_hex()
+    ))
+    .key(format!(
+        "{}{}",
+        crate::activity::ACTIVE_PREFIX,
+        recipient.to_hex()
+    ))
+    .key(format!("delivery_generations:{}", recipient.to_hex()))
+    .arg(identity)
+    .arg(
+        generation
+            .map(|generation| generation.to_string())
+            .unwrap_or_default(),
+    )
+    .arg(settings.min_interval_secs)
+    .invoke_async(&mut *conn)
+    .await
+    .map_err(ServiceError::Redis)
 }
 
 /// Keep provider storage short so offline devices do not replay old activity.
@@ -129,4 +279,29 @@ pub fn immediate_delivery(payload: &mut FcmPayload) {
 
 pub(crate) fn outcome(reason: &'static str) {
     metrics::counter!("push_delivery_policy_total", "outcome" => reason).increment(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BudgetDecision;
+
+    #[test]
+    fn each_budget_refusal_reports_its_own_policy_outcome() {
+        assert_eq!(BudgetDecision::Allowed.refusal_outcome(), None);
+        let refusals = [
+            (BudgetDecision::Active, "active"),
+            (BudgetDecision::StaleVisit, "stale_visit"),
+            (BudgetDecision::AllowanceExhausted, "allowance_exhausted"),
+            (
+                BudgetDecision::Cooldown {
+                    retry_after_secs: 60,
+                },
+                "cooldown",
+            ),
+            (BudgetDecision::Capped, "frequency_capped"),
+        ];
+        for (decision, label) in refusals {
+            assert_eq!(decision.refusal_outcome(), Some(label), "{decision:?}");
+        }
+    }
 }
