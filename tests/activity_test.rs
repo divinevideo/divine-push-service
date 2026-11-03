@@ -435,6 +435,7 @@ async fn activity_without_registered_devices_creates_no_presence_or_visit_state(
             "notification_activity_session:{}:{session}",
             owner.to_hex()
         ))
+        .arg(format!("notification_activity_sessions:{}", owner.to_hex()))
         .query_async(&mut *conn)
         .await
         .unwrap();
@@ -721,4 +722,135 @@ async fn pre_visit_work_cannot_match_missing_activity_after_retention_expires() 
         .await,
         BudgetDecision::Allowed
     );
+}
+
+#[tokio::test]
+async fn account_session_limit_rejects_new_ids_without_resetting_existing_state() {
+    let (pool, owner) = setup().await;
+    let mut sessions = Vec::new();
+    // A week's retained sessions are bounded independently of the IP limiter.
+    for _ in 0..activity::MAX_SESSIONS_PER_ACCOUNT {
+        let session = Uuid::new_v4();
+        update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+        sessions.push(session);
+    }
+    let before = activity::current_generation(&pool, &owner).await.unwrap();
+    let extra = Uuid::new_v4();
+    assert!(activity::record_activity(
+        &pool,
+        &owner,
+        &ActivityUpdate {
+            session_id: extra,
+            sequence: 1,
+            visit: 1,
+            state: ActivityState::Foreground,
+        },
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        activity::current_generation(&pool, &owner).await.unwrap(),
+        before
+    );
+    let mut conn = pool.get().await.unwrap();
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(format!(
+            "notification_activity_session:{}:{extra}",
+            owner.to_hex()
+        ))
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(!exists, "a refused session must create no session hash");
+    let active: u64 = redis::cmd("ZCARD")
+        .arg(format!("notification_active:{}", owner.to_hex()))
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(active, activity::MAX_SESSIONS_PER_ACCOUNT);
+    drop(conn);
+    // An admitted session can still heartbeat at the cap without refilling.
+    update(&pool, &owner, sessions[0], 2, 1, ActivityState::Foreground).await;
+    assert_eq!(
+        activity::current_generation(&pool, &owner).await.unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn event_work_retention_uses_the_callers_retry_horizon() {
+    let (pool, owner) = setup().await;
+    let identity = "event:synthetic-retention";
+    activity::generation_for_work(&pool, &owner, identity, 90_000)
+        .await
+        .unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(format!(
+            "notification_work_generation:{}:{}",
+            owner.to_hex(),
+            blake3::hash(identity.as_bytes()).to_hex()
+        ))
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        (89_999..=90_000).contains(&ttl),
+        "unexpected work TTL: {ttl}"
+    );
+}
+
+#[tokio::test]
+async fn expired_session_slots_are_reclaimed_atomically_under_concurrent_admission() {
+    let (pool, owner) = setup().await;
+    let mut first = None;
+    for _ in 0..activity::MAX_SESSIONS_PER_ACCOUNT {
+        let session = Uuid::new_v4();
+        first.get_or_insert(session);
+        update(&pool, &owner, session, 1, 1, ActivityState::Background).await;
+    }
+    let expired = first.unwrap();
+    let index = format!("notification_activity_sessions:{}", owner.to_hex());
+    let mut conn = pool.get().await.unwrap();
+    redis::pipe()
+        .atomic()
+        .cmd("ZADD")
+        .arg(&index)
+        .arg(0)
+        .arg(expired.to_string())
+        .ignore()
+        .cmd("EXPIRE")
+        .arg(format!(
+            "notification_activity_session:{}:{expired}",
+            owner.to_hex()
+        ))
+        .arg(0)
+        .ignore()
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let updates: Vec<_> = (0..2)
+        .map(|_| ActivityUpdate {
+            session_id: Uuid::new_v4(),
+            sequence: 1,
+            visit: 1,
+            state: ActivityState::Foreground,
+        })
+        .collect();
+    let (a, b) = tokio::join!(
+        activity::record_activity(&pool, &owner, &updates[0]),
+        activity::record_activity(&pool, &owner, &updates[1]),
+    );
+    assert_eq!(
+        [a.is_ok(), b.is_ok()].into_iter().filter(|ok| *ok).count(),
+        1
+    );
+    let mut conn = pool.get().await.unwrap();
+    let count: u64 = redis::cmd("ZCARD")
+        .arg(index)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(count, activity::MAX_SESSIONS_PER_ACCOUNT);
 }

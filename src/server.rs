@@ -128,6 +128,10 @@ async fn activity(
     };
     match crate::activity::record_activity(pool, &recipient, &update).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(ServiceError::ActivitySessionLimit) => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many retained activity sessions",
+        ),
         Err(error) => {
             tracing::error!(error=%error,"Activity update failed");
             error_response(
@@ -509,6 +513,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn activity_endpoint_rejects_an_additional_session_at_the_account_cap() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let pool = crate::redis_store::create_pool(&url, 2).await.unwrap();
+        let owner = nostr_sdk::Keys::generate().public_key();
+        crate::redis_store::add_or_update_token(
+            &pool,
+            &owner,
+            &format!("synthetic-cap-{}", owner.to_hex()),
+        )
+        .await
+        .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let (now, _): (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+        for _ in 0..crate::activity::MAX_SESSIONS_PER_ACCOUNT {
+            redis::cmd("ZADD")
+                .arg(format!("notification_activity_sessions:{}", owner.to_hex()))
+                .arg(now + 604800)
+                .arg(uuid::Uuid::new_v4().to_string())
+                .query_async::<()>(&mut *conn)
+                .await
+                .unwrap();
+        }
+        drop(conn);
+        let mut state = server_state(Arc::new(TaskHealth::new()));
+        state.activity_pool = Some(pool);
+        let body = serde_json::json!({"recipientPubkey":owner.to_hex(),"sessionId":uuid::Uuid::new_v4(),"sequence":1,"visit":1,"state":"foreground"});
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/activity")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[tokio::test]

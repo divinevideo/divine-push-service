@@ -205,6 +205,7 @@ results influence work.
 - `notification_visit_sequence` - Persistent counter without account identifiers; allocates generations that remain distinct after per-account activity expires
 - `notification_active:{pubkey}` - Foreground sessions scored by presence expiry
 - `notification_activity_session:{pubkey}:{session}` - Last applied sequence and visit of one app session
+- `notification_activity_sessions:{pubkey}` - Expiring admission index capped at 128 retained sessions; excess new sessions get HTTP 429 without resetting visit state
 - `notification_work_generation:{pubkey}:{hash}` - Visit generation a notification was first attempted under, so a retry cannot adopt a later visit
 - `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
 

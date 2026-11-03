@@ -51,6 +51,9 @@ pub enum ServiceError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("Too many retained activity sessions")]
+    ActivitySessionLimit,
+
     #[error("Relay error: {0}")]
     RelayError(String),
 
@@ -105,6 +108,10 @@ impl IntoResponse for ServiceError {
             ServiceError::SerdeJson(e) => (StatusCode::BAD_REQUEST, format!("JSON error: {}", e)),
             ServiceError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ServiceError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
+            ServiceError::ActivitySessionLimit => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many retained activity sessions".to_string(),
+            ),
             ServiceError::RelayError(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Relay error: {}", msg),

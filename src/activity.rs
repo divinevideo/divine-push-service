@@ -14,6 +14,8 @@ pub const STATE_PREFIX: &str = "notification_activity:";
 pub const ACTIVE_PREFIX: &str = "notification_active:";
 pub const PRESENCE_TTL_SECS: u64 = 180;
 const SESSION_TTL_SECS: u64 = 604800;
+/// Bound retained sessions while allowing multiple devices and process restarts.
+pub const MAX_SESSIONS_PER_ACCOUNT: u64 = 128;
 pub const STATE_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -56,7 +58,7 @@ pub async fn record_activity(
         .get()
         .await
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    let reset: bool = redis::Script::new(
+    let reset: i64 = redis::Script::new(
         r#"
         if redis.call('EXISTS', KEYS[4]) == 0 then return 0 end
         local previous_sequence = tonumber(redis.call('HGET', KEYS[1], 'sequence') or '0')
@@ -64,6 +66,13 @@ pub async fn record_activity(
         local previous_visit = tonumber(redis.call('HGET', KEYS[1], 'visit') or '0')
         if tonumber(ARGV[6]) < previous_visit then return 0 end
         local now = tonumber(redis.call('TIME')[1])
+        redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', now)
+        if not redis.call('ZSCORE', KEYS[6], ARGV[1])
+          and redis.call('ZCARD', KEYS[6]) >= tonumber(ARGV[8]) then
+          return -1
+        end
+        redis.call('ZADD', KEYS[6], now + tonumber(ARGV[5]), ARGV[1])
+        redis.call('EXPIRE', KEYS[6], ARGV[5])
         redis.call('HSET', KEYS[1], 'sequence', ARGV[2], 'state', ARGV[3], 'visit', ARGV[6])
         redis.call('EXPIRE', KEYS[1], ARGV[5])
         redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
@@ -101,6 +110,7 @@ pub async fn record_activity(
     .key(format!("{STATE_PREFIX}{owner}"))
     .key(format!("user_tokens:{owner}"))
     .key("notification_visit_sequence")
+    .key(format!("notification_activity_sessions:{owner}"))
     .arg(update.session_id.to_string())
     .arg(update.sequence)
     .arg(match update.state {
@@ -111,10 +121,15 @@ pub async fn record_activity(
     .arg(SESSION_TTL_SECS)
     .arg(update.visit)
     .arg(STATE_TTL_SECS)
+    .arg(MAX_SESSIONS_PER_ACCOUNT)
     .invoke_async(&mut *conn)
     .await
     .map_err(ServiceError::Redis)?;
-    metrics::counter!("push_activity_total", "outcome" => if reset { "visit" } else { "renewed_or_stale" }).increment(1);
+    if reset == -1 {
+        metrics::counter!("push_activity_total", "outcome" => "session_limit").increment(1);
+        return Err(ServiceError::ActivitySessionLimit);
+    }
+    metrics::counter!("push_activity_total", "outcome" => if reset == 1 { "visit" } else { "renewed_or_stale" }).increment(1);
     Ok(())
 }
 
@@ -135,7 +150,7 @@ pub async fn current_generation(pool: &RedisPool, recipient: &PublicKey) -> Resu
 
 /// Bind a recipient/work identity before fallible preflight. A retry must retain
 /// its first generation even when no interruption slot was reserved yet.
-/// Retain at least a week, and longer when the work's expiry requires it.
+/// Retain for the caller's retry horizon, with a minimum TTL of one second.
 /// Public activity for an account without registered devices creates no marker.
 pub async fn generation_for_work(
     pool: &RedisPool,
@@ -180,7 +195,7 @@ pub async fn generation_for_work(
     .key(format!("{STATE_PREFIX}{}", recipient.to_hex()))
     .key(format!("user_tokens:{}", recipient.to_hex()))
     .key("notification_visit_sequence")
-    .arg(retention_secs.max(SESSION_TTL_SECS))
+    .arg(retention_secs.max(1))
     .arg(STATE_TTL_SECS)
     .invoke_async(&mut *conn)
     .await

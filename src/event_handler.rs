@@ -1726,8 +1726,21 @@ async fn send_notification_trigger_to_user(
         .service
         .delivery
         .max_event_age_secs
-        .max(state.settings.service.coalesce_group_ttl_secs)
+        .max(
+            state
+                .settings
+                .service
+                .coalesce_group_ttl_secs
+                .saturating_add(state.settings.service.coalesce_logical_expiry_grace_secs),
+        )
         .max(86_400);
+    // Internal DM hooks have no public-event age fence. Preserve their prior
+    // retry horizon rather than applying the shorter public-event retention.
+    let retention_secs = if trigger.nostr_event().is_none() {
+        retention_secs.max(7 * 86_400)
+    } else {
+        retention_secs
+    };
     let visit_generation = crate::activity::generation_for_work(
         &state.redis_pool,
         target_pubkey,
@@ -3622,6 +3635,16 @@ mod tests {
         assert!(!data.contains_key("senderName"));
 
         let mut conn = pool.get().await.unwrap();
+        let work_ttl: i64 = redis::cmd("TTL")
+            .arg(format!(
+                "notification_work_generation:{}:{}",
+                recipient.to_hex(),
+                blake3::hash(format!("event:{}", event_id.to_hex()).as_bytes()).to_hex()
+            ))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!((604_799..=604_800).contains(&work_ttl));
         redis::cmd("DEL")
             .arg(format!(
                 "dedup:{}:{}",

@@ -56,7 +56,8 @@ Encrypted kind 3079 registration accepts optional `timezone` (IANA name) and
 without re-registration. Offsets remain supported for existing apps. Invalid
 names fall back to an offset; absent/invalid optional timezone data does not
 reject a token registration. Tokens without usable timezone data receive no
-social, direct-message, or campaign pushes.
+social, direct-message, or campaign pushes, except through the staff-only
+campaign bridge described above.
 The mobile app refreshes registration on resume after the zone or offset changes.
 Travel while an app stays closed cannot be detected by the server.
 
@@ -88,7 +89,7 @@ background execution must leave the normal notification tap path usable.
 Monitor `push_delivery_policy_total` outcomes (`quiet_hours`,
 `timezone_unknown`, `expired`, `missing_activity_target`, `active`,
 `stale_visit`, `allowance_exhausted`, `cooldown`, `frequency_capped`) and
-`push_activity_total` outcomes (`visit`, `renewed_or_stale`) alongside existing
+`push_activity_total` outcomes (`visit`, `renewed_or_stale`, `session_limit`) alongside existing
 FCM and coalescing counters. These metric labels contain no recipient
 identifiers. The quiet-hours and timezone counters count device evaluations,
 including the final send-time recheck, and `cooldown` counts each re-evaluation
@@ -115,8 +116,20 @@ The additional Redis state is:
   expiry.
 - `notification_activity_session:{pubkey}:{session}`: the last applied
   `sequence`, `state`, and `visit` of one app session, kept for a week.
+- `notification_activity_sessions:{pubkey}`: admission index of at most 128
+  retained sessions, scored by expiry. A new session beyond this bound gets
+  HTTP 429 without changing presence, generation, or allowance. Existing
+  admitted sessions can still heartbeat; expired slots are reclaimed atomically.
+  The week-long ordering state is not shortened to the presence horizon:
+  forgetting a session after a brief offline interval could count its heartbeat
+  as a new visit. Pre-existing session hashes from before the cap retain their
+  TTL and expire naturally; no scan or bulk deletion is performed.
 - `notification_work_generation:{pubkey}:{hash}`: the visit generation a
   notification was first attempted under, so a retry cannot adopt a later
-  visit. Written only for accounts with registered devices and kept for at
-  least a week.
+  visit. Written only for registered accounts before fallible eligibility
+  lookups, so a failed lookup cannot rebind work after a visit. Public-event
+  retention covers the maximum of event age, group lifetime plus grace, and
+  24 hours (25 hours with defaults), rather than a blanket seven days.
+  Internal direct-message hooks retain their prior seven-day floor because
+  they have no public-event age fence. Campaigns retain their supplied lifetime.
 - `token_timezone_names`: device IANA names, removed with device tokens.
