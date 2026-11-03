@@ -447,6 +447,7 @@ mod tests {
         let mut state = server_state(Arc::new(TaskHealth::new()));
         state.activity_pool = Some(pool.clone());
         let app = router(state);
+        let mut first_generation = None;
         for (sequence, presence) in [
             (1, "foreground"),
             (1, "foreground"),
@@ -469,12 +470,11 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-            assert_eq!(
-                crate::activity::current_generation(&pool, &owner)
-                    .await
-                    .unwrap(),
-                1
-            );
+            let generation = crate::activity::current_generation(&pool, &owner)
+                .await
+                .unwrap();
+            assert_ne!(generation, 0);
+            assert_eq!(*first_generation.get_or_insert(generation), generation);
         }
         assert!(!crate::activity::is_active(&pool, &owner).await.unwrap());
     }

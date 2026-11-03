@@ -202,6 +202,7 @@ results influence work.
 - `coalesce:g:activity:{owner}:{generation}:{bucket}` - Account digest group (like/repost counts, bounded hashed action identities, first event, flush lease) used when `coalesce_immediate_limit` is 0
 - `delivery_budget:{pubkey}` / `delivery_generations:{pubkey}` - Reserved push identities for the shared interruption policy, and the visit generation each was reserved under
 - `notification_activity:{pubkey}` - Visit `generation`, `absence_used` count, and `activity_reported`; expires after 90 days without accepted activity. Delivery reservations do not renew it
+- `notification_visit_sequence` - Persistent counter without account identifiers; allocates generations that remain distinct after per-account activity expires
 - `notification_active:{pubkey}` - Foreground sessions scored by presence expiry
 - `notification_activity_session:{pubkey}:{session}` - Last applied sequence and visit of one app session
 - `notification_work_generation:{pubkey}:{hash}` - Visit generation a notification was first attempted under, so a retry cannot adopt a later visit

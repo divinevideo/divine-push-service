@@ -83,21 +83,19 @@ async fn returning_refills_allowance_without_erasing_delivery_history() {
     );
     let session = Uuid::new_v4();
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let generation = activity::current_generation(&pool, &owner).await.unwrap();
+    assert_ne!(generation, 0);
     assert_eq!(
-        activity::current_generation(&pool, &owner).await.unwrap(),
-        1
-    );
-    assert_eq!(
-        spend(&pool, &owner, "while-active", 1, &settings).await,
+        spend(&pool, &owner, "while-active", generation, &settings).await,
         BudgetDecision::Active
     );
     update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
     assert_eq!(
-        spend(&pool, &owner, "new-activity", 1, &settings).await,
+        spend(&pool, &owner, "new-activity", generation, &settings).await,
         BudgetDecision::Allowed
     );
     assert_eq!(
-        spend(&pool, &owner, "first", 1, &settings).await,
+        spend(&pool, &owner, "first", generation, &settings).await,
         BudgetDecision::StaleVisit
     );
     assert_eq!(
@@ -117,8 +115,9 @@ async fn a_return_does_not_bypass_six_hour_cooldown() {
     let session = Uuid::new_v4();
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
     update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    let generation = activity::current_generation(&pool, &owner).await.unwrap();
     assert!(matches!(
-        spend(&pool, &owner, "after-return", 1, &settings).await,
+        spend(&pool, &owner, "after-return", generation, &settings).await,
         BudgetDecision::Cooldown {
             retry_after_secs: 21599..=21600
         }
@@ -133,7 +132,7 @@ async fn a_return_does_not_bypass_six_hour_cooldown() {
         .await
         .unwrap();
     assert_eq!(
-        spend(&pool, &owner, "after-return", 1, &settings).await,
+        spend(&pool, &owner, "after-return", generation, &settings).await,
         BudgetDecision::Allowed
     );
 }
@@ -143,24 +142,22 @@ async fn heartbeat_duplicate_and_reordered_activity_never_refill() {
     let (pool, owner) = setup().await;
     let session = Uuid::new_v4();
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let first_visit = activity::current_generation(&pool, &owner).await.unwrap();
     update(&pool, &owner, session, 2, 1, ActivityState::Foreground).await;
     update(&pool, &owner, session, 2, 1, ActivityState::Foreground).await;
     assert_eq!(
         activity::current_generation(&pool, &owner).await.unwrap(),
-        1
+        first_visit
     );
     update(&pool, &owner, session, 4, 1, ActivityState::Background).await;
     update(&pool, &owner, session, 3, 1, ActivityState::Foreground).await;
     assert!(!activity::is_active(&pool, &owner).await.unwrap());
     assert_eq!(
         activity::current_generation(&pool, &owner).await.unwrap(),
-        1
+        first_visit
     );
     update(&pool, &owner, session, 5, 2, ActivityState::Foreground).await;
-    assert_eq!(
-        activity::current_generation(&pool, &owner).await.unwrap(),
-        2
-    );
+    assert!(activity::current_generation(&pool, &owner).await.unwrap() > first_visit);
 }
 
 #[tokio::test]
@@ -181,6 +178,7 @@ async fn crashed_presence_expires_and_heartbeat_does_not_create_a_visit() {
     let (pool, owner) = setup().await;
     let session = Uuid::new_v4();
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let generation = activity::current_generation(&pool, &owner).await.unwrap();
     let mut conn = pool.get().await.unwrap();
     redis::cmd("ZADD")
         .arg(format!("{}{}", activity::ACTIVE_PREFIX, owner.to_hex()))
@@ -194,7 +192,7 @@ async fn crashed_presence_expires_and_heartbeat_does_not_create_a_visit() {
     assert!(activity::is_active(&pool, &owner).await.unwrap());
     assert_eq!(
         activity::current_generation(&pool, &owner).await.unwrap(),
-        1
+        generation
     );
 }
 
@@ -275,24 +273,23 @@ async fn missed_background_does_not_prevent_the_next_visit_reset() {
     let (pool, owner) = setup().await;
     let session = Uuid::new_v4();
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let first_visit = activity::current_generation(&pool, &owner).await.unwrap();
     // Sequence2 was a background report lost while offline. The next real
     // foreground carries its own visit epoch, independent of delivery order.
     update(&pool, &owner, session, 3, 2, ActivityState::Foreground).await;
-    assert_eq!(
-        activity::current_generation(&pool, &owner).await.unwrap(),
-        2
-    );
+    let second_visit = activity::current_generation(&pool, &owner).await.unwrap();
+    assert!(second_visit > first_visit);
     update(&pool, &owner, session, 4, 2, ActivityState::Foreground).await;
     assert_eq!(
         activity::current_generation(&pool, &owner).await.unwrap(),
-        2
+        second_visit
     );
     update(&pool, &owner, session, 5, 2, ActivityState::Background).await;
     update(&pool, &owner, session, 6, 1, ActivityState::Foreground).await;
     assert!(!activity::is_active(&pool, &owner).await.unwrap());
     assert_eq!(
         activity::current_generation(&pool, &owner).await.unwrap(),
-        2
+        second_visit
     );
 }
 
@@ -369,7 +366,7 @@ async fn preflight_retries_keep_the_first_work_generation_without_spending_allow
     let first = activity::generation_for_work(&pool, &owner, "campaign:pending", 86400)
         .await
         .unwrap();
-    assert_eq!(first, 0);
+    assert_ne!(first, 0);
     let session = Uuid::new_v4();
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
     update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
@@ -385,7 +382,11 @@ async fn preflight_retries_keep_the_first_work_generation_without_spending_allow
     let new_work = activity::generation_for_work(&pool, &owner, "campaign:new", 86400)
         .await
         .unwrap();
-    assert_eq!(new_work, 1);
+    assert_eq!(
+        new_work,
+        activity::current_generation(&pool, &owner).await.unwrap()
+    );
+    assert_ne!(new_work, first);
     assert_eq!(
         spend(&pool, &owner, "campaign:new", new_work, &settings).await,
         BudgetDecision::Allowed
@@ -452,9 +453,9 @@ async fn activity_without_registered_devices_creates_no_presence_or_visit_state(
     // An ignored report must not consume the sequence before registration.
     update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
     assert!(activity::is_active(&pool, &owner).await.unwrap());
-    assert_eq!(
+    assert_ne!(
         activity::current_generation(&pool, &owner).await.unwrap(),
-        1
+        0
     );
 }
 
@@ -515,12 +516,13 @@ async fn accepted_activity_renews_ninety_day_retention_but_stale_reports_do_not(
         .await
         .unwrap();
     drop(conn);
+    let generation = activity::current_generation(&pool, &owner).await.unwrap();
     assert_eq!(
         spend(
             &pool,
             &owner,
             "after-activity",
-            1,
+            generation,
             &DeliverySettings::default()
         )
         .await,
@@ -603,5 +605,120 @@ async fn activity_keeps_a_reporting_flag_instead_of_an_unused_timestamp() {
     assert!(
         !timestamp_exists,
         "activity should no longer retain the unused timestamp"
+    );
+}
+
+#[tokio::test]
+async fn expired_activity_cannot_revalidate_work_from_an_earlier_visit() {
+    let (pool, owner) = setup().await;
+    let session = Uuid::new_v4();
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    // Campaign work can live longer than the activity hash: its retention
+    // includes the remaining campaign lifetime, not just the seven-day floor.
+    let old = activity::generation_for_work(
+        &pool,
+        &owner,
+        "campaign:long-lived-preflight",
+        activity::STATE_TTL_SECS * 2,
+    )
+    .await
+    .unwrap();
+    update(&pool, &owner, session, 3, 2, ActivityState::Foreground).await;
+    update(&pool, &owner, session, 4, 2, ActivityState::Background).await;
+    let mut conn = pool.get().await.unwrap();
+    // Model the account hash expiring while the longer-lived work marker
+    // remains. A returning process has a new session after the long absence.
+    redis::cmd("EXPIRE")
+        .arg(format!("notification_activity:{}", owner.to_hex()))
+        .arg(0)
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let returning_session = Uuid::new_v4();
+    update(
+        &pool,
+        &owner,
+        returning_session,
+        1,
+        1,
+        ActivityState::Foreground,
+    )
+    .await;
+    update(
+        &pool,
+        &owner,
+        returning_session,
+        2,
+        1,
+        ActivityState::Background,
+    )
+    .await;
+    let retry = activity::generation_for_work(
+        &pool,
+        &owner,
+        "campaign:long-lived-preflight",
+        activity::STATE_TTL_SECS,
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry, old, "the first-attempt binding must survive");
+    assert_eq!(
+        spend(
+            &pool,
+            &owner,
+            "campaign:long-lived-preflight",
+            retry,
+            &DeliverySettings::default(),
+        )
+        .await,
+        BudgetDecision::StaleVisit,
+        "expiring activity state must not recycle an old visit generation"
+    );
+}
+
+#[tokio::test]
+async fn pre_visit_work_cannot_match_missing_activity_after_retention_expires() {
+    let (pool, owner) = setup().await;
+    let identity = "campaign:pre-visit-long-lived";
+    let first =
+        activity::generation_for_work(&pool, &owner, identity, activity::STATE_TTL_SECS * 2)
+            .await
+            .unwrap();
+    let session = Uuid::new_v4();
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    let mut conn = pool.get().await.unwrap();
+    redis::cmd("EXPIRE")
+        .arg(format!("notification_activity:{}", owner.to_hex()))
+        .arg(0)
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let retry = activity::generation_for_work(&pool, &owner, identity, activity::STATE_TTL_SECS)
+        .await
+        .unwrap();
+    assert_eq!(retry, first);
+    assert_eq!(
+        spend(&pool, &owner, identity, retry, &DeliverySettings::default()).await,
+        BudgetDecision::StaleVisit
+    );
+    let new_identity = "campaign:new-after-retention";
+    let current = activity::generation_for_work(&pool, &owner, new_identity, 86400)
+        .await
+        .unwrap();
+    assert_ne!(current, first);
+    assert_eq!(
+        spend(
+            &pool,
+            &owner,
+            new_identity,
+            current,
+            &DeliverySettings::default()
+        )
+        .await,
+        BudgetDecision::Allowed
     );
 }

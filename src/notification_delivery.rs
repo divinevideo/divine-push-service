@@ -163,7 +163,7 @@ pub async fn reserve_budget_for_generation(
         if redis.call('ZCOUNT', KEYS[1], '(' .. (now - 3600), '+inf') >= tonumber(ARGV[2]) then return {5, 0} end
         redis.call('ZADD', KEYS[1], now, ARGV[1])
         redis.call('EXPIRE', KEYS[1], 86400)
-        redis.call('HSET', KEYS[4], ARGV[1], generation)
+        redis.call('HSET', KEYS[4], ARGV[1], string.format('%.0f', generation))
         redis.call('EXPIRE', KEYS[4], 86400)
         redis.call('HSET', KEYS[2], 'absence_used', used + 1)
         redis.call('EXPIRE', KEYS[2], ARGV[7], 'NX')

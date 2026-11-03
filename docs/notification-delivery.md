@@ -105,6 +105,12 @@ The additional Redis state is:
   `absence_used`, and `activity_reported`. Accepted activity renews its 90-day
   expiry; duplicate or stale reports do not. Accounts without registered devices
   create no activity, session, or presence state.
+- `notification_visit_sequence`: one persistent sequence with no account
+  identifiers. Each real visit and a registered account's first work after
+  missing or expired activity state allocates a new generation. This prevents
+  longer-lived campaign work from matching a recycled generation. On first use
+  it is seeded from Redis server microseconds to avoid reusing legacy per-account
+  visit counts.
 - `notification_active:{pubkey}`: foreground sessions scored by presence
   expiry.
 - `notification_activity_session:{pubkey}:{session}`: the last applied

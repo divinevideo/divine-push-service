@@ -69,7 +69,15 @@ pub async fn record_activity(
         redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
         local reset = 0
         if tonumber(ARGV[6]) > previous_visit then
-          redis.call('HINCRBY', KEYS[3], 'generation', 1)
+          -- This counter contains no account data and must outlive account
+          -- hashes: long-lived campaign work can retain an earlier generation
+          -- after the account's 90-day expiry. Seed above legacy visit counts
+          -- so a rolling upgrade cannot reuse their small generation values.
+          local clock = redis.call('TIME')
+          redis.call('SET', KEYS[5], string.format('%.0f',
+            tonumber(clock[1]) * 1000000 + tonumber(clock[2])), 'NX')
+          local generation = redis.call('INCR', KEYS[5])
+          redis.call('HSET', KEYS[3], 'generation', string.format('%.0f', generation))
           redis.call('HSET', KEYS[3], 'absence_used', 0)
           reset = 1
         end
@@ -92,6 +100,7 @@ pub async fn record_activity(
     .key(format!("{ACTIVE_PREFIX}{owner}"))
     .key(format!("{STATE_PREFIX}{owner}"))
     .key(format!("user_tokens:{owner}"))
+    .key("notification_visit_sequence")
     .arg(update.session_id.to_string())
     .arg(update.sequence)
     .arg(match update.state {
@@ -142,8 +151,20 @@ pub async fn generation_for_work(
         r#"
         local generation = redis.call('GET', KEYS[1])
         local registered = redis.call('EXISTS', KEYS[3]) == 1
+        local current = redis.call('HGET', KEYS[2], 'generation')
+        if registered and not current then
+          -- Bind pre-visit work to a real epoch too. Otherwise an old work
+          -- marker bound to legacy generation 0 could match missing state
+          -- again after the 90-day retention window.
+          local clock = redis.call('TIME')
+          redis.call('SET', KEYS[4], string.format('%.0f',
+            tonumber(clock[1]) * 1000000 + tonumber(clock[2])), 'NX')
+          current = string.format('%.0f', redis.call('INCR', KEYS[4]))
+          redis.call('HSET', KEYS[2], 'generation', current)
+          redis.call('EXPIRE', KEYS[2], ARGV[2], 'NX')
+        end
         if not generation then
-          generation = redis.call('HGET', KEYS[2], 'generation') or '0'
+          generation = current or '0'
           if registered then redis.call('SET', KEYS[1], generation, 'EX', ARGV[1]) end
         elseif registered and redis.call('TTL', KEYS[1]) < tonumber(ARGV[1]) then
           redis.call('EXPIRE', KEYS[1], ARGV[1])
@@ -158,7 +179,9 @@ pub async fn generation_for_work(
     ))
     .key(format!("{STATE_PREFIX}{}", recipient.to_hex()))
     .key(format!("user_tokens:{}", recipient.to_hex()))
+    .key("notification_visit_sequence")
     .arg(retention_secs.max(SESSION_TTL_SECS))
+    .arg(STATE_TTL_SECS)
     .invoke_async(&mut *conn)
     .await
     .map_err(ServiceError::Redis)
