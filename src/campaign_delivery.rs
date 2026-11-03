@@ -206,6 +206,10 @@ fn is_expired(expires_at: Option<&str>, now: i64) -> bool {
     let Some(raw) = expires_at else {
         return false;
     };
+    expiry_timestamp(raw).is_none_or(|expiry| expiry <= now)
+}
+
+fn expiry_timestamp(raw: &str) -> Option<i64> {
     let normalized;
     let candidate = if raw.len() == 17 && raw.ends_with('Z') {
         normalized = format!("{}:00Z", &raw[..raw.len() - 1]);
@@ -213,10 +217,9 @@ fn is_expired(expires_at: Option<&str>, now: i64) -> bool {
     } else {
         raw
     };
-    match chrono::DateTime::parse_from_rfc3339(candidate) {
-        Ok(parsed) => parsed.timestamp() <= now,
-        Err(_) => true,
-    }
+    chrono::DateTime::parse_from_rfc3339(candidate)
+        .ok()
+        .map(|parsed| parsed.timestamp())
 }
 
 /// Attach the Cloudflare Access service-token headers to an outbound request.
@@ -341,6 +344,30 @@ async fn deliver(
     let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
     };
+    // Bind on the first recipient attempt, before token/consent lookups can
+    // fail and cause a retry. Future campaigns are not bound until offered.
+    let remaining_lifetime = delivery
+        .expires_at
+        .as_deref()
+        .and_then(expiry_timestamp)
+        .map(|expiry| expiry.saturating_sub(now).max(0) as u64)
+        .unwrap_or(0);
+    let visit_generation = match crate::activity::generation_for_work(
+        &state.redis_pool,
+        &recipient,
+        &format!("campaign:{}", delivery.idempotency_key),
+        remaining_lifetime.saturating_add(settings.dedup_ttl_secs),
+    )
+    .await
+    {
+        Ok(generation) => generation,
+        Err(_) => {
+            return refuse(
+                DeliveryStatus::RetryableFailure,
+                "activity_authority_unavailable",
+            )
+        }
+    };
 
     let recipient_hex = recipient.to_hex();
     let allowed = &state.settings.service.allowed_pubkeys;
@@ -455,16 +482,17 @@ async fn deliver(
         );
     }
 
-    match crate::notification_delivery::reserve_budget(
+    match crate::notification_delivery::reserve_budget_for_generation(
         &state.redis_pool,
         &recipient,
         &format!("campaign:{}", delivery.idempotency_key),
         &state.settings.service.delivery,
+        Some(visit_generation),
     )
     .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(crate::notification_delivery::BudgetDecision::Allowed) => {}
+        Ok(_) => {
             release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
             return refuse(DeliveryStatus::Suppressed, "recipient_frequency_capped");
         }
@@ -478,6 +506,28 @@ async fn deliver(
     }
     let mut payload = campaign_payload(delivery, &recipient);
     crate::notification_delivery::immediate_delivery(&mut payload);
+    match crate::notification_delivery::validate_reservation(
+        &state.redis_pool,
+        &recipient,
+        &format!("campaign:{}", delivery.idempotency_key),
+        &state.settings.service.delivery,
+        Some(visit_generation),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::Suppressed, "recipient_returned");
+        }
+        Err(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(
+                DeliveryStatus::RetryableFailure,
+                "activity_authority_unavailable",
+            );
+        }
+    }
     let outcomes = state.fcm_client.send_batch(&tokens, payload).await;
 
     let mut delivered_tokens = Vec::new();
@@ -1107,7 +1157,7 @@ mod tests {
             &crate::notification_delivery::DeliverySettings::default(),
         )
         .expect("22:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T22:00:00Z");
+        assert_eq!(retry, "2026-01-01T21:00:00Z");
 
         let retry = quiet_hours_retry_after(
             -480,
@@ -1115,7 +1165,7 @@ mod tests {
             &crate::notification_delivery::DeliverySettings::default(),
         )
         .expect("04:00 local is quiet");
-        assert_eq!(retry, "2026-01-01T16:00:00Z");
+        assert_eq!(retry, "2026-01-01T15:00:00Z");
     }
 
     #[test]
@@ -1126,19 +1176,21 @@ mod tests {
         let at_twenty_one = chrono::DateTime::parse_from_rfc3339("2026-01-01T21:00:00Z")
             .unwrap()
             .timestamp();
-        assert!(quiet_hours_retry_after(
-            0,
-            at_seven,
-            &crate::notification_delivery::DeliverySettings::default()
-        )
-        .is_some());
+        assert_eq!(
+            quiet_hours_retry_after(
+                0,
+                at_seven,
+                &crate::notification_delivery::DeliverySettings::default()
+            ),
+            None
+        );
         assert_eq!(
             quiet_hours_retry_after(
                 0,
                 at_twenty_one,
                 &crate::notification_delivery::DeliverySettings::default()
             ),
-            None
+            Some("2026-01-02T07:00:00Z".into())
         );
     }
 
@@ -1363,6 +1415,58 @@ mod tests {
             encoded,
             r#"{"results":[{"idempotencyKey":"rev-1:abc","leaseId":"2026-09-17T12:00:00.000Z","status":"retryable_failure","reason":"provider_error"}]}"#
         );
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_cannot_rebind_a_campaign_after_a_visit() {
+        let pool = test_redis_pool().await.expect("Redis is required");
+        let (pending, token) = registered_delivery(&pool, "visit-preflight").await;
+        let recipient = PublicKey::from_str(&pending.recipient_pubkey).unwrap();
+        let token_key = format!("user_tokens:{}", recipient.to_hex());
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("SET")
+            .arg(&token_key)
+            .arg("synthetic-wrong-type")
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool.clone(), sender.clone());
+        let first = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
+        assert_eq!(first.status, DeliveryStatus::RetryableFailure);
+        assert_eq!(first.reason.as_deref(), Some("token_lookup_failed"));
+        let session = uuid::Uuid::new_v4();
+        for (sequence, activity_state) in [
+            (1, crate::activity::ActivityState::Foreground),
+            (2, crate::activity::ActivityState::Background),
+        ] {
+            crate::activity::record_activity(
+                &pool,
+                &recipient,
+                &crate::activity::ActivityUpdate {
+                    session_id: session,
+                    sequence,
+                    visit: 1,
+                    state: activity_state,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&token_key)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        redis_store::add_or_update_token(&pool, &recipient, &token)
+            .await
+            .unwrap();
+        let retry = deliver(&state, &pending, 1_800_000_000, TEST_LEASE_SECS).await;
+        assert_eq!(retry.status, DeliveryStatus::Suppressed);
+        assert!(sender.get_sent_messages().is_empty());
     }
 
     #[tokio::test]
@@ -1811,7 +1915,7 @@ mod tests {
         let result = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
         assert_eq!(result.status, DeliveryStatus::Deferred);
         assert_eq!(result.reason.as_deref(), Some("recipient_quiet_hours"));
-        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T22:00:00Z"));
+        assert_eq!(result.retry_after.as_deref(), Some("2026-01-01T21:00:00Z"));
         assert_eq!(
             claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
             -2,
