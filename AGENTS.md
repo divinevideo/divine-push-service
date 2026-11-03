@@ -201,7 +201,7 @@ results influence work.
 - `coalesce:emitted:{owner}` - Per-recipient rolling emission window: one member per emitted like/repost notification (trigger event id for an immediate push, group id for a summary), scored by the Redis server time of the send. Reads drop members older than `recipient_daily_window_secs` and `ZCARD` is checked against `recipient_daily_cap` before either path spends, so immediates and summaries share the same 24-hour budget; a summary refused by the cap requeues for the moment the oldest member ages out, and a failure that emitted nothing removes its member again
 - `coalesce:g:activity:{owner}:{generation}:{bucket}` - Account digest group (like/repost counts, bounded hashed action identities, first event, flush lease) used when `coalesce_immediate_limit` is 0
 - `delivery_budget:{pubkey}` / `delivery_generations:{pubkey}` - Reserved push identities for the shared interruption policy, and the visit generation each was reserved under
-- `notification_activity:{pubkey}` - Visit `generation` and `absence_used` count; no expiry
+- `notification_activity:{pubkey}` - Visit `generation`, `absence_used` count, and `activity_reported`; expires after 90 days without accepted activity. Delivery reservations do not renew it
 - `notification_active:{pubkey}` - Foreground sessions scored by presence expiry
 - `notification_activity_session:{pubkey}:{session}` - Last applied sequence and visit of one app session
 - `notification_work_generation:{pubkey}:{hash}` - Visit generation a notification was first attempted under, so a retry cannot adopt a later visit

@@ -14,6 +14,7 @@ pub const STATE_PREFIX: &str = "notification_activity:";
 pub const ACTIVE_PREFIX: &str = "notification_active:";
 pub const PRESENCE_TTL_SECS: u64 = 180;
 const SESSION_TTL_SECS: u64 = 604800;
+pub const STATE_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +58,7 @@ pub async fn record_activity(
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
     let reset: bool = redis::Script::new(
         r#"
+        if redis.call('EXISTS', KEYS[4]) == 0 then return 0 end
         local previous_sequence = tonumber(redis.call('HGET', KEYS[1], 'sequence') or '0')
         if tonumber(ARGV[2]) <= previous_sequence then return 0 end
         local previous_visit = tonumber(redis.call('HGET', KEYS[1], 'visit') or '0')
@@ -77,7 +79,9 @@ pub async fn record_activity(
         else
           redis.call('ZREM', KEYS[2], ARGV[1])
         end
-        redis.call('HSET', KEYS[3], 'last_activity_at', now)
+        redis.call('HSET', KEYS[3], 'activity_reported', 1)
+        redis.call('HDEL', KEYS[3], 'last_activity_at')
+        redis.call('EXPIRE', KEYS[3], ARGV[7])
         return reset
     "#,
     )
@@ -87,6 +91,7 @@ pub async fn record_activity(
     ))
     .key(format!("{ACTIVE_PREFIX}{owner}"))
     .key(format!("{STATE_PREFIX}{owner}"))
+    .key(format!("user_tokens:{owner}"))
     .arg(update.session_id.to_string())
     .arg(update.sequence)
     .arg(match update.state {
@@ -96,6 +101,7 @@ pub async fn record_activity(
     .arg(PRESENCE_TTL_SECS)
     .arg(SESSION_TTL_SECS)
     .arg(update.visit)
+    .arg(STATE_TTL_SECS)
     .invoke_async(&mut *conn)
     .await
     .map_err(ServiceError::Redis)?;

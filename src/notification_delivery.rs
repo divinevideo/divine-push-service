@@ -166,6 +166,7 @@ pub async fn reserve_budget_for_generation(
         redis.call('HSET', KEYS[4], ARGV[1], generation)
         redis.call('EXPIRE', KEYS[4], 86400)
         redis.call('HSET', KEYS[2], 'absence_used', used + 1)
+        redis.call('EXPIRE', KEYS[2], ARGV[7], 'NX')
         return {0, 0}
     "#).key(format!("delivery_budget:{}", recipient.to_hex()))
         .key(format!("{}{}", crate::activity::STATE_PREFIX, recipient.to_hex()))
@@ -174,6 +175,7 @@ pub async fn reserve_budget_for_generation(
         .arg(identity).arg(settings.hourly_cap).arg(settings.daily_cap)
         .arg(settings.min_interval_secs).arg(settings.absence_cap)
         .arg(generation.map(|generation|generation.to_string()).unwrap_or_default())
+        .arg(crate::activity::STATE_TTL_SECS)
         .invoke_async(&mut *conn).await.map_err(ServiceError::Redis)?;
     let decision = match decision {
         (0, _) => BudgetDecision::Allowed,

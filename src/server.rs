@@ -436,6 +436,13 @@ mod tests {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
         let pool = crate::redis_store::create_pool(&url, 2).await.unwrap();
         let owner = nostr_sdk::Keys::generate().public_key();
+        crate::redis_store::add_or_update_token(
+            &pool,
+            &owner,
+            &format!("synthetic-activity-endpoint-{}", owner.to_hex()),
+        )
+        .await
+        .unwrap();
         let session = uuid::Uuid::new_v4();
         let mut state = server_state(Arc::new(TaskHealth::new()));
         state.activity_pool = Some(pool.clone());

@@ -112,24 +112,40 @@ recovery, and superseded timestamp retries are fixed. Final verification passed
 343 related app tests and full lib/test/integration_test analysis; the lifecycle
 fix also passed 199 focused app tests and the full 477-test API client suite.
 Five NIP-55 channel tests passed before the final transport/test-fake fixes.
-Final whole-diff independent review found no actionable code findings. The mobile PR must remain draft until real base/head simulator
-screenshots demonstrate lifecycle and digest tap behavior with safe test data.
+Final whole-diff independent review found no actionable code findings. The mobile PR
+merged on 2026-11-02. Actual base/head device captures were not performed; the
+maintainer removed that mandatory draft gate on 2026-10-30.
 
 Independent push review exposed retry cooldown bypasses, inverted quiet-hour
 configuration, ingest rebinding during a visit, and pre-reservation delivery
 retry rebinding. Regression tests reproduced each bug before repair. Final
-361-test output is in /tmp/visit-push-reviewed-all-tests.log; strict Clippy is
-in /tmp/visit-push-reviewed-clippy.log. Build debug symbols and incremental
+361-test and strict Clippy results were recorded during that session; its temporary
+log files are not durable validation artifacts. Build debug symbols and incremental
 artifacts were disabled for the final checks to fit the shared machine's disk.
 
 Delivery targets: push PR #88, Funnelcake PR #1410, mobile PR #10567. Push and
-mobile remain draft pending actual safe-data base/head device evidence. Gateway
-CI explicitly runs the new endpoint integration target. Current-head independent
-push re-review and final live CI inspection are still required.
+mobile are no longer held in draft for screenshots. Gateway CI explicitly runs
+the new endpoint integration target. Review repairs still require current-head
+independent push re-review and live CI inspection.
 
 A final review also found public events could create work markers for
 unregistered or statically ineligible recipients. The registration/age/allowlist
 regression failed before repair. Static checks now precede binding and the Lua
-binding writes/renews only for registered accounts. Final 361 tests and strict
-Clippy are recorded in /tmp/visit-push-final-registration-tests.log and
-/tmp/visit-push-final-registration-clippy.log.
+binding writes/renews only for registered accounts. That session recorded 361
+passing tests and strict Clippy; its temporary log files are not durable artifacts.
+
+
+## Retention review follow-up (2026-11-03)
+
+Activity for unregistered accounts is ignored atomically. Accepted activity
+renews a 90-day account-state expiry; replays and push reservations do not renew
+it. Delivery-only state also expires. `activity_reported` replaces the unused
+activity timestamp. Regression tests failed before each repair, then the full
+Redis-backed `cargo test --all-targets` passed 366 tests with none failed or
+ignored. Strict all-target/all-feature Clippy, `cargo build`, formatting, diff
+checks, and all five deploy-payload contract cases passed locally.
+
+The older-client rolling fallback and direct-message exemptions still need the
+maintainer's policy decision. The existing limits remain in effect pending that
+decision. No merge, deployment, live FCM test, or device verification is claimed
+by this follow-up.

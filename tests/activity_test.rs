@@ -8,12 +8,24 @@ use divine_push_service::{
 use nostr_sdk::{Keys, PublicKey};
 use uuid::Uuid;
 
-async fn setup() -> (RedisPool, PublicKey) {
+async fn setup_unregistered() -> (RedisPool, PublicKey) {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     (
         redis_store::create_pool(&url, 5).await.unwrap(),
         Keys::generate().public_key(),
     )
+}
+
+async fn setup() -> (RedisPool, PublicKey) {
+    let (pool, owner) = setup_unregistered().await;
+    redis_store::add_or_update_token(
+        &pool,
+        &owner,
+        &format!("synthetic-activity-{}", owner.to_hex()),
+    )
+    .await
+    .unwrap();
+    (pool, owner)
 }
 
 async fn update(
@@ -406,5 +418,190 @@ async fn provider_preflight_rejects_an_old_reservation_after_a_newer_send() {
         !validate_reservation(&pool, &owner, "old", &settings, Some(0))
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn activity_without_registered_devices_creates_no_presence_or_visit_state() {
+    let (pool, owner) = setup_unregistered().await;
+    let session = Uuid::new_v4();
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let mut conn = pool.get().await.unwrap();
+    let keys: u64 = redis::cmd("EXISTS")
+        .arg(format!("notification_activity:{}", owner.to_hex()))
+        .arg(format!("notification_active:{}", owner.to_hex()))
+        .arg(format!(
+            "notification_activity_session:{}:{session}",
+            owner.to_hex()
+        ))
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        keys, 0,
+        "an account without a device has no push activity to retain"
+    );
+    drop(conn);
+    redis_store::add_or_update_token(
+        &pool,
+        &owner,
+        &format!("synthetic-retention-{}", owner.to_hex()),
+    )
+    .await
+    .unwrap();
+    // An ignored report must not consume the sequence before registration.
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    assert!(activity::is_active(&pool, &owner).await.unwrap());
+    assert_eq!(
+        activity::current_generation(&pool, &owner).await.unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn accepted_activity_renews_ninety_day_retention_but_stale_reports_do_not() {
+    let (pool, owner) = setup().await;
+    redis_store::add_or_update_token(
+        &pool,
+        &owner,
+        &format!("synthetic-retention-{}", owner.to_hex()),
+    )
+    .await
+    .unwrap();
+    let session = Uuid::new_v4();
+    let key = format!("notification_activity:{}", owner.to_hex());
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let mut conn = pool.get().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&key)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        (7_775_999..=7_776_000).contains(&ttl),
+        "activity state must expire after 90 inactive days, got {ttl}"
+    );
+    redis::cmd("EXPIRE")
+        .arg(&key)
+        .arg(60)
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let mut conn = pool.get().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&key)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!((1..=60).contains(&ttl), "a replay must not renew retention");
+    drop(conn);
+    update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    let mut conn = pool.get().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&key)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        (7_775_999..=7_776_000).contains(&ttl),
+        "accepted reports must renew retention"
+    );
+    redis::cmd("EXPIRE")
+        .arg(&key)
+        .arg(60)
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(
+            &pool,
+            &owner,
+            "after-activity",
+            1,
+            &DeliverySettings::default()
+        )
+        .await,
+        BudgetDecision::Allowed
+    );
+    let mut conn = pool.get().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&key)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        (1..=60).contains(&ttl),
+        "sending a push must not extend activity retention"
+    );
+}
+
+#[tokio::test]
+async fn delivery_without_activity_never_creates_immortal_activity_state() {
+    let (pool, owner) = setup().await;
+    assert_eq!(
+        spend(
+            &pool,
+            &owner,
+            "delivery-only",
+            0,
+            &DeliverySettings::default()
+        )
+        .await,
+        BudgetDecision::Allowed
+    );
+    let mut conn = pool.get().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(format!("notification_activity:{}", owner.to_hex()))
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert_ne!(
+        ttl, -1,
+        "delivery must not leave activity state without an expiry"
+    );
+}
+
+#[tokio::test]
+async fn activity_keeps_a_reporting_flag_instead_of_an_unused_timestamp() {
+    let (pool, owner) = setup().await;
+    let key = format!("notification_activity:{}", owner.to_hex());
+    let mut conn = pool.get().await.unwrap();
+    redis::cmd("HSET")
+        .arg(&key)
+        .arg("last_activity_at")
+        .arg(1)
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    update(
+        &pool,
+        &owner,
+        Uuid::new_v4(),
+        1,
+        1,
+        ActivityState::Foreground,
+    )
+    .await;
+    let mut conn = pool.get().await.unwrap();
+    let flag: Option<u8> = redis::cmd("HGET")
+        .arg(&key)
+        .arg("activity_reported")
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(flag, Some(1));
+    let timestamp_exists: bool = redis::cmd("HEXISTS")
+        .arg(&key)
+        .arg("last_activity_at")
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        !timestamp_exists,
+        "activity should no longer retain the unused timestamp"
     );
 }

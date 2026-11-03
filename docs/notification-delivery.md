@@ -6,9 +6,10 @@ replicas and device tokens:
 
 - At most two pushes between visits (`absence_cap`). An authenticated
   foreground visit, reported through `POST /internal/v1/activity`, resets the
-  count. The count has no expiry, so an account whose client never reports a
-  visit is not reset: after two pushes it receives none until a reporting
-  client opens.
+  count. After two pushes, an account whose client never reports a visit
+  receives none until a reporting client opens or its 90-day activity state
+  expires. A rolling fallback for clients that cannot report activity remains
+  an unresolved rollout decision.
 - At least six hours between any two pushes (`min_interval_secs`). A visit
   does not reset this gap.
 - No push while any of the account's devices is in the foreground. Presence
@@ -23,7 +24,9 @@ mention, new-post, or direct-message push refused by this policy is dropped,
 not queued. Likes and reposts buffer from the first interaction into one
 `activityDigest` push per account, visit, and two-hour bucket; a digest refused
 only by the six-hour gap is requeued for the remaining gap, and one refused for
-any other reason is dropped.
+any other reason is dropped. Counts describe the selected two-hour bucket;
+buckets waiting on cooldown are not merged, and later buckets can be suppressed
+when the allowance is exhausted.
 
 `service.delivery` accepts `quiet_start_hour` (21), `quiet_end_hour` (7),
 `hourly_cap` (5), `daily_cap` (20), `max_event_age_secs` (3600),
@@ -99,7 +102,9 @@ The additional Redis state is:
 - `delivery_generations:{pubkey}`: the visit generation each of those
   identities was reserved under, with the same lifetime.
 - `notification_activity:{pubkey}`: the account's visit `generation`,
-  `absence_used`, and `last_activity_at`. It has no expiry.
+  `absence_used`, and `activity_reported`. Accepted activity renews its 90-day
+  expiry; duplicate or stale reports do not. Accounts without registered devices
+  create no activity, session, or presence state.
 - `notification_active:{pubkey}`: foreground sessions scored by presence
   expiry.
 - `notification_activity_session:{pubkey}:{session}`: the last applied
