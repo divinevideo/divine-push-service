@@ -2011,6 +2011,11 @@ async fn send_notification_trigger_to_user(
         None => create_direct_message_payload(event_id, target_pubkey),
     };
 
+    let delivery_class = if notification_type == NotificationType::DirectMessage {
+        crate::notification_delivery::DeliveryClass::DirectMessage
+    } else {
+        crate::notification_delivery::DeliveryClass::Nonurgent
+    };
     let preflight = async {
         let awake = crate::notification_delivery::social_tokens(
             &state.redis_pool,
@@ -2025,24 +2030,26 @@ async fn send_notification_trigger_to_user(
         if eligible.is_empty() {
             return Ok(Vec::new());
         }
-        if crate::notification_delivery::reserve_budget_for_generation(
+        if crate::notification_delivery::reserve_budget_for_class(
             &state.redis_pool,
             target_pubkey,
             &work_identity,
             &state.settings.service.delivery,
             Some(visit_generation),
+            delivery_class,
         )
         .await?
             != crate::notification_delivery::BudgetDecision::Allowed
         {
             return Ok(Vec::new());
         }
-        if !crate::notification_delivery::validate_reservation(
+        if !crate::notification_delivery::validate_reservation_for_class(
             &state.redis_pool,
             target_pubkey,
             &work_identity,
             &state.settings.service.delivery,
             Some(visit_generation),
+            delivery_class,
         )
         .await?
         {
@@ -3657,6 +3664,227 @@ mod tests {
         redis_store::remove_token(&pool, &recipient, &fcm_token)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_messages_bypass_a_spent_absence_allowance_and_recent_nonurgent_send() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let recipient = Keys::generate().public_key();
+        add_awake_test_token(
+            &pool,
+            &recipient,
+            &format!("synthetic-dm-exempt-{}", recipient.to_hex()),
+        )
+        .await
+        .unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        for (sequence, state) in [
+            (1, crate::activity::ActivityState::Foreground),
+            (2, crate::activity::ActivityState::Background),
+        ] {
+            crate::activity::record_activity(
+                &pool,
+                &recipient,
+                &crate::activity::ActivityUpdate {
+                    session_id,
+                    sequence,
+                    visit: 1,
+                    state,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let generation = crate::activity::current_generation(&pool, &recipient)
+            .await
+            .unwrap();
+        let relaxed = crate::notification_delivery::DeliverySettings {
+            min_interval_secs: 0,
+            ..Default::default()
+        };
+        for identity in ["nonurgent:first", "nonurgent:second"] {
+            assert!(crate::notification_delivery::reserve_budget(
+                &pool, &recipient, identity, &relaxed
+            )
+            .await
+            .unwrap());
+        }
+        let mock = MockFcmSender::new();
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        state.settings.service.delivery = Default::default();
+        for id in [10595, 10596, 10597, 10595] {
+            send_direct_message_notification(
+                &state,
+                test_event_id(id),
+                &recipient,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            mock.get_sent_messages().len(),
+            3,
+            "distinct DMs bypass quota and gap, while a replay stays deduplicated"
+        );
+        let mut conn = pool.get().await.unwrap();
+        let used: u64 = redis::cmd("HGET")
+            .arg(format!("notification_activity:{}", recipient.to_hex()))
+            .arg("absence_used")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(used, 2, "DMs must not spend nonurgent allowance");
+        assert_eq!(
+            crate::activity::current_generation(&pool, &recipient)
+                .await
+                .unwrap(),
+            generation
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_messages_do_not_delay_or_spend_the_next_nonurgent_push() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let recipient = Keys::generate().public_key();
+        add_awake_test_token(
+            &pool,
+            &recipient,
+            &format!("synthetic-dm-gap-{}", recipient.to_hex()),
+        )
+        .await
+        .unwrap();
+        let mock = MockFcmSender::new();
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        state.settings.service.delivery = Default::default();
+        for id in [10598, 10599, 10600] {
+            send_direct_message_notification(
+                &state,
+                test_event_id(id),
+                &recipient,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(mock.get_sent_messages().len(), 3);
+        let generation = crate::activity::current_generation(&pool, &recipient)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::notification_delivery::reserve_budget_for_generation(
+                &pool,
+                &recipient,
+                "social:after-dm",
+                &state.settings.service.delivery,
+                Some(generation)
+            )
+            .await
+            .unwrap(),
+            crate::notification_delivery::BudgetDecision::Allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_messages_still_respect_active_quiet_and_unknown_timezone_devices() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        for reason in ["active", "quiet", "unknown"] {
+            let recipient = Keys::generate().public_key();
+            let token = format!("synthetic-dm-{reason}-{}", recipient.to_hex());
+            let session_id = uuid::Uuid::new_v4();
+            match reason {
+                "unknown" => redis_store::add_or_update_token(&pool, &recipient, &token)
+                    .await
+                    .unwrap(),
+                "quiet" => {
+                    let hour = (chrono::Utc::now().timestamp().rem_euclid(86400) / 3600) as i32;
+                    let offset = ((23 - hour + 12).rem_euclid(24) - 12) * 60;
+                    redis_store::add_or_update_token_with_timezone(
+                        &pool,
+                        &recipient,
+                        &token,
+                        Some(offset),
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => {
+                    add_awake_test_token(&pool, &recipient, &token)
+                        .await
+                        .unwrap();
+                    crate::activity::record_activity(
+                        &pool,
+                        &recipient,
+                        &crate::activity::ActivityUpdate {
+                            session_id,
+                            sequence: 1,
+                            visit: 1,
+                            state: crate::activity::ActivityState::Foreground,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let mock = MockFcmSender::new();
+            let mut state = test_app_state(
+                crate::config::Settings::new().unwrap(),
+                pool.clone(),
+                FcmClient::new_with_impl(Box::new(mock.clone())),
+            );
+            state.settings.service.delivery = Default::default();
+            send_direct_message_notification(
+                &state,
+                test_event_id(10601),
+                &recipient,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                mock.get_sent_messages().is_empty(),
+                "DM must respect {reason}"
+            );
+            if reason == "active" {
+                crate::activity::record_activity(
+                    &pool,
+                    &recipient,
+                    &crate::activity::ActivityUpdate {
+                        session_id,
+                        sequence: 2,
+                        visit: 1,
+                        state: crate::activity::ActivityState::Background,
+                    },
+                )
+                .await
+                .unwrap();
+            } else {
+                add_awake_test_token(&pool, &recipient, &token)
+                    .await
+                    .unwrap();
+            }
+            send_direct_message_notification(
+                &state,
+                test_event_id(10602),
+                &recipient,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                mock.get_sent_messages().len(),
+                1,
+                "eligible DM must resume after {reason}"
+            );
+        }
     }
 
     #[tokio::test]

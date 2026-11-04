@@ -10,6 +10,10 @@ resets the interruption allowance. The six-hour cooldown survives a visit.
 - Allow at most two nonurgent pushes while away. A foreground visit resets this
   allowance and invalidates queued nudges from earlier visits. Heartbeats do not
   reset it. Any active device suppresses nonurgent pushes.
+- Until the first authenticated activity report, retain a rolling two-push
+  allowance per 24 hours for nonurgent notifications. DMs bypass this allowance
+  and the six-hour gap without spending nonurgent quota or advancing its clock;
+  all other delivery gates remain. Policy confirmed by the maintainer on 2026-11-04.
 - Retain delivery identities, provider outcomes, and the minimum six-hour gap
   across visits. Resetting does not grant another send of an old identity.
 - Keep consent, expiry, existing stricter campaign limits, and recipient-local

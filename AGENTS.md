@@ -200,7 +200,8 @@ results influence work.
 - `coalesce:throttle:{owner}` - Per-recipient token bucket shared by immediate like/repost pushes and summary flushes: a summary with an empty bucket defers to the next refill instead of sending
 - `coalesce:emitted:{owner}` - Per-recipient rolling emission window: one member per emitted like/repost notification (trigger event id for an immediate push, group id for a summary), scored by the Redis server time of the send. Reads drop members older than `recipient_daily_window_secs` and `ZCARD` is checked against `recipient_daily_cap` before either path spends, so immediates and summaries share the same 24-hour budget; a summary refused by the cap requeues for the moment the oldest member ages out, and a failure that emitted nothing removes its member again
 - `coalesce:g:activity:{owner}:{generation}:{bucket}` - Account digest group (like/repost counts, bounded hashed action identities, first event, flush lease) used when `coalesce_immediate_limit` is 0
-- `delivery_budget:{pubkey}` / `delivery_generations:{pubkey}` - Reserved push identities for the shared interruption policy, and the visit generation each was reserved under
+- `delivery_budget:{pubkey}` / `delivery_generations:{pubkey}` - Nonurgent reserved identities and visit generations; own the nonurgent cooldown and pre-report rolling allowance
+- `delivery_dm_budget:{pubkey}` / `delivery_dm_generations:{pubkey}` - DM reserved identities and visit generations; shared hourly/daily caps count both reservation sets
 - `notification_activity:{pubkey}` - Visit `generation`, `absence_used` count, and `activity_reported`; expires after 90 days without accepted activity. Delivery reservations do not renew it
 - `notification_visit_sequence` - Persistent counter without account identifiers; allocates generations that remain distinct after per-account activity expires
 - `notification_active:{pubkey}` - Foreground sessions scored by presence expiry
@@ -220,7 +221,7 @@ results influence work.
 | Campaign | n/a | Approved campaign notifications collected from the campaign tool. Not triggered by a Nostr event; off by default. |
 | activityDigest | 7, 16 | One push summarizing buffered likes and reposts across posts (default) |
 
-Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes. Like and Repost are coalesced into account digests by default (see `docs/plans/like-repost-coalescing.md`); Comment, Mention, and NewPost are not, because collapsing them can lose a notification with no durable inbox row. Every push type, direct messages included, shares the visit-based interruption policy in `docs/notification-delivery.md`.
+Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes. Like and Repost are coalesced into account digests by default (see `docs/plans/like-repost-coalescing.md`); Comment, Mention, and NewPost are not, because collapsing them can lose a notification with no durable inbox row. Nonurgent pushes share the visit-based interruption policy in `docs/notification-delivery.md`, with a rolling two-per-day allowance before activity reporting. Direct messages bypass that allowance and the six-hour gap, while retaining shared hourly/daily caps, presence, quiet hours, preferences, and visit fencing.
 
 ## Unblocking Workflow
 

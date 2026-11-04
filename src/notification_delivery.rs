@@ -111,6 +111,32 @@ impl BudgetDecision {
     }
 }
 
+/// Only direct messages bypass the nonurgent allowance and cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryClass {
+    Nonurgent,
+    DirectMessage,
+}
+
+impl DeliveryClass {
+    fn budget_prefixes(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Nonurgent => (
+                "delivery_budget",
+                "delivery_generations",
+                "delivery_dm_budget",
+                "delivery_dm_generations",
+            ),
+            Self::DirectMessage => (
+                "delivery_dm_budget",
+                "delivery_dm_generations",
+                "delivery_budget",
+                "delivery_generations",
+            ),
+        }
+    }
+}
+
 /// Atomically authorize one account interruption. Generation-aware queued work
 /// is fenced by a foreground transition, including a transition after leasing.
 pub async fn reserve_budget_for_generation(
@@ -120,30 +146,62 @@ pub async fn reserve_budget_for_generation(
     settings: &DeliverySettings,
     generation: Option<u64>,
 ) -> Result<BudgetDecision> {
+    reserve_budget_for_class(
+        pool,
+        recipient,
+        identity,
+        settings,
+        generation,
+        DeliveryClass::Nonurgent,
+    )
+    .await
+}
+
+/// Reserve a class-specific identity while sharing hourly/daily bounds. Direct
+/// messages never spend nonurgent allowance or advance its cooldown.
+pub async fn reserve_budget_for_class(
+    pool: &RedisPool,
+    recipient: &PublicKey,
+    identity: &str,
+    settings: &DeliverySettings,
+    generation: Option<u64>,
+    class: DeliveryClass,
+) -> Result<BudgetDecision> {
+    let (budget, generations, other_budget, other_generations) = class.budget_prefixes();
     let mut conn = pool
         .get()
         .await
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
     let decision: (u64, u64) = redis::Script::new(r#"
         local now = tonumber(redis.call('TIME')[1])
-        local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - 86400)
-        for _, id in ipairs(expired) do redis.call('HDEL', KEYS[4], id) end
-        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - 86400)
+        local direct_message = ARGV[8] == '1'
+        for _, pair in ipairs({{KEYS[1], KEYS[4]}, {KEYS[5], KEYS[6]}}) do
+          local expired = redis.call('ZRANGEBYSCORE', pair[1], '-inf', now - 86400)
+          for _, id in ipairs(expired) do redis.call('HDEL', pair[2], id) end
+          redis.call('ZREMRANGEBYSCORE', pair[1], '-inf', now - 86400)
+        end
         redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
         local generation = tonumber(redis.call('HGET', KEYS[2], 'generation') or '0')
         if ARGV[6] ~= '' and tonumber(ARGV[6]) ~= generation then return {2, 0} end
         if redis.call('ZCARD', KEYS[3]) > 0 then return {1, 0} end
-        if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+        local hour_count = redis.call('ZCOUNT', KEYS[1], '(' .. (now - 3600), '+inf')
+          + redis.call('ZCOUNT', KEYS[5], '(' .. (now - 3600), '+inf')
+        local previous_score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+        if previous_score then
           local reserved_generation = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
           if reserved_generation ~= generation then return {2, 0} end
-          -- A retry keeps its original allowance, but cannot jump a newer
-          -- notification. Refresh its attempt time so subsequent sends wait
-          -- a full interval after this provider submission as well.
-          local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
-          for i = 1, #latest, 2 do
-            if latest[i] ~= ARGV[1] then
-              local remaining = tonumber(latest[i + 1]) + tonumber(ARGV[4]) - now
-              if remaining > 0 then return {4, remaining} end
+          -- Reusing a current-hour identity is free. Moving an older one
+          -- into this hour must still fit the shared hourly bound.
+          if tonumber(previous_score) <= now - 3600 and hour_count >= tonumber(ARGV[2]) then return {5, 0} end
+          -- Nonurgent retries cannot jump a newer nonurgent notification.
+          -- Refresh their attempt time so subsequent sends wait a full gap.
+          if not direct_message then
+            local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+            for i = 1, #latest, 2 do
+              if latest[i] ~= ARGV[1] then
+                local remaining = tonumber(latest[i + 1]) + tonumber(ARGV[4]) - now
+                if remaining > 0 then return {4, remaining} end
+              end
             end
           end
           redis.call('ZADD', KEYS[1], now, ARGV[1])
@@ -151,31 +209,39 @@ pub async fn reserve_budget_for_generation(
           redis.call('EXPIRE', KEYS[4], 86400)
           return {0, 0}
         end
-        local used = tonumber(redis.call('HGET', KEYS[2], 'absence_used'))
-        if used == nil then used = redis.call('ZCARD', KEYS[1]) end
-        if used >= tonumber(ARGV[5]) then return {3, 0} end
-        local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
-        if #latest > 0 then
-          local remaining = tonumber(latest[2]) + tonumber(ARGV[4]) - now
-          if remaining > 0 then return {4, remaining} end
+        local reported = redis.call('HEXISTS', KEYS[2], 'activity_reported') == 1
+        local used = redis.call('ZCARD', KEYS[1])
+        if reported then used = tonumber(redis.call('HGET', KEYS[2], 'absence_used') or '0') end
+        if not direct_message then
+          if used >= tonumber(ARGV[5]) then return {3, 0} end
+          local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+          if #latest > 0 then
+            local remaining = tonumber(latest[2]) + tonumber(ARGV[4]) - now
+            if remaining > 0 then return {4, remaining} end
+          end
         end
-        if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return {5, 0} end
-        if redis.call('ZCOUNT', KEYS[1], '(' .. (now - 3600), '+inf') >= tonumber(ARGV[2]) then return {5, 0} end
+        if redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[3]) then return {5, 0} end
+        if hour_count >= tonumber(ARGV[2]) then return {5, 0} end
         redis.call('ZADD', KEYS[1], now, ARGV[1])
         redis.call('EXPIRE', KEYS[1], 86400)
         redis.call('HSET', KEYS[4], ARGV[1], string.format('%.0f', generation))
         redis.call('EXPIRE', KEYS[4], 86400)
-        redis.call('HSET', KEYS[2], 'absence_used', used + 1)
-        redis.call('EXPIRE', KEYS[2], ARGV[7], 'NX')
+        if not direct_message and reported then
+          redis.call('HSET', KEYS[2], 'absence_used', used + 1)
+          redis.call('EXPIRE', KEYS[2], ARGV[7], 'NX')
+        end
         return {0, 0}
-    "#).key(format!("delivery_budget:{}", recipient.to_hex()))
+    "#).key(format!("{budget}:{}", recipient.to_hex()))
         .key(format!("{}{}", crate::activity::STATE_PREFIX, recipient.to_hex()))
         .key(format!("{}{}", crate::activity::ACTIVE_PREFIX, recipient.to_hex()))
-        .key(format!("delivery_generations:{}",recipient.to_hex()))
+        .key(format!("{generations}:{}",recipient.to_hex()))
+        .key(format!("{other_budget}:{}",recipient.to_hex()))
+        .key(format!("{other_generations}:{}",recipient.to_hex()))
         .arg(identity).arg(settings.hourly_cap).arg(settings.daily_cap)
         .arg(settings.min_interval_secs).arg(settings.absence_cap)
         .arg(generation.map(|generation|generation.to_string()).unwrap_or_default())
         .arg(crate::activity::STATE_TTL_SECS)
+        .arg(u8::from(class == DeliveryClass::DirectMessage))
         .invoke_async(&mut *conn).await.map_err(ServiceError::Redis)?;
     let decision = match decision {
         (0, _) => BudgetDecision::Allowed,
@@ -200,6 +266,28 @@ pub async fn validate_reservation(
     settings: &DeliverySettings,
     generation: Option<u64>,
 ) -> Result<bool> {
+    validate_reservation_for_class(
+        pool,
+        recipient,
+        identity,
+        settings,
+        generation,
+        DeliveryClass::Nonurgent,
+    )
+    .await
+}
+
+/// Recheck presence and visit fencing for either class. Only nonurgent work
+/// rechecks and refreshes the shared nonurgent cooldown.
+pub async fn validate_reservation_for_class(
+    pool: &RedisPool,
+    recipient: &PublicKey,
+    identity: &str,
+    settings: &DeliverySettings,
+    generation: Option<u64>,
+    class: DeliveryClass,
+) -> Result<bool> {
+    let (budget, generations, other_budget, _) = class.budget_prefixes();
     let mut conn = pool
         .get()
         .await
@@ -213,12 +301,19 @@ pub async fn validate_reservation(
         if ARGV[2] ~= '' and tonumber(ARGV[2]) ~= generation then return 0 end
         local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
         if not score or tonumber(score) <= now - 86400 then return 0 end
+        if tonumber(score) <= now - 3600 then
+          local hour_count = redis.call('ZCOUNT', KEYS[1], '(' .. (now - 3600), '+inf')
+            + redis.call('ZCOUNT', KEYS[5], '(' .. (now - 3600), '+inf')
+          if hour_count >= tonumber(ARGV[5]) then return 0 end
+        end
         local reserved_generation = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
         if generation ~= reserved_generation then return 0 end
-        local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
-        for i = 1, #latest, 2 do
-          if latest[i] ~= ARGV[1] and tonumber(latest[i + 1]) + tonumber(ARGV[3]) > now then
-            return 0
+        if ARGV[4] ~= '1' then
+          local latest = redis.call('ZREVRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+          for i = 1, #latest, 2 do
+            if latest[i] ~= ARGV[1] and tonumber(latest[i + 1]) + tonumber(ARGV[3]) > now then
+              return 0
+            end
           end
         end
         redis.call('ZADD', KEYS[1], now, ARGV[1])
@@ -227,7 +322,7 @@ pub async fn validate_reservation(
         return 1
     "#,
     )
-    .key(format!("delivery_budget:{}", recipient.to_hex()))
+    .key(format!("{budget}:{}", recipient.to_hex()))
     .key(format!(
         "{}{}",
         crate::activity::STATE_PREFIX,
@@ -238,7 +333,8 @@ pub async fn validate_reservation(
         crate::activity::ACTIVE_PREFIX,
         recipient.to_hex()
     ))
-    .key(format!("delivery_generations:{}", recipient.to_hex()))
+    .key(format!("{generations}:{}", recipient.to_hex()))
+    .key(format!("{other_budget}:{}", recipient.to_hex()))
     .arg(identity)
     .arg(
         generation
@@ -246,6 +342,8 @@ pub async fn validate_reservation(
             .unwrap_or_default(),
     )
     .arg(settings.min_interval_secs)
+    .arg(u8::from(class == DeliveryClass::DirectMessage))
+    .arg(settings.hourly_cap)
     .invoke_async(&mut *conn)
     .await
     .map_err(ServiceError::Redis)

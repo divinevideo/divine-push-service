@@ -854,3 +854,392 @@ async fn expired_session_slots_are_reclaimed_atomically_under_concurrent_admissi
         .unwrap();
     assert_eq!(count, activity::MAX_SESSIONS_PER_ACCOUNT);
 }
+
+#[tokio::test]
+async fn nonreporting_accounts_use_a_sliding_daily_allowance() {
+    let (pool, owner) = setup().await;
+    let settings = DeliverySettings {
+        min_interval_secs: 0,
+        ..Default::default()
+    };
+    let generation = activity::generation_for_work(&pool, &owner, "legacy", 86400)
+        .await
+        .unwrap();
+    assert_ne!(generation, 0, "work epochs do not imply activity reporting");
+    assert_eq!(
+        spend(&pool, &owner, "first", generation, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        spend(&pool, &owner, "second", generation, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        spend(&pool, &owner, "third", generation, &settings).await,
+        BudgetDecision::AllowanceExhausted
+    );
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_budget:{}", owner.to_hex()))
+        .arg(now.0 - 86401)
+        .arg("first")
+        .arg(now.0 - 21601)
+        .arg("second")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(&pool, &owner, "third", generation, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        spend(&pool, &owner, "fourth", generation, &settings).await,
+        BudgetDecision::AllowanceExhausted
+    );
+}
+
+#[tokio::test]
+async fn nonreporting_accounts_ignore_a_preexisting_sticky_absence_counter() {
+    let (pool, owner) = setup().await;
+    let mut conn = pool.get().await.unwrap();
+    redis::cmd("HSET")
+        .arg(format!("notification_activity:{}", owner.to_hex()))
+        .arg("absence_used")
+        .arg(2)
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(
+            &pool,
+            &owner,
+            "legacy-upgrade",
+            0,
+            &DeliverySettings::default()
+        )
+        .await,
+        BudgetDecision::Allowed
+    );
+}
+
+#[tokio::test]
+async fn reporting_accounts_keep_the_absence_allowance_after_the_rolling_day() {
+    let (pool, owner) = setup().await;
+    let session = Uuid::new_v4();
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    let generation = activity::current_generation(&pool, &owner).await.unwrap();
+    let settings = DeliverySettings {
+        min_interval_secs: 0,
+        ..Default::default()
+    };
+    for id in ["first", "second"] {
+        assert_eq!(
+            spend(&pool, &owner, id, generation, &settings).await,
+            BudgetDecision::Allowed
+        );
+    }
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_budget:{}", owner.to_hex()))
+        .arg(now.0 - 86401)
+        .arg("first")
+        .arg(now.0 - 86401)
+        .arg("second")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(&pool, &owner, "third", generation, &settings).await,
+        BudgetDecision::AllowanceExhausted
+    );
+}
+
+#[tokio::test]
+async fn direct_message_reservations_keep_presence_and_visit_fences() {
+    use divine_push_service::notification_delivery::{
+        reserve_budget_for_class, validate_reservation_for_class, DeliveryClass,
+    };
+    let (pool, owner) = setup().await;
+    let session = Uuid::new_v4();
+    let settings = DeliverySettings::default();
+    update(&pool, &owner, session, 1, 1, ActivityState::Foreground).await;
+    let generation = activity::current_generation(&pool, &owner).await.unwrap();
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm",
+            &settings,
+            Some(generation),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Active
+    );
+    update(&pool, &owner, session, 2, 1, ActivityState::Background).await;
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm",
+            &settings,
+            Some(generation),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Allowed
+    );
+    assert!(validate_reservation_for_class(
+        &pool,
+        &owner,
+        "dm",
+        &settings,
+        Some(generation),
+        DeliveryClass::DirectMessage
+    )
+    .await
+    .unwrap());
+    update(&pool, &owner, session, 3, 2, ActivityState::Foreground).await;
+    update(&pool, &owner, session, 4, 2, ActivityState::Background).await;
+    assert!(!validate_reservation_for_class(
+        &pool,
+        &owner,
+        "dm",
+        &settings,
+        Some(generation),
+        DeliveryClass::DirectMessage
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm",
+            &settings,
+            Some(generation),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::StaleVisit
+    );
+}
+
+#[tokio::test]
+async fn direct_messages_share_hourly_and_daily_bounds_with_nonurgent_pushes() {
+    use divine_push_service::notification_delivery::{reserve_budget_for_class, DeliveryClass};
+    let (pool, owner) = setup().await;
+    let settings = DeliverySettings {
+        hourly_cap: 2,
+        daily_cap: 3,
+        ..Default::default()
+    };
+    assert_eq!(
+        spend(&pool, &owner, "social", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm:first",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm:second",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Capped
+    );
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    for (key, id) in [
+        ("delivery_budget", "social"),
+        ("delivery_dm_budget", "dm:first"),
+    ] {
+        redis::cmd("ZADD")
+            .arg(format!("{key}:{}", owner.to_hex()))
+            .arg(now.0 - 3601)
+            .arg(id)
+            .query_async::<()>(&mut *conn)
+            .await
+            .unwrap();
+    }
+    drop(conn);
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm:second",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "dm:third",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Capped
+    );
+}
+
+async fn dm_retry_outside_a_full_shared_hour() -> (RedisPool, PublicKey, DeliverySettings) {
+    use divine_push_service::notification_delivery::{reserve_budget_for_class, DeliveryClass};
+    let (pool, owner) = setup().await;
+    let settings = DeliverySettings::default();
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "old-dm",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Allowed
+    );
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_dm_budget:{}", owner.to_hex()))
+        .arg(now.0 - 3601)
+        .arg("old-dm")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        spend(&pool, &owner, "current-social", 0, &settings).await,
+        BudgetDecision::Allowed
+    );
+    for i in 0..4 {
+        assert_eq!(
+            reserve_budget_for_class(
+                &pool,
+                &owner,
+                &format!("current-dm:{i}"),
+                &settings,
+                Some(0),
+                DeliveryClass::DirectMessage
+            )
+            .await
+            .unwrap(),
+            BudgetDecision::Allowed
+        );
+    }
+    (pool, owner, settings)
+}
+
+async fn free_one_dm_hour_slot(pool: &RedisPool, owner: &PublicKey) {
+    let mut conn = pool.get().await.unwrap();
+    let now: (u64, u64) = redis::cmd("TIME").query_async(&mut *conn).await.unwrap();
+    redis::cmd("ZADD")
+        .arg(format!("delivery_dm_budget:{}", owner.to_hex()))
+        .arg(now.0 - 3601)
+        .arg("current-dm:0")
+        .query_async::<()>(&mut *conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dm_reservation_retry_cannot_reenter_a_full_hour() {
+    use divine_push_service::notification_delivery::{reserve_budget_for_class, DeliveryClass};
+    let (pool, owner, settings) = dm_retry_outside_a_full_shared_hour().await;
+    assert_eq!(
+        reserve_budget_for_class(
+            &pool,
+            &owner,
+            "old-dm",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap(),
+        BudgetDecision::Capped
+    );
+    free_one_dm_hour_slot(&pool, &owner).await;
+    for _ in 0..2 {
+        assert_eq!(
+            reserve_budget_for_class(
+                &pool,
+                &owner,
+                "old-dm",
+                &settings,
+                Some(0),
+                DeliveryClass::DirectMessage
+            )
+            .await
+            .unwrap(),
+            BudgetDecision::Allowed,
+            "a retry already inside the full hour consumes no new slot"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dm_provider_preflight_cannot_reenter_a_full_hour() {
+    use divine_push_service::notification_delivery::{
+        validate_reservation_for_class, DeliveryClass,
+    };
+    let (pool, owner, settings) = dm_retry_outside_a_full_shared_hour().await;
+    assert!(!validate_reservation_for_class(
+        &pool,
+        &owner,
+        "old-dm",
+        &settings,
+        Some(0),
+        DeliveryClass::DirectMessage
+    )
+    .await
+    .unwrap());
+    free_one_dm_hour_slot(&pool, &owner).await;
+    for _ in 0..2 {
+        assert!(validate_reservation_for_class(
+            &pool,
+            &owner,
+            "old-dm",
+            &settings,
+            Some(0),
+            DeliveryClass::DirectMessage
+        )
+        .await
+        .unwrap());
+    }
+}
