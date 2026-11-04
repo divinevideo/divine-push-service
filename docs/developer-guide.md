@@ -132,6 +132,10 @@ When the triggering event is not addressable and carries no addressable referenc
 
 ### Internal direct-message hook
 
+DM pushes bypass the nonurgent two-push allowance and six-hour gap. They retain
+preferences, presence, timezone/quiet-hour checks, replay deduplication and visit
+fencing, and share the five-per-hour/twenty-per-day guardrails with other pushes.
+
 Trusted senders request a generic direct-message push with
 `POST /internal/v1/direct-message` and the bearer token configured through
 `NOSTR_PUSH__SERVER__INTERNAL_API_TOKEN`. The endpoint is unavailable when the

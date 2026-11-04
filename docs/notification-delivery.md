@@ -1,21 +1,25 @@
 # Notification delivery policy
 
-Social pushes (direct messages included), like/repost digests, and campaigns
-share one per-account interruption policy, reserved atomically in Redis across
-replicas and device tokens:
+Nonurgent social pushes, like/repost digests, and campaigns share one
+per-account interruption policy, reserved atomically in Redis across replicas
+and device tokens:
 
-- At most two pushes between visits (`absence_cap`). An authenticated
-  foreground visit, reported through `POST /internal/v1/activity`, resets the
-  count. After two pushes, an account whose client never reports a visit
-  receives none until a reporting client opens or its 90-day activity state
-  expires. A rolling fallback for clients that cannot report activity remains
-  an unresolved rollout decision.
-- At least six hours between any two pushes (`min_interval_secs`). A visit
+- At most two nonurgent pushes between visits (`absence_cap`) after an account
+  reports authenticated activity through `POST /internal/v1/activity`. A visit
+  resets that count. Until the first activity report, use a rolling allowance
+  of two nonurgent pushes per 24 hours, so older and external-signer clients keep
+  receiving pushes. The fallback also resumes if the 90-day activity state
+  expires; a retained work generation alone does not indicate a visit report.
+- At least six hours between nonurgent pushes (`min_interval_secs`). A visit
   does not reset this gap.
+- Direct messages bypass both the absence/rolling two-push allowance and the
+  six-hour gap. They neither spend nonurgent allowance nor advance its cooldown.
 - No push while any of the account's devices is in the foreground. Presence
   lapses 180 seconds after a session's last foreground report, so a crashed
   app cannot suppress pushes indefinitely.
-- The older rolling bounds of five per hour and twenty per day still apply.
+- All categories, including DMs, share the older rolling bounds of five per hour
+  and twenty per day. DM preferences, timezone/quiet-hour checks, replay
+  deduplication, visit fencing, and final provider preflight still apply.
 
 Retries reuse their identity and keep their allowance and visit generation;
 failed or ambiguous provider attempts conservatively keep their slot. Work
@@ -97,11 +101,15 @@ of a requeued digest, rather than distinct notifications.
 
 The additional Redis state is:
 
-- `delivery_budget:{pubkey}`: a rolling set of reserved notification
-  identities, scored by their latest attempt and expiring after a day without
-  a reservation.
+- `delivery_budget:{pubkey}`: nonurgent reserved identities, scored by their
+  latest attempt and expiring after a day without a reservation. This set owns
+  the nonurgent cooldown and the rolling allowance for non-reporting accounts.
 - `delivery_generations:{pubkey}`: the visit generation each of those
   identities was reserved under, with the same lifetime.
+- `delivery_dm_budget:{pubkey}` / `delivery_dm_generations:{pubkey}`: DM
+  reservations and their visit generations, with the same day-long lifetime.
+  Their counts are combined atomically with nonurgent reservations for hourly
+  and daily caps, while their timestamps do not affect nonurgent cooldown.
 - `notification_activity:{pubkey}`: the account's visit `generation`,
   `absence_used`, and `activity_reported`. Accepted activity renews its 90-day
   expiry; duplicate or stale reports do not. Accounts without registered devices

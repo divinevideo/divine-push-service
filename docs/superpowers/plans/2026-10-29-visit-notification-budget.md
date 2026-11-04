@@ -145,7 +145,22 @@ Redis-backed `cargo test --all-targets` passed 366 tests with none failed or
 ignored. Strict all-target/all-feature Clippy, `cargo build`, formatting, diff
 checks, and all five deploy-payload contract cases passed locally.
 
-The older-client rolling fallback and direct-message exemptions still need the
-maintainer's policy decision. The existing limits remain in effect pending that
-decision. No merge, deployment, live FCM test, or device verification is claimed
+At that checkpoint the older-client fallback and DM exemption awaited a
+maintainer decision. On 2026-11-04 the maintainer selected rolling limits until
+activity reporting and a DM exemption from allowance and cooldown. No merge, deployment, live FCM test, or device verification is claimed
 by this follow-up.
+
+
+## Delivery policy follow-up (2026-11-04)
+
+The selected rolling fallback and DM exemption are implemented in a follow-up
+because PR #88 had already merged. DM reservations have separate clocks while
+sharing hourly/daily bounds with nonurgent reservations. Both retry admission and
+final provider preflight refuse an older reservation that would overfill the
+current hour; reusing an identity already in that hour remains free.
+
+Final Redis-backed validation passed 382 all-target tests plus one doctest, with
+zero failed or ignored. Strict all-target/all-feature Clippy, build, formatting,
+diff checks, and all five deploy-payload contract cases passed. New policy and
+hourly retry regressions failed for the expected behavior before repair.
+Physical-device/FCM and live companion integration were not exercised.
