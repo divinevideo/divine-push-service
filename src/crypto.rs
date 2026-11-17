@@ -49,7 +49,7 @@ fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(value
         .as_array()
-        .filter(|values| values.len() <= 16)
+        .filter(|values| values.len() <= 16 && values.iter().all(serde_json::Value::is_string))
         .map(|values| {
             ["app_route", "video_address", "creator_profile"]
                 .into_iter()
@@ -57,6 +57,27 @@ fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
                 .map(str::to_string)
                 .collect()
         }))
+}
+
+#[cfg(test)]
+mod campaign_capability_tests {
+    use super::TokenPayload;
+
+    #[test]
+    fn malformed_campaign_capabilities_cannot_grant_advanced_delivery() {
+        for value in [
+            serde_json::json!(["video_address", 42]),
+            serde_json::json!(["creator_profile", null]),
+            serde_json::json!({"video_address": true}),
+            serde_json::json!(vec!["app_route"; 17]),
+        ] {
+            let payload: TokenPayload = serde_json::from_value(serde_json::json!({
+                "token": "synthetic-device", "campaignTargetTypes": value,
+            }))
+            .unwrap();
+            assert_eq!(payload.campaign_target_types, None);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

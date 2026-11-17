@@ -31,15 +31,20 @@ struct TapTarget {
 
 impl TapTarget {
     fn is_supported(&self) -> bool {
+        let full_pubkey = |key: &str| {
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && PublicKey::from_hex(key).is_ok()
+        };
         match self.target_type.as_str() {
             "app_route" => self.value == "/following/new",
-            "creator_profile" => self.value.len() == 64 && PublicKey::from_hex(&self.value).is_ok(),
+            "creator_profile" => full_pubkey(&self.value),
             "video_address" => {
                 let mut parts = self.value.splitn(3, ':');
                 parts.next() == Some("34236")
-                    && parts
-                        .next()
-                        .is_some_and(|key| key.len() == 64 && PublicKey::from_hex(key).is_ok())
+                    && parts.next().is_some_and(full_pubkey)
                     && parts.next().is_some_and(|d_tag| !d_tag.is_empty())
             }
             _ => false,
@@ -1176,6 +1181,23 @@ mod tests {
             claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
             -2
         );
+        pending.idempotency_key.push_str("-following");
+        pending.tap_target = TapTarget {
+            target_type: "app_route".into(),
+            value: "/following/new".into(),
+        };
+        assert_eq!(
+            deliver(
+                &state,
+                &pending,
+                Timestamp::now().as_secs() as i64,
+                TEST_LEASE_SECS
+            )
+            .await
+            .status,
+            DeliveryStatus::Delivered,
+            "unsupported destinations must not spend the interruption allowance"
+        );
     }
 
     #[tokio::test]
@@ -1220,6 +1242,22 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, capable_token);
         assert_ne!(sent[0].0, legacy_token);
+    }
+
+    #[test]
+    fn campaign_targets_require_lowercase_full_pubkeys() {
+        for target in [
+            TapTarget {
+                target_type: "creator_profile".into(),
+                value: "AB".repeat(32),
+            },
+            TapTarget {
+                target_type: "video_address".into(),
+                value: format!("34236:{}:clip", "AB".repeat(32)),
+            },
+        ] {
+            assert!(!target.is_supported());
+        }
     }
 
     #[test]
