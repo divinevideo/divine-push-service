@@ -18,6 +18,7 @@ pub mod notification_delivery;
 pub mod preferences;
 pub mod redis_connection;
 pub mod redis_store;
+pub mod release_eligibility;
 pub mod roster_publisher;
 pub mod server;
 pub mod services;

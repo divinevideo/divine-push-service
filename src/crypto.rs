@@ -41,6 +41,31 @@ pub struct TokenPayload {
         deserialize_with = "campaign_target_types"
     )]
     pub campaign_target_types: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "optional_device_string")]
+    pub platform: Option<String>,
+    #[serde(
+        rename = "installChannel",
+        default,
+        deserialize_with = "optional_device_string"
+    )]
+    pub install_channel: Option<String>,
+    #[serde(
+        rename = "appVersion",
+        default,
+        deserialize_with = "optional_device_string"
+    )]
+    pub app_version: Option<String>,
+}
+
+// Invalid optional metadata must clear stale eligibility without dropping the token.
+fn optional_device_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .filter(|value| value.len() <= 20)
+        .map(str::to_string))
 }
 
 fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
@@ -51,7 +76,7 @@ fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
         .as_array()
         .filter(|values| values.len() <= 16 && values.iter().all(serde_json::Value::is_string))
         .map(|values| {
-            ["app_route", "video_address", "creator_profile"]
+            crate::campaign_delivery::CAMPAIGN_TARGET_TYPES
                 .into_iter()
                 .filter(|target| values.iter().any(|value| value.as_str() == Some(target)))
                 .map(str::to_string)
@@ -62,6 +87,17 @@ fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod campaign_capability_tests {
     use super::TokenPayload;
+
+    #[test]
+    fn registration_preserves_announcement_and_featured_feed_capabilities() {
+        let payload: TokenPayload = serde_json::from_value(serde_json::json!({
+            "token": "synthetic-device", "campaignTargetTypes": ["announcement", "featured_feed", "unknown"]
+        })).unwrap();
+        assert_eq!(
+            payload.campaign_target_types.unwrap(),
+            vec!["announcement", "featured_feed"]
+        );
+    }
 
     #[test]
     fn malformed_campaign_capabilities_cannot_grant_advanced_delivery() {

@@ -27,6 +27,7 @@ const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
 const TOKEN_TIMEZONE_NAMES_HASH: &str = "token_timezone_names";
 const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
 const TOKEN_CAMPAIGN_TARGET_TYPES_HASH: &str = "token_campaign_target_types";
+const TOKEN_RELEASE_METADATA_HASH: &str = "token_release_metadata";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 const USER_TOKENS_PREFIX: &str = "user_tokens:";
 
@@ -196,6 +197,40 @@ pub async fn campaign_capable_tokens(
         .collect())
 }
 
+/// Keeps eligible devices and records whether any rejected device lacks usable metadata.
+/// This gate is independent of the internal-test consent bypass.
+pub(crate) async fn release_eligible_tokens(
+    pool: &RedisPool,
+    tokens: Vec<(String, Option<i32>)>,
+    release: &crate::release_eligibility::ReleaseEligibility,
+) -> Result<(Vec<(String, Option<i32>)>, bool)> {
+    if tokens.is_empty() {
+        return Ok((tokens, false));
+    }
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let values: Vec<Option<String>> = redis::cmd("HMGET")
+        .arg(TOKEN_RELEASE_METADATA_HASH)
+        .arg(tokens.iter().map(|(token, _)| token).collect::<Vec<_>>())
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    let mut eligible = Vec::new();
+    let mut unknown = false;
+    for (token, value) in tokens.into_iter().zip(values) {
+        match value.and_then(|raw| {
+            serde_json::from_str::<crate::release_eligibility::DeviceReleaseMetadata>(&raw).ok()
+        }) {
+            Some(metadata) if metadata.is_eligible_for(release) => eligible.push(token),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    Ok((eligible, unknown))
+}
+
 /// Adds or updates a single device token for a pubkey.
 pub async fn add_or_update_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> Result<()> {
     add_or_update_token_with_timezone(pool, pubkey, token, None).await
@@ -212,32 +247,16 @@ pub async fn add_or_update_token_with_timezone(
 }
 
 /// Store device timezone and offset together with the registration.
+///
+/// Clears campaign capabilities and release metadata: only signed kind-3079
+/// registrations carry them, through `apply_device_registration`, which is
+/// also the only writer that honours the device ordering fence.
 pub async fn add_or_update_token_with_timezone_name(
     pool: &RedisPool,
     pubkey: &PublicKey,
     token: &str,
     timezone_offset_minutes: Option<i32>,
     timezone: Option<&str>,
-) -> Result<()> {
-    add_or_update_token_with_campaign_targets(
-        pool,
-        pubkey,
-        token,
-        timezone_offset_minutes,
-        timezone,
-        None,
-    )
-    .await
-}
-
-/// Atomically replaces a device's registration, timezone and campaign capabilities.
-pub async fn add_or_update_token_with_campaign_targets(
-    pool: &RedisPool,
-    pubkey: &PublicKey,
-    token: &str,
-    timezone_offset_minutes: Option<i32>,
-    timezone: Option<&str>,
-    campaign_target_types: Option<&[String]>,
 ) -> Result<()> {
     let now_timestamp = Timestamp::now().as_secs();
     let pubkey_hex = pubkey.to_hex();
@@ -297,23 +316,8 @@ pub async fn add_or_update_token_with_campaign_targets(
         }
     }
 
-    match campaign_target_types {
-        Some(targets) => {
-            let targets: Vec<&str> = ["app_route", "video_address", "creator_profile"]
-                .into_iter()
-                .filter(|target| targets.iter().any(|value| value == target))
-                .collect();
-            pipe.hset(
-                TOKEN_CAMPAIGN_TARGET_TYPES_HASH,
-                token,
-                serde_json::to_string(&targets)
-                    .map_err(|e| ServiceError::Internal(format!("Campaign capabilities: {e}")))?,
-            );
-        }
-        None => {
-            pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
-        }
-    }
+    pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
+        .hdel(TOKEN_RELEASE_METADATA_HASH, token);
 
     let _result = pipe
         .query_async::<Value>(&mut *conn)
@@ -321,6 +325,153 @@ pub async fn add_or_update_token_with_campaign_targets(
         .map_err(ServiceError::Redis)?;
 
     Ok(())
+}
+
+/// Applies signed registration state in event order, atomically across replicas.
+/// Within one author, equal timestamps prefer deregistration, then the lowest
+/// event ID within one operation. Cross-author ties retain registration arrival order.
+/// Ordering tombstones survive removal and cleanup within the replay window; their keys hash the token so
+/// deregistration does not retain the token itself or device metadata.
+pub(crate) async fn apply_device_registration(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    payload: &crate::crypto::TokenPayload,
+    release: Option<&crate::release_eligibility::DeviceReleaseMetadata>,
+) -> Result<DeviceControlOutcome> {
+    let metadata = serde_json::json!({
+        "offset": payload.timezone_offset_minutes.filter(|offset| (-720..=840).contains(offset)),
+        "timezone": payload.timezone.as_deref().filter(|name| name.parse::<chrono_tz::Tz>().is_ok()),
+        "targets": payload.campaign_target_types.as_ref().map(serde_json::to_string).transpose()
+            .map_err(|e| ServiceError::Internal(format!("Campaign capabilities: {e}")))?,
+        "release": release.map(serde_json::to_string).transpose()
+            .map_err(|e| ServiceError::Internal(format!("Device metadata: {e}")))?,
+    });
+    apply_ordered_device_control(pool, event, payload.token.trim(), Some(metadata)).await
+}
+
+/// Removes only the current owner's device, fencing delayed registrations.
+pub(crate) async fn apply_device_deregistration(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    token: &str,
+) -> Result<DeviceControlOutcome> {
+    apply_ordered_device_control(pool, event, token, None).await
+}
+
+/// What a signed device control event did, so callers can log ownership changes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeviceControlOutcome {
+    /// Applied. `previous_owner` held the token beforehand, if anyone did.
+    Applied { previous_owner: Option<String> },
+    /// A newer event, or one that wins a same-second tie, was already applied.
+    Superseded,
+    /// Outside the accepted replay window or more than five minutes ahead.
+    InvalidTimestamp,
+    /// A deregistration from a pubkey that does not own the token. `owner` is the
+    /// current owner, or `None` when there is no device state or fence to remove.
+    NotOwner { owner: Option<String> },
+}
+
+// This deployment uses one Redis instance, as do the notify-list scripts.
+// All ownership, ordering and metadata changes execute in one atomic script.
+static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+        local incoming = cjson.decode(ARGV[1])
+        local token = ARGV[2]
+        local owner = redis.call('HGET', KEYS[2], token)
+        local stored = redis.call('GET', KEYS[1])
+        local operation = incoming.metadata == cjson.null and 'deregister' or 'register'
+        if operation == 'deregister' then
+            if owner and owner ~= incoming.owner then return {2, owner} end
+            if not owner and not stored then return {2, ''} end
+        end
+        if stored then
+            stored = cjson.decode(stored)
+            if incoming.at < stored.at then return {0, ''} end
+            if incoming.at == stored.at and incoming.owner == stored.owner then
+                -- Legacy fences predate operation storage: absent active state
+                -- conservatively represents a sign-out, preserving its privacy fence.
+                local previous_operation = stored.operation or (owner and 'register' or 'deregister')
+                if operation ~= previous_operation then
+                    if operation == 'register' then return {0, ''} end
+                elseif incoming.id >= stored.id then
+                    return {0, ''}
+                end
+            end
+        end
+        if owner then
+            redis.call('SREM', ARGV[3] .. owner, token)
+        end
+        redis.call('HDEL', KEYS[2], token)
+        redis.call('ZREM', KEYS[3], token)
+        for i = 4, 7 do redis.call('HDEL', KEYS[i], token) end
+        if incoming.metadata ~= cjson.null then
+            local metadata = incoming.metadata
+            redis.call('SADD', ARGV[3] .. incoming.owner, token)
+            redis.call('HSET', KEYS[2], token, incoming.owner)
+            redis.call('ZADD', KEYS[3], incoming.now, token)
+            local fields = {'offset', 'timezone', 'targets', 'release'}
+            for i, field in ipairs(fields) do
+                if metadata[field] ~= cjson.null then
+                    redis.call('HSET', KEYS[i + 3], token, metadata[field])
+                end
+            end
+        end
+        redis.call('SET', KEYS[1], cjson.encode({at=incoming.at, id=incoming.id, owner=incoming.owner, operation=operation}), 'EXAT', incoming.expires_at)
+        return {1, owner or ''}
+    "#,
+    )
+});
+
+async fn apply_ordered_device_control(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    token: &str,
+    metadata: Option<serde_json::Value>,
+) -> Result<DeviceControlOutcome> {
+    let now = Timestamp::now().as_secs();
+    let at = event.created_at.as_secs();
+    let horizon = crate::event_handler::REPLAY_HORIZON_SECS;
+    let skew = crate::event_handler::CONTROL_EVENT_FUTURE_SKEW_SECS;
+    if at > now.saturating_add(skew) || at < now.saturating_sub(horizon) {
+        return Ok(DeviceControlOutcome::InvalidTimestamp);
+    }
+    let incoming = serde_json::json!({
+        // Fixed-width decimal preserves the full u64 order in Lua without f64 rounding.
+        "at": format!("{:020}", event.created_at.as_secs()),
+        "id": event.id.to_hex(), "owner": event.pubkey.to_hex(),
+        "now": now, "metadata": metadata, "expires_at": at + horizon + skew,
+    });
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let (code, other_owner): (i64, String) = DEVICE_CONTROL
+        .key(format!(
+            "device_registration_order:{}",
+            blake3::hash(token.as_bytes()).to_hex()
+        ))
+        .key(TOKEN_TO_PUBKEY_HASH)
+        .key(STALE_TOKENS_ZSET)
+        .key(TOKEN_TIMEZONE_OFFSETS_HASH)
+        .key(TOKEN_TIMEZONE_NAMES_HASH)
+        .key(TOKEN_CAMPAIGN_TARGET_TYPES_HASH)
+        .key(TOKEN_RELEASE_METADATA_HASH)
+        .arg(incoming.to_string())
+        .arg(token)
+        .arg(USER_TOKENS_PREFIX)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    let other_owner = (!other_owner.is_empty()).then_some(other_owner);
+    Ok(match code {
+        1 => DeviceControlOutcome::Applied {
+            previous_owner: other_owner,
+        },
+        2 => DeviceControlOutcome::NotOwner { owner: other_owner },
+        _ => DeviceControlOutcome::Superseded,
+    })
 }
 
 /// Removes a single device token for a pubkey.
@@ -354,7 +505,8 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
                 .hdel(TOKEN_TO_PUBKEY_HASH, token) // Remove from token->pubkey map
                 .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token)
                 .hdel(TOKEN_TIMEZONE_NAMES_HASH, token)
-                .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
+                .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
+                .hdel(TOKEN_RELEASE_METADATA_HASH, token);
 
             let _result: RedisResult<Value> = pipe.query_async(&mut *conn).await;
             _result.map(|_| ()).map_err(ServiceError::Redis)?;
@@ -604,6 +756,7 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
     pipe.hdel(TOKEN_TIMEZONE_OFFSETS_HASH, &stale_tokens);
     pipe.hdel(TOKEN_TIMEZONE_NAMES_HASH, &stale_tokens);
     pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, &stale_tokens);
+    pipe.hdel(TOKEN_RELEASE_METADATA_HASH, &stale_tokens);
 
     // 3c. Remove tokens from individual user sets
     let mut actual_removed_count = 0;
