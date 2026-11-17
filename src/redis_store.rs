@@ -363,7 +363,7 @@ pub(crate) async fn apply_device_deregistration(
 pub(crate) enum DeviceControlOutcome {
     /// Applied. `previous_owner` held the token beforehand, if anyone did.
     Applied { previous_owner: Option<String> },
-    /// An event at or after this one, by `created_at` then event ID, already applied.
+    /// A newer event, or one that wins a same-second tie, was already applied.
     Superseded,
     /// Outside the accepted replay window or more than five minutes ahead.
     InvalidTimestamp,
