@@ -336,10 +336,22 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
     )
     .await
     {
-        Ok(true) => {
+        Ok(redis_store::DeviceControlOutcome::Applied { previous_owner }) => {
+            if let Some(previous_owner) =
+                previous_owner.filter(|owner| *owner != event.pubkey.to_hex())
+            {
+                warn!(
+                    event_id = %event.id, pubkey = %event.pubkey, %previous_owner,
+                    "Token re-registration: token moved from a different pubkey"
+                );
+            }
             info!(event_id = %event.id, pubkey = %event.pubkey, "Registered/Updated encrypted token");
         }
-        Ok(false) => {
+        // Registrations are never ownership-checked, so only superseded ones land here.
+        Ok(
+            redis_store::DeviceControlOutcome::Superseded
+            | redis_store::DeviceControlOutcome::NotOwner { .. },
+        ) => {
             debug!(event_id = %event.id, "Ignored superseded device registration");
         }
         Err(e) => {
@@ -392,15 +404,30 @@ async fn handle_deregistration(state: &AppState, event: &Event) -> Result<()> {
         return Ok(());
     }
 
-    let removed =
-        redis_store::apply_device_deregistration(&state.redis_pool, event, fcm_token).await?;
-    if removed {
-        info!(event_id = %event.id, pubkey = %event.pubkey, "Deregistered encrypted token");
-    } else {
-        debug!(
-            event_id = %event.id, pubkey = %event.pubkey,
-            "Token not found for deregistration"
-        );
+    match redis_store::apply_device_deregistration(&state.redis_pool, event, fcm_token).await? {
+        redis_store::DeviceControlOutcome::Applied {
+            previous_owner: Some(_),
+        } => {
+            info!(event_id = %event.id, pubkey = %event.pubkey, "Deregistered encrypted token");
+        }
+        redis_store::DeviceControlOutcome::Applied {
+            previous_owner: None,
+        }
+        | redis_store::DeviceControlOutcome::NotOwner { owner: None } => {
+            debug!(
+                event_id = %event.id, pubkey = %event.pubkey,
+                "Token not found for deregistration"
+            );
+        }
+        redis_store::DeviceControlOutcome::NotOwner { owner: Some(owner) } => {
+            warn!(
+                event_id = %event.id, pubkey = %event.pubkey, %owner,
+                "Deregistration rejected: token belongs to a different pubkey"
+            );
+        }
+        redis_store::DeviceControlOutcome::Superseded => {
+            debug!(event_id = %event.id, "Ignored superseded device deregistration");
+        }
     }
 
     // Preferences are identity-scoped, while deregistration removes one device token.
@@ -2709,6 +2736,81 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1_800_000_000);
         Timestamp::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn device_control_reports_ownership_moves_and_foreign_deregistrations() {
+        use redis_store::DeviceControlOutcome::{Applied, NotOwner, Superseded};
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (a, b) = (Keys::generate(), Keys::generate());
+        let token = format!("synthetic-owner-outcome-{}", a.public_key().to_hex());
+        let payload: crate::crypto::TokenPayload =
+            serde_json::from_value(serde_json::json!({ "token": token })).unwrap();
+        let signed = |kind: u16, user: &Keys| {
+            EventBuilder::new(Kind::from(kind), "")
+                .custom_created_at(next_device_control_timestamp())
+                .sign_with_keys(user)
+                .unwrap()
+        };
+        let register = |user: &Keys| {
+            let event = signed(KIND_REGISTRATION, user);
+            let (pool, payload) = (pool.clone(), &payload);
+            async move {
+                redis_store::apply_device_registration(&pool, &event, payload, None)
+                    .await
+                    .unwrap()
+            }
+        };
+        let deregister = |event: Event| {
+            let (pool, token) = (pool.clone(), token.clone());
+            async move {
+                redis_store::apply_device_deregistration(&pool, &event, &token)
+                    .await
+                    .unwrap()
+            }
+        };
+        let (a_hex, b_hex) = (a.public_key().to_hex(), b.public_key().to_hex());
+
+        assert_eq!(
+            register(&a).await,
+            Applied {
+                previous_owner: None
+            }
+        );
+        assert_eq!(
+            register(&b).await,
+            Applied {
+                previous_owner: Some(a_hex)
+            }
+        );
+        assert_eq!(
+            deregister(signed(KIND_DEREGISTRATION, &a)).await,
+            NotOwner {
+                owner: Some(b_hex.clone())
+            }
+        );
+        let removal = signed(KIND_DEREGISTRATION, &b);
+        assert_eq!(
+            deregister(removal.clone()).await,
+            Applied {
+                previous_owner: Some(b_hex)
+            }
+        );
+        assert_eq!(deregister(removal).await, Superseded);
+        assert_eq!(
+            deregister(signed(KIND_DEREGISTRATION, &b)).await,
+            Applied {
+                previous_owner: None
+            },
+            "a newer deregistration with nothing left to remove"
+        );
+        assert_eq!(
+            deregister(signed(KIND_DEREGISTRATION, &a)).await,
+            NotOwner { owner: None },
+            "an unregistered token last controlled by another pubkey is not a live ownership clash"
+        );
     }
 
     fn encrypted_deregistration_event(user_keys: &Keys, service_keys: &Keys, token: &str) -> Event {

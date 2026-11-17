@@ -336,7 +336,7 @@ pub(crate) async fn apply_device_registration(
     event: &nostr_sdk::Event,
     payload: &crate::crypto::TokenPayload,
     release: Option<&crate::release_eligibility::DeviceReleaseMetadata>,
-) -> Result<bool> {
+) -> Result<DeviceControlOutcome> {
     let metadata = serde_json::json!({
         "offset": payload.timezone_offset_minutes.filter(|offset| (-720..=840).contains(offset)),
         "timezone": payload.timezone.as_deref().filter(|name| name.parse::<chrono_tz::Tz>().is_ok()),
@@ -353,8 +353,21 @@ pub(crate) async fn apply_device_deregistration(
     pool: &RedisPool,
     event: &nostr_sdk::Event,
     token: &str,
-) -> Result<bool> {
+) -> Result<DeviceControlOutcome> {
     apply_ordered_device_control(pool, event, token, None).await
+}
+
+/// What a signed device control event did, so callers can log ownership changes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeviceControlOutcome {
+    /// Applied. `previous_owner` held the token beforehand, if anyone did.
+    Applied { previous_owner: Option<String> },
+    /// An event at or after this one, by `created_at` then event ID, already applied.
+    Superseded,
+    /// A deregistration from a pubkey that does not own the token. `owner` is the
+    /// current owner, or `None` when the token is unregistered and another
+    /// pubkey applied its last control event.
+    NotOwner { owner: Option<String> },
 }
 
 // This deployment uses one Redis instance, as do the notify-list scripts.
@@ -370,13 +383,13 @@ static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
             stored = cjson.decode(stored)
             if incoming.at < stored.at or
                 (incoming.at == stored.at and incoming.id >= stored.id) then
-                return 0
+                return {0, ''}
             end
         end
         if incoming.metadata == cjson.null then
             if (owner and owner ~= incoming.owner) or
                 (not owner and stored and stored.owner ~= incoming.owner) then
-                return 0
+                return {2, owner or ''}
             end
         end
         if owner then
@@ -398,7 +411,7 @@ static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
             end
         end
         redis.call('SET', KEYS[1], cjson.encode({at=incoming.at, id=incoming.id, owner=incoming.owner}))
-        return 1
+        return {1, owner or ''}
     "#,
     )
 });
@@ -408,7 +421,7 @@ async fn apply_ordered_device_control(
     event: &nostr_sdk::Event,
     token: &str,
     metadata: Option<serde_json::Value>,
-) -> Result<bool> {
+) -> Result<DeviceControlOutcome> {
     let incoming = serde_json::json!({
         // Fixed-width decimal preserves the full u64 order in Lua without f64 rounding.
         "at": format!("{:020}", event.created_at.as_secs()),
@@ -419,7 +432,7 @@ async fn apply_ordered_device_control(
         .get()
         .await
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
-    let applied: i64 = DEVICE_CONTROL
+    let (code, other_owner): (i64, String) = DEVICE_CONTROL
         .key(format!(
             "device_registration_order:{}",
             blake3::hash(token.as_bytes()).to_hex()
@@ -436,7 +449,14 @@ async fn apply_ordered_device_control(
         .invoke_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
-    Ok(applied == 1)
+    let other_owner = (!other_owner.is_empty()).then_some(other_owner);
+    Ok(match code {
+        1 => DeviceControlOutcome::Applied {
+            previous_owner: other_owner,
+        },
+        2 => DeviceControlOutcome::NotOwner { owner: other_owner },
+        _ => DeviceControlOutcome::Superseded,
+    })
 }
 
 /// Removes a single device token for a pubkey.
