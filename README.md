@@ -136,17 +136,44 @@ Optional. When enabled, the service polls the campaign tool's internal delivery 
 It is off by default, and even when enabled it does not poll unless a safe HTTPS `api_base_url` and both Access credentials are set. Normal delivery requires an explicit `campaignsEnabled` kind-3083 preference and a valid device UTC offset from kind 3079, and enforces 21:00–06:59 recipient-local quiet hours. `allow_unverified_consent` is retained only as an explicit staff/internal-test bridge.
 
 Encrypted kind-3079 registration may include `campaignTargetTypes`, an array of
-`app_route`, `video_address`, and `creator_profile`. This describes device support,
+`app_route`, `video_address`, `creator_profile`, `announcement`, and `featured_feed`.
+This describes device support,
 independently of marketing consent. Missing or malformed capabilities mean
 Following-only support. Registrations replace previous capabilities; token removal
-and stale-token cleanup remove them. Only compatible devices receive a video or
-profile campaign; an account with no compatible devices reports
+and stale-token cleanup remove them. Only compatible devices receive an advanced
+campaign destination; an account with no compatible devices reports
 `campaign_target_unsupported` without spending its notification allowance.
 
 Campaign destinations are `/following/new` (`app_route`), a full
 `34236:<64-hex-pubkey>:<nonempty-d-tag>` coordinate (`video_address`), or a full
-hex pubkey (`creator_profile`). Unsupported destinations are rejected before FCM.
+hex pubkey (`creator_profile`). Announcement and featured-feed destinations use
+canonical lowercase hyphenated UUIDs (`announcement` and `featured_feed`); the
+latter identifies a Funnelcake feed configuration. Unsupported destinations are
+rejected before FCM.
 The delivery API and final send idempotency are unchanged.
+
+Release campaigns additionally carry optional nullable `releaseEligibility`:
+`{"platform":"ios","channel":"app_store","version":"1.2.3"}`. Valid combinations
+are `ios`/`app_store`, `android`/`google_play`, and `android`/`zapstore`. Versions
+must be canonical `X.Y.Z` with decimal components from 0 through 999999, no leading
+zeroes except `0`, and no prerelease or build suffix. Invalid release constraints
+fail pending-response decoding rather than becoming unrestricted campaigns.
+
+Devices advertise `platform`, `installChannel`, and `appVersion` only inside the
+existing encrypted kind-3079 registration. All three must be valid together;
+missing, incomplete, or malformed values clear previous release metadata without
+rejecting registration. Deregistration and stale-token cleanup remove this data.
+The push service alone stores it, alongside device registrations; campaigns do
+not receive device metadata or tokens.
+
+A release campaign reaches only devices on the matching platform and install
+channel whose installed version is strictly older than the advertised release.
+Unknown or malformed metadata suppresses release delivery. If no compatible device
+is eligible, the result is `release_eligibility_unknown` when any device has unknown
+metadata, otherwise `release_not_applicable`. Destination capabilities are checked
+first and retain the separate `campaign_target_unsupported` outcome. Eligibility
+never bypasses consent, quiet hours, expiry, visit fencing, caps, or idempotency;
+even the internal-test consent bridge cannot bypass release eligibility.
 
 Roll out this backend before mobile advertises the additional destinations, then
 enable those choices in the campaign dashboard. Validate with opted-in staff

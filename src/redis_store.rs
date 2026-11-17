@@ -27,6 +27,7 @@ const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
 const TOKEN_TIMEZONE_NAMES_HASH: &str = "token_timezone_names";
 const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
 const TOKEN_CAMPAIGN_TARGET_TYPES_HASH: &str = "token_campaign_target_types";
+const TOKEN_RELEASE_METADATA_HASH: &str = "token_release_metadata";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 const USER_TOKENS_PREFIX: &str = "user_tokens:";
 
@@ -196,6 +197,40 @@ pub async fn campaign_capable_tokens(
         .collect())
 }
 
+/// Keeps eligible devices and records whether any rejected device lacks usable metadata.
+/// This gate is independent of the internal-test consent bypass.
+pub(crate) async fn release_eligible_tokens(
+    pool: &RedisPool,
+    tokens: Vec<(String, Option<i32>)>,
+    release: &crate::release_eligibility::ReleaseEligibility,
+) -> Result<(Vec<(String, Option<i32>)>, bool)> {
+    if tokens.is_empty() {
+        return Ok((tokens, false));
+    }
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let values: Vec<Option<String>> = redis::cmd("HMGET")
+        .arg(TOKEN_RELEASE_METADATA_HASH)
+        .arg(tokens.iter().map(|(token, _)| token).collect::<Vec<_>>())
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    let mut eligible = Vec::new();
+    let mut unknown = false;
+    for (token, value) in tokens.into_iter().zip(values) {
+        match value.and_then(|raw| {
+            serde_json::from_str::<crate::release_eligibility::DeviceReleaseMetadata>(&raw).ok()
+        }) {
+            Some(metadata) if metadata.is_eligible_for(release) => eligible.push(token),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    Ok((eligible, unknown))
+}
+
 /// Adds or updates a single device token for a pubkey.
 pub async fn add_or_update_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> Result<()> {
     add_or_update_token_with_timezone(pool, pubkey, token, None).await
@@ -238,6 +273,28 @@ pub async fn add_or_update_token_with_campaign_targets(
     timezone_offset_minutes: Option<i32>,
     timezone: Option<&str>,
     campaign_target_types: Option<&[String]>,
+) -> Result<()> {
+    add_or_update_token_with_device_metadata(
+        pool,
+        pubkey,
+        token,
+        timezone_offset_minutes,
+        timezone,
+        campaign_target_types,
+        None,
+    )
+    .await
+}
+
+/// Atomically replaces registration metadata; missing fields clear previous values.
+pub async fn add_or_update_token_with_device_metadata(
+    pool: &RedisPool,
+    pubkey: &PublicKey,
+    token: &str,
+    timezone_offset_minutes: Option<i32>,
+    timezone: Option<&str>,
+    campaign_target_types: Option<&[String]>,
+    release_metadata: Option<&crate::release_eligibility::DeviceReleaseMetadata>,
 ) -> Result<()> {
     let now_timestamp = Timestamp::now().as_secs();
     let pubkey_hex = pubkey.to_hex();
@@ -299,10 +356,16 @@ pub async fn add_or_update_token_with_campaign_targets(
 
     match campaign_target_types {
         Some(targets) => {
-            let targets: Vec<&str> = ["app_route", "video_address", "creator_profile"]
-                .into_iter()
-                .filter(|target| targets.iter().any(|value| value == target))
-                .collect();
+            let targets: Vec<&str> = [
+                "app_route",
+                "video_address",
+                "creator_profile",
+                "announcement",
+                "featured_feed",
+            ]
+            .into_iter()
+            .filter(|target| targets.iter().any(|value| value == target))
+            .collect();
             pipe.hset(
                 TOKEN_CAMPAIGN_TARGET_TYPES_HASH,
                 token,
@@ -312,6 +375,20 @@ pub async fn add_or_update_token_with_campaign_targets(
         }
         None => {
             pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
+        }
+    }
+
+    match release_metadata {
+        Some(metadata) => {
+            pipe.hset(
+                TOKEN_RELEASE_METADATA_HASH,
+                token,
+                serde_json::to_string(metadata)
+                    .map_err(|e| ServiceError::Internal(format!("Device release metadata: {e}")))?,
+            );
+        }
+        None => {
+            pipe.hdel(TOKEN_RELEASE_METADATA_HASH, token);
         }
     }
 
@@ -354,7 +431,8 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
                 .hdel(TOKEN_TO_PUBKEY_HASH, token) // Remove from token->pubkey map
                 .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token)
                 .hdel(TOKEN_TIMEZONE_NAMES_HASH, token)
-                .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
+                .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
+                .hdel(TOKEN_RELEASE_METADATA_HASH, token);
 
             let _result: RedisResult<Value> = pipe.query_async(&mut *conn).await;
             _result.map(|_| ()).map_err(ServiceError::Redis)?;
@@ -604,6 +682,7 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
     pipe.hdel(TOKEN_TIMEZONE_OFFSETS_HASH, &stale_tokens);
     pipe.hdel(TOKEN_TIMEZONE_NAMES_HASH, &stale_tokens);
     pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, &stale_tokens);
+    pipe.hdel(TOKEN_RELEASE_METADATA_HASH, &stale_tokens);
 
     // 3c. Remove tokens from individual user sets
     let mut actual_removed_count = 0;

@@ -323,13 +323,19 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         );
     }
 
-    match redis_store::add_or_update_token_with_campaign_targets(
+    let release_metadata = crate::release_eligibility::DeviceReleaseMetadata::from_registration(
+        token_payload.platform.as_deref(),
+        token_payload.install_channel.as_deref(),
+        token_payload.app_version.as_deref(),
+    );
+    match redis_store::add_or_update_token_with_device_metadata(
         &state.redis_pool,
         &event.pubkey,
         fcm_token,
         timezone_offset_minutes,
         token_payload.timezone.as_deref(),
         token_payload.campaign_target_types.as_deref(),
+        release_metadata.as_ref(),
     )
     .await
     {
@@ -2921,6 +2927,133 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         let stored: Option<String> = redis::cmd("HGET")
             .arg("token_campaign_target_types")
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[tokio::test]
+    async fn registration_replaces_release_metadata_and_legacy_registration_clears_it() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let user = Keys::generate();
+        let service = Keys::generate();
+        let token = format!(
+            "synthetic-registration-release-{}",
+            user.public_key().to_hex()
+        );
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.crypto_service = Some(CryptoService::new(service.clone()));
+        let full = serde_json::json!({"token":token,"platform":"android","installChannel":"zapstore","appVersion":"1.2.3",
+            "campaignTargetTypes":["announcement","featured_feed"]});
+        for replacement in [
+            serde_json::json!({"token":token}),
+            serde_json::json!({"token":token,"platform":"android","installChannel":"google_play"}),
+            serde_json::json!({"token":token,"platform":"ios","installChannel":"zapstore","appVersion":"1.2.3"}),
+            serde_json::json!({"token":token,"platform":"android","installChannel":"zapstore","appVersion":"1.2.3+4"}),
+            serde_json::json!({"token":token,"platform":42,"installChannel":"zapstore","appVersion":"1.2.3"}),
+        ] {
+            handle_registration(
+                &state,
+                &encrypted_registration_event(&user, &service, full.clone()),
+            )
+            .await
+            .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let stored: Option<String> = redis::cmd("HGET")
+                .arg("token_release_metadata")
+                .arg(&token)
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored.map(|v| serde_json::from_str::<serde_json::Value>(&v).unwrap()),
+                Some(
+                    serde_json::json!({"platform":"android","installChannel":"zapstore","appVersion":"1.2.3"})
+                )
+            );
+            let capabilities: String = redis::cmd("HGET")
+                .arg("token_campaign_target_types")
+                .arg(&token)
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&capabilities).unwrap(),
+                vec!["announcement", "featured_feed"]
+            );
+            drop(conn);
+            handle_registration(
+                &state,
+                &encrypted_registration_event(&user, &service, replacement),
+            )
+            .await
+            .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let stored: Option<String> = redis::cmd("HGET")
+                .arg("token_release_metadata")
+                .arg(&token)
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored, None,
+                "incomplete registration must clear unverifiable stale metadata"
+            );
+            drop(conn);
+            assert!(
+                redis_store::get_tokens_for_pubkey(&pool, &user.public_key())
+                    .await
+                    .unwrap()
+                    .contains(&token)
+            );
+        }
+        handle_registration(
+            &state,
+            &encrypted_registration_event(&user, &service, full.clone()),
+        )
+        .await
+        .unwrap();
+        handle_deregistration(
+            &state,
+            &encrypted_deregistration_event(&user, &service, &token),
+        )
+        .await
+        .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg("token_release_metadata")
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
+        drop(conn);
+        handle_registration(&state, &encrypted_registration_event(&user, &service, full))
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("ZADD")
+            .arg("stale_tokens")
+            .arg(0)
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        redis_store::cleanup_stale_tokens(&pool, 90 * 86400)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg("token_release_metadata")
             .arg(&token)
             .query_async(&mut *conn)
             .await
