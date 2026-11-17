@@ -1395,6 +1395,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_signed_registration_cannot_send_release_to_updated_device() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let service = Keys::generate();
+        let token = format!("synthetic-campaign-order-{}", user.public_key().to_hex());
+        let sender = MockFcmSender::new();
+        let mut state = sending_state(pool.clone(), sender.clone());
+        state.service_keys = Some(service.clone());
+        state.crypto_service = Some(crate::crypto::CryptoService::new(service.clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let now = Timestamp::now().as_secs();
+        for (version, at) in [("2.0.0", now), ("1.0.0", now - 1)] {
+            let encrypted = nostr_sdk::nips::nip44::encrypt(user.secret_key(), &service.public_key(),
+                serde_json::json!({"token":token,"platform":"ios","installChannel":"app_store","appVersion":version}).to_string(),
+                nostr_sdk::nips::nip44::Version::V2).unwrap();
+            let event = EventBuilder::new(Kind::from(3079), encrypted)
+                .tag(Tag::public_key(service.public_key()))
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(&user)
+                .unwrap();
+            assert!(event.verify().is_ok());
+            tx.send((
+                Box::new(event),
+                crate::event_handler::EventContext::Historical,
+            ))
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let state = Arc::new(state);
+        crate::event_handler::run(
+            state.clone(),
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut pending = pending_with_release(
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"2.0.0"}),
+        )
+        .unwrap();
+        pending.idempotency_key = format!("synthetic-order-{}", user.public_key().to_hex());
+        pending.recipient_pubkey = user.public_key().to_hex();
+        let outcome = deliver(&state, &pending, now as i64, TEST_LEASE_SECS).await;
+        assert_eq!(outcome.status, DeliveryStatus::Suppressed);
+        assert_eq!(outcome.reason.as_deref(), Some("release_not_applicable"));
+        assert!(sender.get_sent_messages().is_empty());
+    }
+
+    #[tokio::test]
     async fn release_campaign_sends_only_older_matching_devices() {
         let Some(pool) = test_redis_pool().await else {
             return;

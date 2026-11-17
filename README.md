@@ -166,6 +166,15 @@ rejecting registration. Deregistration and stale-token cleanup remove this data.
 The push service alone stores it, alongside device registrations; campaigns do
 not receive device metadata or tokens.
 
+Signed device registrations and deregistrations apply atomically in publication
+order (`created_at`, with the lowest event ID winning a timestamp tie), across
+replicas and replay. A newer downgrade or install-channel change replaces the
+previous metadata. Ordering tombstones persist after deregistration and stale
+cleanup to prevent delayed registrations restoring removed device authority.
+Their keys contain a hash of the token; their values retain only the ordering
+stamp and owner pubkey, without notification tokens or release metadata. Existing
+registrations gain an ordering stamp on their first accepted signed control event.
+
 A release campaign reaches only devices on the matching platform and install
 channel whose installed version is strictly older than the advertised release.
 Unknown or malformed metadata suppresses release delivery. If no compatible device

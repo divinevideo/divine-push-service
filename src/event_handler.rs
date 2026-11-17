@@ -328,19 +328,19 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         token_payload.install_channel.as_deref(),
         token_payload.app_version.as_deref(),
     );
-    match redis_store::add_or_update_token_with_device_metadata(
+    match redis_store::apply_device_registration(
         &state.redis_pool,
-        &event.pubkey,
-        fcm_token,
-        timezone_offset_minutes,
-        token_payload.timezone.as_deref(),
-        token_payload.campaign_target_types.as_deref(),
+        event,
+        &token_payload,
         release_metadata.as_ref(),
     )
     .await
     {
-        Ok(_) => {
+        Ok(true) => {
             info!(event_id = %event.id, pubkey = %event.pubkey, "Registered/Updated encrypted token");
+        }
+        Ok(false) => {
+            debug!(event_id = %event.id, "Ignored superseded device registration");
         }
         Err(e) => {
             return Err(e);
@@ -392,7 +392,8 @@ async fn handle_deregistration(state: &AppState, event: &Event) -> Result<()> {
         return Ok(());
     }
 
-    let removed = redis_store::remove_token(&state.redis_pool, &event.pubkey, fcm_token).await?;
+    let removed =
+        redis_store::apply_device_deregistration(&state.redis_pool, event, fcm_token).await?;
     if removed {
         info!(event_id = %event.id, pubkey = %event.pubkey, "Deregistered encrypted token");
     } else {
@@ -2704,6 +2705,12 @@ mod tests {
         EventId::from_slice(&bytes).expect("32 bytes is a valid event id")
     }
 
+    fn next_device_control_timestamp() -> Timestamp {
+        static NEXT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1_800_000_000);
+        Timestamp::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn encrypted_deregistration_event(user_keys: &Keys, service_keys: &Keys, token: &str) -> Event {
         let payload = serde_json::json!({ "token": token }).to_string();
         let encrypted = nostr_sdk::nips::nip44::encrypt(
@@ -2715,6 +2722,7 @@ mod tests {
         .expect("test token should encrypt");
 
         EventBuilder::new(Kind::from(KIND_DEREGISTRATION), encrypted)
+            .custom_created_at(next_device_control_timestamp())
             .tag(Tag::public_key(service_keys.public_key()))
             .sign_with_keys(user_keys)
             .expect("test deregistration should sign")
@@ -2850,6 +2858,7 @@ mod tests {
         .expect("test token should encrypt");
 
         EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+            .custom_created_at(next_device_control_timestamp())
             .tag(Tag::public_key(service_keys.public_key()))
             .sign_with_keys(user_keys)
             .expect("test registration should sign")
@@ -2932,6 +2941,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored, None);
+    }
+
+    #[tokio::test]
+    async fn delayed_signed_registration_cannot_restore_release_or_destination_authority() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let service = Keys::generate();
+        let token = format!("synthetic-ordered-{}", user.public_key().to_hex());
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.crypto_service = Some(CryptoService::new(service.clone()));
+        let signed = |version: &str, targets: Vec<&str>, at: u64| {
+            let payload =
+                serde_json::json!({"token":token,"platform":"ios","installChannel":"app_store",
+                "appVersion":version,"campaignTargetTypes":targets})
+                .to_string();
+            let encrypted = nostr_sdk::nips::nip44::encrypt(
+                user.secret_key(),
+                &service.public_key(),
+                payload,
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(&user)
+                .unwrap()
+        };
+        let old = signed("1.0.0", vec!["announcement"], 100);
+        let current = signed("2.0.0", vec![], 200);
+        assert!(old.verify().is_ok() && current.verify().is_ok());
+        handle_registration(&state, &current).await.unwrap();
+        handle_registration(&state, &old).await.unwrap();
+        let tokens = redis_store::get_tokens_with_timezone_offsets(&pool, &user.public_key())
+            .await
+            .unwrap();
+        let release = serde_json::from_value(
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"2.0.0"}),
+        )
+        .unwrap();
+        let (eligible, unknown) =
+            redis_store::release_eligible_tokens(&pool, tokens.clone(), &release)
+                .await
+                .unwrap();
+        assert!(
+            eligible.is_empty(),
+            "already updated device must suppress release delivery"
+        );
+        assert!(!unknown);
+        assert!(
+            redis_store::campaign_capable_tokens(&pool, tokens, "announcement")
+                .await
+                .unwrap()
+                .is_empty(),
+            "older registration must not restore cleared destination capabilities"
+        );
+        // A newer real downgrade remains authoritative; this is event ordering, not max version.
+        handle_registration(&state, &signed("1.0.0", vec!["announcement"], 300))
+            .await
+            .unwrap();
+        let tokens = redis_store::get_tokens_with_timezone_offsets(&pool, &user.public_key())
+            .await
+            .unwrap();
+        assert_eq!(
+            redis_store::release_eligible_tokens(&pool, tokens, &release)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        // Ties converge on the lowest event ID regardless of arrival order or replicas.
+        let first = signed("1.0.0", vec!["announcement"], 400);
+        let second = signed("2.0.0", vec![], 400);
+        let (winner, loser) = if first.id < second.id {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        handle_registration(&state, loser).await.unwrap();
+        let (a, b) = tokio::join!(
+            handle_registration(&state, winner),
+            handle_registration(&state, loser)
+        );
+        a.unwrap();
+        b.unwrap();
+        handle_registration(&state, loser).await.unwrap();
+        let expected = state
+            .crypto_service
+            .as_ref()
+            .unwrap()
+            .decrypt_token_payload(&winner.content, &user.public_key())
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let stored: String = redis::cmd("HGET")
+            .arg("token_release_metadata")
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap()["appVersion"],
+            expected.app_version.unwrap()
+        );
+        drop(conn);
+        let encrypted = nostr_sdk::nips::nip44::encrypt(
+            user.secret_key(),
+            &service.public_key(),
+            serde_json::json!({"token":token}).to_string(),
+            nostr_sdk::nips::nip44::Version::V2,
+        )
+        .unwrap();
+        let deregister = EventBuilder::new(Kind::from(KIND_DEREGISTRATION), encrypted)
+            .custom_created_at(Timestamp::from(500))
+            .sign_with_keys(&user)
+            .unwrap();
+        handle_deregistration(&state, &deregister).await.unwrap();
+        handle_registration(&state, winner).await.unwrap();
+        assert!(
+            redis_store::get_tokens_for_pubkey(&pool, &user.public_key())
+                .await
+                .unwrap()
+                .is_empty(),
+            "deregistration tombstone must fence delayed registration"
+        );
+        let reregister = signed("1.0.0", vec![], 600);
+        handle_registration(&state, &reregister).await.unwrap();
+        handle_deregistration(&state, &deregister).await.unwrap();
+        assert_eq!(
+            redis_store::get_tokens_for_pubkey(&pool, &user.public_key())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "delayed deregistration must not remove a newer registration"
+        );
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("ZADD")
+            .arg("stale_tokens")
+            .arg(0)
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        redis_store::cleanup_stale_tokens(&pool, 90 * 86400)
+            .await
+            .unwrap();
+        handle_registration(&state, &reregister).await.unwrap();
+        assert!(
+            redis_store::get_tokens_for_pubkey(&pool, &user.public_key())
+                .await
+                .unwrap()
+                .is_empty(),
+            "cleanup must retain the ordering fence against old signed registrations"
+        );
+        let encrypted = nostr_sdk::nips::nip44::encrypt(user.secret_key(), &service.public_key(),
+            serde_json::json!({"token":token,"platform":"android","installChannel":"zapstore","appVersion":"0.1.0"}).to_string(),
+            nostr_sdk::nips::nip44::Version::V2).unwrap();
+        let channel_change = EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+            .custom_created_at(Timestamp::from(700))
+            .sign_with_keys(&user)
+            .unwrap();
+        handle_registration(&state, &channel_change).await.unwrap();
+        let release = serde_json::from_value(
+            serde_json::json!({"platform":"android","channel":"zapstore","version":"2.0.0"}),
+        )
+        .unwrap();
+        let tokens = redis_store::get_tokens_with_timezone_offsets(&pool, &user.public_key())
+            .await
+            .unwrap();
+        assert_eq!(
+            redis_store::release_eligible_tokens(&pool, tokens, &release)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1,
+            "newer channel changes remain authoritative even with a lower version"
+        );
     }
 
     #[tokio::test]

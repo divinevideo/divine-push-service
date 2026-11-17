@@ -400,6 +400,113 @@ pub async fn add_or_update_token_with_device_metadata(
     Ok(())
 }
 
+/// Applies signed registration state in event order, atomically across replicas.
+/// Equal timestamps choose the lowest event ID, matching the notify-list policy.
+/// Ordering tombstones survive removal and cleanup; their keys hash the token so
+/// deregistration does not retain the token itself or device metadata.
+pub(crate) async fn apply_device_registration(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    payload: &crate::crypto::TokenPayload,
+    release: Option<&crate::release_eligibility::DeviceReleaseMetadata>,
+) -> Result<bool> {
+    let metadata = serde_json::json!({
+        "offset": payload.timezone_offset_minutes.filter(|offset| (-720..=840).contains(offset)),
+        "timezone": payload.timezone.as_deref().filter(|name| name.parse::<chrono_tz::Tz>().is_ok()),
+        "targets": payload.campaign_target_types.as_ref().map(serde_json::to_string).transpose()
+            .map_err(|e| ServiceError::Internal(format!("Campaign capabilities: {e}")))?,
+        "release": release.map(serde_json::to_string).transpose()
+            .map_err(|e| ServiceError::Internal(format!("Device metadata: {e}")))?,
+    });
+    apply_ordered_device_control(pool, event, payload.token.trim(), Some(metadata)).await
+}
+
+/// Removes only the current owner's device, fencing delayed registrations.
+pub(crate) async fn apply_device_deregistration(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    token: &str,
+) -> Result<bool> {
+    apply_ordered_device_control(pool, event, token, None).await
+}
+
+async fn apply_ordered_device_control(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    token: &str,
+    metadata: Option<serde_json::Value>,
+) -> Result<bool> {
+    // This deployment uses one Redis instance, as do the notify-list scripts.
+    // All ownership, ordering and metadata changes execute in one atomic script.
+    const SCRIPT: &str = r#"
+        local incoming = cjson.decode(ARGV[1])
+        local token = ARGV[2]
+        local owner = redis.call('HGET', KEYS[2], token)
+        local stored = redis.call('GET', KEYS[1])
+        if stored then
+            stored = cjson.decode(stored)
+            if incoming.at < stored.at or
+                (incoming.at == stored.at and incoming.id >= stored.id) then
+                return 0
+            end
+        end
+        if incoming.metadata == cjson.null then
+            if (owner and owner ~= incoming.owner) or
+                (not owner and stored and stored.owner ~= incoming.owner) then
+                return 0
+            end
+        end
+        if owner then
+            redis.call('SREM', ARGV[3] .. owner, token)
+        end
+        redis.call('HDEL', KEYS[2], token)
+        redis.call('ZREM', KEYS[3], token)
+        for i = 4, 7 do redis.call('HDEL', KEYS[i], token) end
+        if incoming.metadata ~= cjson.null then
+            local metadata = incoming.metadata
+            redis.call('SADD', ARGV[3] .. incoming.owner, token)
+            redis.call('HSET', KEYS[2], token, incoming.owner)
+            redis.call('ZADD', KEYS[3], incoming.now, token)
+            local fields = {'offset', 'timezone', 'targets', 'release'}
+            for i, field in ipairs(fields) do
+                if metadata[field] ~= cjson.null then
+                    redis.call('HSET', KEYS[i + 3], token, metadata[field])
+                end
+            end
+        end
+        redis.call('SET', KEYS[1], cjson.encode({at=incoming.at, id=incoming.id, owner=incoming.owner}))
+        return 1
+    "#;
+    let incoming = serde_json::json!({
+        // Fixed-width decimal preserves the full u64 order in Lua without f64 rounding.
+        "at": format!("{:020}", event.created_at.as_secs()),
+        "id": event.id.to_hex(), "owner": event.pubkey.to_hex(),
+        "now": Timestamp::now().as_secs(), "metadata": metadata,
+    });
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let applied: i64 = redis::Script::new(SCRIPT)
+        .key(format!(
+            "device_registration_order:{}",
+            blake3::hash(token.as_bytes()).to_hex()
+        ))
+        .key(TOKEN_TO_PUBKEY_HASH)
+        .key(STALE_TOKENS_ZSET)
+        .key(TOKEN_TIMEZONE_OFFSETS_HASH)
+        .key(TOKEN_TIMEZONE_NAMES_HASH)
+        .key(TOKEN_CAMPAIGN_TARGET_TYPES_HASH)
+        .key(TOKEN_RELEASE_METADATA_HASH)
+        .arg(incoming.to_string())
+        .arg(token)
+        .arg(USER_TOKENS_PREFIX)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(applied == 1)
+}
+
 /// Removes a single device token for a pubkey.
 /// Returns true if the token was found and removed.
 /// Only allows removal if the token is registered to the requesting pubkey.
