@@ -181,6 +181,8 @@ results influence work.
 - `token_to_pubkey` - Hash mapping a token back to its owner
 - `token_timezone_offsets` - Hash mapping a token to the UTC offset minutes captured at registration
 - `token_campaign_target_types` - Hash of per-device campaign destination capabilities from encrypted kind 3079; missing means Following-only, independently of account consent
+- `token_release_metadata` - Hash of per-device `platform`/`installChannel`/`appVersion` (JSON) from encrypted kind 3079, used only for release-campaign eligibility; missing or invalid suppresses release delivery
+- `device_registration_order:{blake3(token)}` - Ordering stamp (`created_at`, event id, owner pubkey) of the last applied kind 3079/3080 for a token. Written by the device control script and kept, with no TTL, after deregistration and stale cleanup so a delayed registration cannot restore removed device state
 - `stale_tokens` - Sorted set scored by the last time a token was known good, for cleanup. Written at registration and again on every delivered push, so the sweep means "inactive" rather than "registered long ago". The refresh uses `ZADD XX GT`: `XX` so a token deregistered mid-send is not resurrected as an owner-less member, `GT` so a replica's clock cannot pull a live token toward the sweep
 - `user_preferences:{pubkey}` - User's notification preferences (JSON)
 - `campaign_consent:{pubkey}` - Explicit campaign opt-in from kind 3083; missing means false
