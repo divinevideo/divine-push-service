@@ -22,11 +22,53 @@ use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// Destination types a device may advertise in `campaignTargetTypes`.
+///
+/// The kind-3079 parser keeps only these, and `TapTarget::is_supported`
+/// accepts only these, each through its own validator arm.
+pub(crate) const CAMPAIGN_TARGET_TYPES: [&str; 5] = [
+    "app_route",
+    "video_address",
+    "creator_profile",
+    "announcement",
+    "featured_feed",
+];
+
 #[derive(Debug, Deserialize)]
 struct TapTarget {
     #[serde(rename = "type")]
     target_type: String,
     value: String,
+}
+
+impl TapTarget {
+    fn is_supported(&self) -> bool {
+        let full_pubkey = |key: &str| {
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && PublicKey::from_hex(key).is_ok()
+        };
+        // An arm for an unlisted type stays unreachable, so devices can always
+        // register every destination this accepts.
+        if !CAMPAIGN_TARGET_TYPES.contains(&self.target_type.as_str()) {
+            return false;
+        }
+        match self.target_type.as_str() {
+            "app_route" => self.value == "/following/new",
+            "creator_profile" => full_pubkey(&self.value),
+            "announcement" | "featured_feed" => uuid::Uuid::parse_str(&self.value)
+                .is_ok_and(|id| id.hyphenated().to_string() == self.value),
+            "video_address" => {
+                let mut parts = self.value.splitn(3, ':');
+                parts.next() == Some("34236")
+                    && parts.next().is_some_and(full_pubkey)
+                    && parts.next().is_some_and(|d_tag| !d_tag.is_empty())
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +95,10 @@ struct PendingDelivery {
     body: String,
     tap_target: TapTarget,
     expires_at: Option<String>,
+    /// Kept raw and validated in `deliver`, like `tap_target`: a constraint
+    /// this build cannot validate fails its own row instead of the batch.
+    #[serde(default)]
+    release_eligibility: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +386,20 @@ async fn deliver(
     if is_expired(delivery.expires_at.as_deref(), now) {
         return refuse(DeliveryStatus::Suppressed, "campaign_expired");
     }
+    if !delivery.tap_target.is_supported() {
+        return refuse(DeliveryStatus::PermanentFailure, "invalid_campaign_target");
+    }
+    let Ok(release) = delivery
+        .release_eligibility
+        .as_ref()
+        .map(crate::release_eligibility::ReleaseEligibility::deserialize)
+        .transpose()
+    else {
+        return refuse(
+            DeliveryStatus::PermanentFailure,
+            "invalid_release_eligibility",
+        );
+    };
 
     let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
@@ -434,6 +494,52 @@ async fn deliver(
         release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
         return refuse(DeliveryStatus::PermanentFailure, "no_device");
     }
+
+    let registered_tokens = match redis_store::campaign_capable_tokens(
+        &state.redis_pool,
+        registered_tokens,
+        &delivery.tap_target.target_type,
+    )
+    .await
+    {
+        Ok(tokens) if !tokens.is_empty() => tokens,
+        Ok(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::Suppressed, "campaign_target_unsupported");
+        }
+        Err(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::RetryableFailure, "capability_lookup_failed");
+        }
+    };
+
+    let registered_tokens = if let Some(release) = &release {
+        match redis_store::release_eligible_tokens(&state.redis_pool, registered_tokens, release)
+            .await
+        {
+            Ok((tokens, _)) if !tokens.is_empty() => tokens,
+            Ok((_, unknown)) => {
+                release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+                return refuse(
+                    DeliveryStatus::Suppressed,
+                    if unknown {
+                        "release_eligibility_unknown"
+                    } else {
+                        "release_not_applicable"
+                    },
+                );
+            }
+            Err(_) => {
+                release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+                return refuse(
+                    DeliveryStatus::RetryableFailure,
+                    "release_eligibility_lookup_failed",
+                );
+            }
+        }
+    } else {
+        registered_tokens
+    };
 
     let mut tokens = Vec::new();
     let mut earliest_retry_after: Option<String> = None;
@@ -1085,6 +1191,585 @@ mod tests {
                 value: "/following/new".to_string(),
             },
             expires_at: expires_at.map(str::to_string),
+            release_eligibility: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn campaign_with_an_unsupported_target_is_never_sent() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, _) = registered_delivery(&pool, "invalid-target").await;
+        pending.tap_target.value = "/not-a-campaign-route".into();
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool, sender.clone());
+        let result = deliver(
+            &state,
+            &pending,
+            Timestamp::now().as_secs() as i64,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.reason.as_deref(), Some("invalid_campaign_target"));
+        assert!(sender.get_sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn campaign_video_does_not_interrupt_a_legacy_device() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, _) = registered_delivery(&pool, "legacy-video").await;
+        pending.tap_target = TapTarget {
+            target_type: "video_address".into(),
+            value: format!("34236:{}:clip", pending.recipient_pubkey),
+        };
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool.clone(), sender.clone());
+        let result = deliver(
+            &state,
+            &pending,
+            Timestamp::now().as_secs() as i64,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Suppressed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("campaign_target_unsupported")
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        assert_eq!(
+            claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
+            -2
+        );
+        pending.idempotency_key.push_str("-following");
+        pending.tap_target = TapTarget {
+            target_type: "app_route".into(),
+            value: "/following/new".into(),
+        };
+        assert_eq!(
+            deliver(
+                &state,
+                &pending,
+                Timestamp::now().as_secs() as i64,
+                TEST_LEASE_SECS
+            )
+            .await
+            .status,
+            DeliveryStatus::Delivered,
+            "unsupported destinations must not spend the interruption allowance"
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_profile_reaches_only_capable_devices_and_dedupes_reoffers() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, legacy_token) = registered_delivery(&pool, "mixed-profile").await;
+        let recipient = PublicKey::from_str(&pending.recipient_pubkey).unwrap();
+        let capable_token = format!("capable-{}", pending.recipient_pubkey);
+        redis_store::add_or_update_token(&pool, &recipient, &capable_token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg("token_campaign_target_types")
+            .arg(&capable_token)
+            .arg(r#"["app_route","video_address","creator_profile"]"#)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        pending.tap_target = TapTarget {
+            target_type: "creator_profile".into(),
+            value: Keys::generate().public_key().to_hex(),
+        };
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool, sender.clone());
+        let now = Timestamp::now().as_secs() as i64;
+        assert_eq!(
+            deliver(&state, &pending, now, TEST_LEASE_SECS).await.status,
+            DeliveryStatus::Delivered
+        );
+        assert_eq!(
+            deliver(&state, &pending, now, TEST_LEASE_SECS)
+                .await
+                .reason
+                .as_deref(),
+            Some("already_delivered")
+        );
+        let sent = sender.get_sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, capable_token);
+        assert_ne!(sent[0].0, legacy_token);
+    }
+
+    #[test]
+    fn announcement_and_featured_feed_targets_require_canonical_uuids() {
+        for target_type in ["announcement", "featured_feed"] {
+            for (value, valid) in [
+                ("5e5503da-455a-4d93-8588-620c4cb2121f", true),
+                ("5E5503DA-455A-4D93-8588-620C4CB2121F", false),
+                ("5e5503da455a4d938588620c4cb2121f", false),
+                ("not-a-uuid", false),
+                ("", false),
+            ] {
+                assert_eq!(
+                    TapTarget {
+                        target_type: target_type.into(),
+                        value: value.into()
+                    }
+                    .is_supported(),
+                    valid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_registrable_campaign_target_type_has_a_destination_validator() {
+        let pubkey = Keys::generate().public_key().to_hex();
+        for target_type in CAMPAIGN_TARGET_TYPES {
+            let value = match target_type {
+                "app_route" => "/following/new".to_string(),
+                "video_address" => format!("34236:{pubkey}:clip"),
+                "creator_profile" => pubkey.clone(),
+                "announcement" | "featured_feed" => {
+                    "5e5503da-455a-4d93-8588-620c4cb2121f".to_string()
+                }
+                other => panic!("add a sample destination for `{other}`"),
+            };
+            assert!(
+                TapTarget {
+                    target_type: target_type.into(),
+                    value
+                }
+                .is_supported(),
+                "`{target_type}` is registrable but no destination of that type is accepted"
+            );
+        }
+    }
+
+    fn pending_with_release(spec: serde_json::Value) -> serde_json::Result<PendingDelivery> {
+        serde_json::from_value(delivery_json("release-fixture", Some(spec)))
+    }
+
+    fn release_spec(
+        spec: serde_json::Value,
+    ) -> serde_json::Result<crate::release_eligibility::ReleaseEligibility> {
+        serde_json::from_value(spec)
+    }
+
+    #[test]
+    fn release_contract_rejects_invalid_platform_channels_and_versions() {
+        for (platform, channel, version) in [
+            ("ios", "app_store", "1.2.3"),
+            ("android", "google_play", "999999.999999.999999"),
+            ("android", "zapstore", "0.0.0"),
+        ] {
+            assert!(release_spec(
+                serde_json::json!({"platform":platform,"channel":channel,"version":version})
+            )
+            .is_ok());
+        }
+        assert!(pending_with_release(serde_json::Value::Null)
+            .unwrap()
+            .release_eligibility
+            .is_none());
+        for (platform, channel, version) in [
+            ("ios", "google_play", "1.2.3"),
+            ("ios", "zapstore", "1.2.3"),
+            ("android", "app_store", "1.2.3"),
+            ("web", "app_store", "1.2.3"),
+            ("ios", "app_store", "01.2.3"),
+            ("ios", "app_store", "1.2"),
+            ("ios", "app_store", "1.2.3+4"),
+            ("ios", "app_store", "1.2.3-beta"),
+            ("ios", "app_store", "1000000.2.3"),
+            ("ios", "app_store", " 1.2.3"),
+        ] {
+            let spec = serde_json::json!({"platform":platform,"channel":channel,"version":version});
+            assert!(
+                release_spec(spec.clone()).is_err(),
+                "accepted {platform}/{channel}/{version}"
+            );
+            assert!(
+                pending_with_release(spec).is_ok(),
+                "{platform}/{channel}/{version} must fail its own row, not the batch decode"
+            );
+        }
+    }
+
+    #[test]
+    fn one_unvalidatable_release_constraint_does_not_fail_the_batch_decode() {
+        let mut rows = vec![delivery_json(
+            "valid",
+            Some(serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3"})),
+        )];
+        for spec in [
+            serde_json::json!({"platform":"android","channel":"new_store","version":"1.2.3"}),
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3-beta"}),
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3","minVersion":"1.0.0"}),
+            serde_json::json!("ios"),
+        ] {
+            rows.push(delivery_json("invalid", Some(spec)));
+        }
+        let parsed: PendingResponse = serde_json::from_value(serde_json::json!({
+            "deliveries": rows, "leaseSeconds": 300,
+        }))
+        .expect("an invalid release constraint must not fail the batch");
+        assert_eq!(parsed.deliveries.len(), 5);
+    }
+
+    fn delivery_json(key: &str, release: Option<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "idempotencyKey": key, "leaseId": "lease-fixture",
+            "campaignRevisionId": "revision-fixture", "recipientPubkey": "a".repeat(64),
+            "category": "engagement", "title": "An update is available", "body": "See the changes.",
+            "tapTarget": { "type": "app_route", "value": "/following/new" },
+            "releaseEligibility": release,
+        })
+    }
+
+    #[tokio::test]
+    async fn invalid_release_constraint_fails_only_its_row_without_sending() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (base, _) = registered_delivery(&pool, "release-invalid").await;
+        let mut pending = pending_with_release(
+            serde_json::json!({"platform":"android","channel":"new_store","version":"1.2.3"}),
+        )
+        .unwrap();
+        pending.idempotency_key = base.idempotency_key;
+        pending.recipient_pubkey = base.recipient_pubkey;
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool.clone(), sender.clone());
+        let result = deliver(
+            &state,
+            &pending,
+            Timestamp::now().as_secs() as i64,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("invalid_release_eligibility")
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        assert_eq!(
+            claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
+            -2
+        );
+    }
+
+    #[tokio::test]
+    async fn release_campaign_suppresses_inapplicable_or_unknown_devices_even_with_test_bypass() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        for (platform, channel, version, reason) in [
+            ("ios", "app_store", "1.2.3", "release_not_applicable"),
+            ("ios", "app_store", "1.3.0", "release_not_applicable"),
+            ("android", "google_play", "1.0.0", "release_not_applicable"),
+            ("android", "zapstore", "1.0.0", "release_not_applicable"),
+            ("ios", "app_store", "1.0.bad", "release_eligibility_unknown"),
+            ("ios", "app_store", "", "release_eligibility_unknown"),
+            ("ios", "zapstore", "1.0.0", "release_eligibility_unknown"),
+            ("", "", "", "release_eligibility_unknown"),
+        ] {
+            let (base, token) = registered_delivery(&pool, "release-suppressed").await;
+            let mut pending = pending_with_release(
+                serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3"}),
+            )
+            .unwrap();
+            pending.idempotency_key = base.idempotency_key;
+            pending.recipient_pubkey = base.recipient_pubkey;
+            let mut conn = pool.get().await.unwrap();
+            let _: () = redis::cmd("HSET").arg("token_release_metadata").arg(&token)
+                .arg(serde_json::json!({"platform":platform,"installChannel":channel,"appVersion":version}).to_string())
+                .query_async(&mut *conn).await.unwrap();
+            drop(conn);
+            let sender = MockFcmSender::new();
+            let state = sending_state(pool.clone(), sender.clone());
+            let result = deliver(
+                &state,
+                &pending,
+                Timestamp::now().as_secs() as i64,
+                TEST_LEASE_SECS,
+            )
+            .await;
+            assert_eq!(
+                result.status,
+                DeliveryStatus::Suppressed,
+                "{platform}/{channel}/{version}"
+            );
+            assert_eq!(result.reason.as_deref(), Some(reason));
+            assert!(sender.get_sent_messages().is_empty());
+            assert_eq!(
+                claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
+                -2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_signed_registration_cannot_send_release_to_updated_device() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let service = Keys::generate();
+        let token = format!("synthetic-campaign-order-{}", user.public_key().to_hex());
+        let sender = MockFcmSender::new();
+        let mut state = sending_state(pool.clone(), sender.clone());
+        state.service_keys = Some(service.clone());
+        state.crypto_service = Some(crate::crypto::CryptoService::new(service.clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let now = Timestamp::now().as_secs();
+        for (version, at) in [("2.0.0", now), ("1.0.0", now - 1)] {
+            let encrypted = nostr_sdk::nips::nip44::encrypt(user.secret_key(), &service.public_key(),
+                serde_json::json!({"token":token,"platform":"ios","installChannel":"app_store","appVersion":version}).to_string(),
+                nostr_sdk::nips::nip44::Version::V2).unwrap();
+            let event = EventBuilder::new(Kind::from(3079), encrypted)
+                .tag(Tag::public_key(service.public_key()))
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(&user)
+                .unwrap();
+            assert!(event.verify().is_ok());
+            tx.send((
+                Box::new(event),
+                crate::event_handler::EventContext::Historical,
+            ))
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let state = Arc::new(state);
+        crate::event_handler::run(
+            state.clone(),
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut pending = pending_with_release(
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"2.0.0"}),
+        )
+        .unwrap();
+        pending.idempotency_key = format!("synthetic-order-{}", user.public_key().to_hex());
+        pending.recipient_pubkey = user.public_key().to_hex();
+        let outcome = deliver(&state, &pending, now as i64, TEST_LEASE_SECS).await;
+        assert_eq!(outcome.status, DeliveryStatus::Suppressed);
+        assert_eq!(outcome.reason.as_deref(), Some("release_not_applicable"));
+        assert!(sender.get_sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_campaign_sends_only_older_matching_devices() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        for (platform, channel) in [
+            ("ios", "app_store"),
+            ("android", "google_play"),
+            ("android", "zapstore"),
+        ] {
+            let (base, legacy) = registered_delivery(&pool, "release-mixed").await;
+            let recipient = PublicKey::from_str(&base.recipient_pubkey).unwrap();
+            let mut pending = pending_with_release(
+                serde_json::json!({"platform":platform,"channel":channel,"version":"1.10.0"}),
+            )
+            .unwrap();
+            pending.idempotency_key = base.idempotency_key;
+            pending.recipient_pubkey = base.recipient_pubkey;
+            let mut expected = Vec::new();
+            for (index, version) in ["1.9.99", "0.999999.999999", "1.10.0", "2.0.0", "bad"]
+                .iter()
+                .enumerate()
+            {
+                let token = format!("synthetic-release-{index}-{}", pending.recipient_pubkey);
+                redis_store::add_or_update_token(&pool, &recipient, &token)
+                    .await
+                    .unwrap();
+                let mut conn = pool.get().await.unwrap();
+                let _: () = redis::cmd("HSET").arg("token_release_metadata").arg(&token)
+                    .arg(serde_json::json!({"platform":platform,"installChannel":channel,"appVersion":version}).to_string())
+                    .query_async(&mut *conn).await.unwrap();
+                if index < 2 {
+                    expected.push(token);
+                }
+            }
+            let sender = MockFcmSender::new();
+            let state = sending_state(pool.clone(), sender.clone());
+            let now = Timestamp::now().as_secs() as i64;
+            assert_eq!(
+                deliver(&state, &pending, now, TEST_LEASE_SECS).await.status,
+                DeliveryStatus::Delivered
+            );
+            assert_eq!(
+                deliver(&state, &pending, now, TEST_LEASE_SECS)
+                    .await
+                    .reason
+                    .as_deref(),
+                Some("already_delivered")
+            );
+            let mut sent: Vec<String> = sender
+                .get_sent_messages()
+                .into_iter()
+                .map(|(token, _)| token)
+                .collect();
+            sent.sort();
+            expected.sort();
+            assert_eq!(sent, expected);
+            assert!(!sent.contains(&legacy));
+        }
+    }
+
+    #[tokio::test]
+    async fn release_campaign_does_not_cross_android_install_channels() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        for (device_channel, release_channel) in
+            [("zapstore", "google_play"), ("google_play", "zapstore")]
+        {
+            let (base, token) = registered_delivery(&pool, "release-channel").await;
+            let mut pending = pending_with_release(serde_json::json!({"platform":"android","channel":release_channel,"version":"2.0.0"})).unwrap();
+            pending.idempotency_key = base.idempotency_key;
+            pending.recipient_pubkey = base.recipient_pubkey;
+            let mut conn = pool.get().await.unwrap();
+            let _: () = redis::cmd("HSET").arg("token_release_metadata").arg(&token)
+                .arg(serde_json::json!({"platform":"android","installChannel":device_channel,"appVersion":"1.0.0"}).to_string())
+                .query_async(&mut *conn).await.unwrap();
+            drop(conn);
+            let sender = MockFcmSender::new();
+            let state = sending_state(pool.clone(), sender.clone());
+            let result = deliver(
+                &state,
+                &pending,
+                Timestamp::now().as_secs() as i64,
+                TEST_LEASE_SECS,
+            )
+            .await;
+            assert_eq!(result.status, DeliveryStatus::Suppressed);
+            assert_eq!(result.reason.as_deref(), Some("release_not_applicable"));
+            assert!(sender.get_sent_messages().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn release_campaign_keeps_consent_quiet_hours_caps_and_expiry_enforced() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let noon = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        for (consent, offset, cap, expiry, status, reason) in [
+            (true, Some(0), 20, None, DeliveryStatus::Delivered, ""),
+            (
+                false,
+                Some(0),
+                20,
+                None,
+                DeliveryStatus::Suppressed,
+                "campaign_consent_disabled",
+            ),
+            (
+                true,
+                Some(720),
+                20,
+                None,
+                DeliveryStatus::Deferred,
+                "recipient_quiet_hours",
+            ),
+            (
+                true,
+                None,
+                20,
+                None,
+                DeliveryStatus::Suppressed,
+                "recipient_timezone_unknown",
+            ),
+            (
+                true,
+                Some(0),
+                0,
+                None,
+                DeliveryStatus::Suppressed,
+                "recipient_frequency_capped",
+            ),
+            (
+                true,
+                Some(0),
+                20,
+                Some("2020-01-01T00:00:00Z"),
+                DeliveryStatus::Suppressed,
+                "campaign_expired",
+            ),
+        ] {
+            let (base, token) = registered_delivery(&pool, "release-guards").await;
+            let recipient = PublicKey::from_str(&base.recipient_pubkey).unwrap();
+            redis_store::add_or_update_token_with_timezone(&pool, &recipient, &token, offset)
+                .await
+                .unwrap();
+            let mut conn = pool.get().await.unwrap();
+            let _: () = redis::cmd("HSET")
+                .arg("token_release_metadata")
+                .arg(&token)
+                .arg(r#"{"platform":"ios","installChannel":"app_store","appVersion":"1.0.0"}"#)
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+            preferences::set_user_preferences_with_campaign_consent(
+                &pool,
+                &base.recipient_pubkey,
+                &preferences::UserPreferences { kinds: vec![] },
+                consent,
+            )
+            .await
+            .unwrap();
+            let mut pending = pending_with_release(
+                serde_json::json!({"platform":"ios","channel":"app_store","version":"2.0.0"}),
+            )
+            .unwrap();
+            pending.idempotency_key = base.idempotency_key;
+            pending.recipient_pubkey = base.recipient_pubkey;
+            pending.expires_at = expiry.map(str::to_owned);
+            let sender = MockFcmSender::new();
+            let mut state = sending_state(pool.clone(), sender.clone());
+            state.settings.campaign_delivery.allow_unverified_consent = false;
+            state.settings.service.delivery.daily_cap = cap;
+            let result = deliver(&state, &pending, noon, TEST_LEASE_SECS).await;
+            assert_eq!(result.status, status);
+            assert_eq!(
+                result.reason.as_deref(),
+                (!reason.is_empty()).then_some(reason)
+            );
+            assert_eq!(
+                sender.get_sent_messages().len(),
+                usize::from(status == DeliveryStatus::Delivered)
+            );
+        }
+    }
+
+    #[test]
+    fn campaign_targets_require_lowercase_full_pubkeys() {
+        for target in [
+            TapTarget {
+                target_type: "creator_profile".into(),
+                value: "AB".repeat(32),
+            },
+            TapTarget {
+                target_type: "video_address".into(),
+                value: format!("34236:{}:clip", "AB".repeat(32)),
+            },
+        ] {
+            assert!(!target.is_supported());
         }
     }
 

@@ -135,6 +135,76 @@ Optional. When enabled, the service polls the campaign tool's internal delivery 
 
 It is off by default, and even when enabled it does not poll unless a safe HTTPS `api_base_url` and both Access credentials are set. Normal delivery requires an explicit `campaignsEnabled` kind-3083 preference and a valid device UTC offset from kind 3079, and enforces 21:00–06:59 recipient-local quiet hours. `allow_unverified_consent` is retained only as an explicit staff/internal-test bridge.
 
+Encrypted kind-3079 registration may include `campaignTargetTypes`, an array of
+`app_route`, `video_address`, `creator_profile`, `announcement`, and `featured_feed`.
+This describes device support,
+independently of marketing consent. Missing or malformed capabilities mean
+Following-only support. Registrations replace previous capabilities; token removal
+and stale-token cleanup remove them. Only compatible devices receive an advanced
+campaign destination; an account with no compatible devices reports
+`campaign_target_unsupported` without spending its notification allowance.
+
+Campaign destinations are `/following/new` (`app_route`), a full
+`34236:<64-hex-pubkey>:<nonempty-d-tag>` coordinate (`video_address`), or a full
+hex pubkey (`creator_profile`). Announcement and featured-feed destinations use
+canonical lowercase hyphenated UUIDs (`announcement` and `featured_feed`); the
+latter identifies a Funnelcake feed configuration. Unsupported destinations are
+rejected before FCM.
+The delivery API and final send idempotency are unchanged.
+
+Release campaigns additionally carry optional nullable `releaseEligibility`:
+`{"platform":"ios","channel":"app_store","version":"1.2.3"}`. Valid combinations
+are `ios`/`app_store`, `android`/`google_play`, and `android`/`zapstore`. Versions
+must be canonical `X.Y.Z` with decimal components from 0 through 999999, no leading
+zeroes except `0`, and no prerelease or build suffix. An invalid release constraint,
+including one with an unknown field, fails its own delivery as `permanent_failure`
+(`invalid_release_eligibility`) rather than becoming an unrestricted campaign; the
+rest of the batch is still delivered.
+
+Devices advertise `platform`, `installChannel`, and `appVersion` only inside the
+existing encrypted kind-3079 registration. All three must be valid together;
+missing, incomplete, or malformed values clear previous release metadata without
+rejecting registration. Deregistration and stale-token cleanup remove this data.
+The push service alone stores it, alongside device registrations; campaigns do
+not receive device metadata or tokens.
+
+Signed device registrations and deregistrations apply atomically in publication
+order (`created_at`) across replicas and replay. Within one author, deregistration
+wins a same-second registration tie; the lowest event ID resolves ties within the
+same operation. A subsequent same-author sign-in must use a later timestamp:
+second-resolution events cannot distinguish a same-second sign-in from replay.
+Between different authors, same-second registrations retain arrival-order behavior;
+the signed events cannot establish cross-author chronology. An old account's
+deregistration never removes an active token owned by a different account.
+
+A newer downgrade or install-channel change replaces the previous metadata.
+Signed controls older than the seven-day replay horizon or more than five minutes
+in the future are rejected without changing device state. Ordering fences survive
+deregistration and stale cleanup until the event's `created_at` plus seven days
+plus five minutes, bounding retention while covering accepted replay and clock
+skew. Their keys contain a hash of the token; values retain only the ordering
+stamp, operation, and owner pubkey, without notification tokens or release metadata.
+An unknown-token deregistration with no existing fence retains nothing. When a
+fence exists without active ownership, a newer valid deregistration advances it
+regardless of the previous author. Existing registrations gain an ordering stamp
+on their first accepted signed control event.
+
+A release campaign reaches only devices on the matching platform and install
+channel whose installed version is strictly older than the advertised release.
+Unknown or malformed metadata suppresses release delivery. If no compatible device
+is eligible, the result is `release_eligibility_unknown` when any device has unknown
+metadata, otherwise `release_not_applicable`. Destination capabilities are checked
+first and retain the separate `campaign_target_unsupported` outcome. Eligibility
+never bypasses consent, quiet hours, expiry, visit fencing, caps, or idempotency;
+even the internal-test consent bridge cannot bypass release eligibility.
+
+Cut over all push-service writers together: quiesce the old pods before enabling
+new writers, so no legacy pod can bypass ordering or leave stale metadata during
+a mixed-version rollout. This is a rollout requirement, not a deployment action
+performed by this change. Roll out this backend before mobile advertises the additional destinations, then
+enable those choices in the campaign dashboard. Validate with opted-in staff
+devices first. Provider acceptance is not confirmation of display or opening.
+
 ### Environment variables
 
 Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nesting separator (for example `redis.url` becomes `NOSTR_PUSH__REDIS__URL`).

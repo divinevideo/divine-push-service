@@ -55,6 +55,28 @@ The content field contains the NIP-44 encrypted token payload. Example plaintext
 { "token": "<platform-token>", "timezoneOffsetMinutes": -300 }
 ```
 
+Optional campaign device fields inside the encrypted payload:
+
+```json
+{
+  "token": "<platform-token>",
+  "timezoneOffsetMinutes": -300,
+  "campaignTargetTypes": ["app_route", "video_address", "creator_profile", "announcement", "featured_feed"],
+  "platform": "android",
+  "installChannel": "zapstore",
+  "appVersion": "1.2.3"
+}
+```
+
+`campaignTargetTypes` describes device navigation support independently of campaign
+consent. Missing or malformed capabilities grant Following-only delivery. A valid
+release metadata tuple is `ios`/`app_store`, `android`/`google_play`, or
+`android`/`zapstore`, with a canonical `X.Y.Z` app version (components 0–999999,
+no leading zeroes except `0`, no suffixes). These optional fields replace previous
+metadata on each registration; incomplete or invalid metadata clears it and
+suppresses release campaigns while preserving ordinary registration. Metadata
+stays in the push service and is removed with the device registration.
+
 **Note:** The exact payload structure is implementation-specific. Services define their own required fields.
 
 **Rules:**
