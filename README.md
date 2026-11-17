@@ -156,8 +156,10 @@ Release campaigns additionally carry optional nullable `releaseEligibility`:
 `{"platform":"ios","channel":"app_store","version":"1.2.3"}`. Valid combinations
 are `ios`/`app_store`, `android`/`google_play`, and `android`/`zapstore`. Versions
 must be canonical `X.Y.Z` with decimal components from 0 through 999999, no leading
-zeroes except `0`, and no prerelease or build suffix. Invalid release constraints
-fail pending-response decoding rather than becoming unrestricted campaigns.
+zeroes except `0`, and no prerelease or build suffix. An invalid release constraint,
+including one with an unknown field, fails its own delivery as `permanent_failure`
+(`invalid_release_eligibility`) rather than becoming an unrestricted campaign; the
+rest of the batch is still delivered.
 
 Devices advertise `platform`, `installChannel`, and `appVersion` only inside the
 existing encrypted kind-3079 registration. All three must be valid together;

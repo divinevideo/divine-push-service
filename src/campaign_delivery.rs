@@ -78,8 +78,10 @@ struct PendingDelivery {
     body: String,
     tap_target: TapTarget,
     expires_at: Option<String>,
+    /// Kept raw and validated in `deliver`, like `tap_target`: a constraint
+    /// this build cannot validate fails its own row instead of the batch.
     #[serde(default)]
-    release_eligibility: Option<crate::release_eligibility::ReleaseEligibility>,
+    release_eligibility: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +372,17 @@ async fn deliver(
     if !delivery.tap_target.is_supported() {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_campaign_target");
     }
+    let Ok(release) = delivery
+        .release_eligibility
+        .as_ref()
+        .map(crate::release_eligibility::ReleaseEligibility::deserialize)
+        .transpose()
+    else {
+        return refuse(
+            DeliveryStatus::PermanentFailure,
+            "invalid_release_eligibility",
+        );
+    };
 
     let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
@@ -483,7 +496,7 @@ async fn deliver(
         }
     };
 
-    let registered_tokens = if let Some(release) = &delivery.release_eligibility {
+    let registered_tokens = if let Some(release) = &release {
         match redis_store::release_eligible_tokens(&state.redis_pool, registered_tokens, release)
             .await
         {
@@ -1300,13 +1313,13 @@ mod tests {
     }
 
     fn pending_with_release(spec: serde_json::Value) -> serde_json::Result<PendingDelivery> {
-        serde_json::from_value(serde_json::json!({
-            "idempotencyKey": "release-fixture", "leaseId": "lease-fixture",
-            "campaignRevisionId": "revision-fixture", "recipientPubkey": "a".repeat(64),
-            "category": "engagement", "title": "An update is available", "body": "See the changes.",
-            "tapTarget": { "type": "app_route", "value": "/following/new" },
-            "releaseEligibility": spec,
-        }))
+        serde_json::from_value(delivery_json("release-fixture", Some(spec)))
+    }
+
+    fn release_spec(
+        spec: serde_json::Value,
+    ) -> serde_json::Result<crate::release_eligibility::ReleaseEligibility> {
+        serde_json::from_value(spec)
     }
 
     #[test]
@@ -1316,12 +1329,15 @@ mod tests {
             ("android", "google_play", "999999.999999.999999"),
             ("android", "zapstore", "0.0.0"),
         ] {
-            assert!(pending_with_release(
+            assert!(release_spec(
                 serde_json::json!({"platform":platform,"channel":channel,"version":version})
             )
             .is_ok());
         }
-        assert!(pending_with_release(serde_json::Value::Null).is_ok());
+        assert!(pending_with_release(serde_json::Value::Null)
+            .unwrap()
+            .release_eligibility
+            .is_none());
         for (platform, channel, version) in [
             ("ios", "google_play", "1.2.3"),
             ("ios", "zapstore", "1.2.3"),
@@ -1334,14 +1350,80 @@ mod tests {
             ("ios", "app_store", "1000000.2.3"),
             ("ios", "app_store", " 1.2.3"),
         ] {
+            let spec = serde_json::json!({"platform":platform,"channel":channel,"version":version});
             assert!(
-                pending_with_release(
-                    serde_json::json!({"platform":platform,"channel":channel,"version":version})
-                )
-                .is_err(),
+                release_spec(spec.clone()).is_err(),
                 "accepted {platform}/{channel}/{version}"
             );
+            assert!(
+                pending_with_release(spec).is_ok(),
+                "{platform}/{channel}/{version} must fail its own row, not the batch decode"
+            );
         }
+    }
+
+    #[test]
+    fn one_unvalidatable_release_constraint_does_not_fail_the_batch_decode() {
+        let mut rows = vec![delivery_json(
+            "valid",
+            Some(serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3"})),
+        )];
+        for spec in [
+            serde_json::json!({"platform":"android","channel":"new_store","version":"1.2.3"}),
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3-beta"}),
+            serde_json::json!({"platform":"ios","channel":"app_store","version":"1.2.3","minVersion":"1.0.0"}),
+            serde_json::json!("ios"),
+        ] {
+            rows.push(delivery_json("invalid", Some(spec)));
+        }
+        let parsed: PendingResponse = serde_json::from_value(serde_json::json!({
+            "deliveries": rows, "leaseSeconds": 300,
+        }))
+        .expect("an invalid release constraint must not fail the batch");
+        assert_eq!(parsed.deliveries.len(), 5);
+    }
+
+    fn delivery_json(key: &str, release: Option<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "idempotencyKey": key, "leaseId": "lease-fixture",
+            "campaignRevisionId": "revision-fixture", "recipientPubkey": "a".repeat(64),
+            "category": "engagement", "title": "An update is available", "body": "See the changes.",
+            "tapTarget": { "type": "app_route", "value": "/following/new" },
+            "releaseEligibility": release,
+        })
+    }
+
+    #[tokio::test]
+    async fn invalid_release_constraint_fails_only_its_row_without_sending() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (base, _) = registered_delivery(&pool, "release-invalid").await;
+        let mut pending = pending_with_release(
+            serde_json::json!({"platform":"android","channel":"new_store","version":"1.2.3"}),
+        )
+        .unwrap();
+        pending.idempotency_key = base.idempotency_key;
+        pending.recipient_pubkey = base.recipient_pubkey;
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool.clone(), sender.clone());
+        let result = deliver(
+            &state,
+            &pending,
+            Timestamp::now().as_secs() as i64,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("invalid_release_eligibility")
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        assert_eq!(
+            claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
+            -2
+        );
     }
 
     #[tokio::test]
