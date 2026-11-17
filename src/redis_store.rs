@@ -357,15 +357,11 @@ pub(crate) async fn apply_device_deregistration(
     apply_ordered_device_control(pool, event, token, None).await
 }
 
-async fn apply_ordered_device_control(
-    pool: &RedisPool,
-    event: &nostr_sdk::Event,
-    token: &str,
-    metadata: Option<serde_json::Value>,
-) -> Result<bool> {
-    // This deployment uses one Redis instance, as do the notify-list scripts.
-    // All ownership, ordering and metadata changes execute in one atomic script.
-    const SCRIPT: &str = r#"
+// This deployment uses one Redis instance, as do the notify-list scripts.
+// All ownership, ordering and metadata changes execute in one atomic script.
+static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
         local incoming = cjson.decode(ARGV[1])
         local token = ARGV[2]
         local owner = redis.call('HGET', KEYS[2], token)
@@ -403,7 +399,16 @@ async fn apply_ordered_device_control(
         end
         redis.call('SET', KEYS[1], cjson.encode({at=incoming.at, id=incoming.id, owner=incoming.owner}))
         return 1
-    "#;
+    "#,
+    )
+});
+
+async fn apply_ordered_device_control(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    token: &str,
+    metadata: Option<serde_json::Value>,
+) -> Result<bool> {
     let incoming = serde_json::json!({
         // Fixed-width decimal preserves the full u64 order in Lua without f64 rounding.
         "at": format!("{:020}", event.created_at.as_secs()),
@@ -414,7 +419,7 @@ async fn apply_ordered_device_control(
         .get()
         .await
         .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
-    let applied: i64 = redis::Script::new(SCRIPT)
+    let applied: i64 = DEVICE_CONTROL
         .key(format!(
             "device_registration_order:{}",
             blake3::hash(token.as_bytes()).to_hex()
