@@ -180,6 +180,7 @@ results influence work.
 - `user_tokens:{pubkey}` - Set of FCM tokens registered for a pubkey
 - `token_to_pubkey` - Hash mapping a token back to its owner
 - `token_timezone_offsets` - Hash mapping a token to the UTC offset minutes captured at registration
+- `token_campaign_target_types` - Hash of per-device campaign destination capabilities from encrypted kind 3079; missing means Following-only, independently of account consent
 - `stale_tokens` - Sorted set scored by the last time a token was known good, for cleanup. Written at registration and again on every delivered push, so the sweep means "inactive" rather than "registered long ago". The refresh uses `ZADD XX GT`: `XX` so a token deregistered mid-send is not resurrected as an owner-less member, `GT` so a replica's clock cannot pull a live token toward the sweep
 - `user_preferences:{pubkey}` - User's notification preferences (JSON)
 - `campaign_consent:{pubkey}` - Explicit campaign opt-in from kind 3083; missing means false

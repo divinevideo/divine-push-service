@@ -26,6 +26,7 @@ const STALE_TOKENS_ZSET: &str = "stale_tokens";
 const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
 const TOKEN_TIMEZONE_NAMES_HASH: &str = "token_timezone_names";
 const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
+const TOKEN_CAMPAIGN_TARGET_TYPES_HASH: &str = "token_campaign_target_types";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 const USER_TOKENS_PREFIX: &str = "user_tokens:";
 
@@ -163,7 +164,39 @@ pub async fn all_registered_pubkeys(pool: &RedisPool) -> Result<Vec<String>> {
     Ok(pubkeys.into_iter().collect())
 }
 
-/// Adds or updates a single device token for a pubkey
+/// Following campaigns are supported by legacy devices. Other destinations
+/// require an explicit per-device capability. Corrupt metadata grants nothing.
+pub async fn campaign_capable_tokens(
+    pool: &RedisPool,
+    tokens: Vec<(String, Option<i32>)>,
+    target_type: &str,
+) -> Result<Vec<(String, Option<i32>)>> {
+    if target_type == "app_route" || tokens.is_empty() {
+        return Ok(tokens);
+    }
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let values: Vec<Option<String>> = redis::cmd("HMGET")
+        .arg(TOKEN_CAMPAIGN_TARGET_TYPES_HASH)
+        .arg(tokens.iter().map(|(token, _)| token).collect::<Vec<_>>())
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(tokens
+        .into_iter()
+        .zip(values)
+        .filter_map(|(token, value)| {
+            let supported = value
+                .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+                .is_some_and(|targets| targets.iter().any(|target| target == target_type));
+            supported.then_some(token)
+        })
+        .collect())
+}
+
+/// Adds or updates a single device token for a pubkey.
 pub async fn add_or_update_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> Result<()> {
     add_or_update_token_with_timezone(pool, pubkey, token, None).await
 }
@@ -185,6 +218,26 @@ pub async fn add_or_update_token_with_timezone_name(
     token: &str,
     timezone_offset_minutes: Option<i32>,
     timezone: Option<&str>,
+) -> Result<()> {
+    add_or_update_token_with_campaign_targets(
+        pool,
+        pubkey,
+        token,
+        timezone_offset_minutes,
+        timezone,
+        None,
+    )
+    .await
+}
+
+/// Atomically replaces a device's registration, timezone and campaign capabilities.
+pub async fn add_or_update_token_with_campaign_targets(
+    pool: &RedisPool,
+    pubkey: &PublicKey,
+    token: &str,
+    timezone_offset_minutes: Option<i32>,
+    timezone: Option<&str>,
+    campaign_target_types: Option<&[String]>,
 ) -> Result<()> {
     let now_timestamp = Timestamp::now().as_secs();
     let pubkey_hex = pubkey.to_hex();
@@ -244,6 +297,24 @@ pub async fn add_or_update_token_with_timezone_name(
         }
     }
 
+    match campaign_target_types {
+        Some(targets) => {
+            let targets: Vec<&str> = ["app_route", "video_address", "creator_profile"]
+                .into_iter()
+                .filter(|target| targets.iter().any(|value| value == target))
+                .collect();
+            pipe.hset(
+                TOKEN_CAMPAIGN_TARGET_TYPES_HASH,
+                token,
+                serde_json::to_string(&targets)
+                    .map_err(|e| ServiceError::Internal(format!("Campaign capabilities: {e}")))?,
+            );
+        }
+        None => {
+            pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
+        }
+    }
+
     let _result = pipe
         .query_async::<Value>(&mut *conn)
         .await
@@ -282,10 +353,10 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
                 .zrem(STALE_TOKENS_ZSET, token) // Remove from stale tracking
                 .hdel(TOKEN_TO_PUBKEY_HASH, token) // Remove from token->pubkey map
                 .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token)
-                .hdel(TOKEN_TIMEZONE_NAMES_HASH, token);
+                .hdel(TOKEN_TIMEZONE_NAMES_HASH, token)
+                .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
 
-            let _result: RedisResult<(usize, usize, usize, usize, usize)> =
-                pipe.query_async(&mut *conn).await;
+            let _result: RedisResult<Value> = pipe.query_async(&mut *conn).await;
             _result.map(|_| ()).map_err(ServiceError::Redis)?;
             Ok(true)
         }
@@ -532,6 +603,7 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
     pipe.hdel(TOKEN_TO_PUBKEY_HASH, &stale_tokens);
     pipe.hdel(TOKEN_TIMEZONE_OFFSETS_HASH, &stale_tokens);
     pipe.hdel(TOKEN_TIMEZONE_NAMES_HASH, &stale_tokens);
+    pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, &stale_tokens);
 
     // 3c. Remove tokens from individual user sets
     let mut actual_removed_count = 0;

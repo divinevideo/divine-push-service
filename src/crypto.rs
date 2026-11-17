@@ -34,6 +34,29 @@ pub struct TokenPayload {
     pub token: String,
     #[serde(rename = "timezoneOffsetMinutes", default)]
     pub timezone_offset_minutes: Option<i32>,
+    /// Optional device support, independent of the account's campaign consent.
+    #[serde(
+        rename = "campaignTargetTypes",
+        default,
+        deserialize_with = "campaign_target_types"
+    )]
+    pub campaign_target_types: Option<Vec<String>>,
+}
+
+fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_array()
+        .filter(|values| values.len() <= 16)
+        .map(|values| {
+            ["app_route", "video_address", "creator_profile"]
+                .into_iter()
+                .filter(|target| values.iter().any(|value| value.as_str() == Some(target)))
+                .map(str::to_string)
+                .collect()
+        }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

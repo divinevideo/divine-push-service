@@ -29,6 +29,24 @@ struct TapTarget {
     value: String,
 }
 
+impl TapTarget {
+    fn is_supported(&self) -> bool {
+        match self.target_type.as_str() {
+            "app_route" => self.value == "/following/new",
+            "creator_profile" => self.value.len() == 64 && PublicKey::from_hex(&self.value).is_ok(),
+            "video_address" => {
+                let mut parts = self.value.splitn(3, ':');
+                parts.next() == Some("34236")
+                    && parts
+                        .next()
+                        .is_some_and(|key| key.len() == 64 && PublicKey::from_hex(key).is_ok())
+                    && parts.next().is_some_and(|d_tag| !d_tag.is_empty())
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingDelivery {
@@ -340,6 +358,9 @@ async fn deliver(
     if is_expired(delivery.expires_at.as_deref(), now) {
         return refuse(DeliveryStatus::Suppressed, "campaign_expired");
     }
+    if !delivery.tap_target.is_supported() {
+        return refuse(DeliveryStatus::PermanentFailure, "invalid_campaign_target");
+    }
 
     let Ok(recipient) = PublicKey::from_str(&delivery.recipient_pubkey) else {
         return refuse(DeliveryStatus::PermanentFailure, "invalid_recipient_pubkey");
@@ -434,6 +455,24 @@ async fn deliver(
         release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
         return refuse(DeliveryStatus::PermanentFailure, "no_device");
     }
+
+    let registered_tokens = match redis_store::campaign_capable_tokens(
+        &state.redis_pool,
+        registered_tokens,
+        &delivery.tap_target.target_type,
+    )
+    .await
+    {
+        Ok(tokens) if !tokens.is_empty() => tokens,
+        Ok(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::Suppressed, "campaign_target_unsupported");
+        }
+        Err(_) => {
+            release_claim(state, &claim, &owner, &delivery.idempotency_key).await;
+            return refuse(DeliveryStatus::RetryableFailure, "capability_lookup_failed");
+        }
+    };
 
     let mut tokens = Vec::new();
     let mut earliest_retry_after: Option<String> = None;
@@ -1086,6 +1125,101 @@ mod tests {
             },
             expires_at: expires_at.map(str::to_string),
         }
+    }
+
+    #[tokio::test]
+    async fn campaign_with_an_unsupported_target_is_never_sent() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, _) = registered_delivery(&pool, "invalid-target").await;
+        pending.tap_target.value = "/not-a-campaign-route".into();
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool, sender.clone());
+        let result = deliver(
+            &state,
+            &pending,
+            Timestamp::now().as_secs() as i64,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.reason.as_deref(), Some("invalid_campaign_target"));
+        assert!(sender.get_sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn campaign_video_does_not_interrupt_a_legacy_device() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, _) = registered_delivery(&pool, "legacy-video").await;
+        pending.tap_target = TapTarget {
+            target_type: "video_address".into(),
+            value: format!("34236:{}:clip", pending.recipient_pubkey),
+        };
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool.clone(), sender.clone());
+        let result = deliver(
+            &state,
+            &pending,
+            Timestamp::now().as_secs() as i64,
+            TEST_LEASE_SECS,
+        )
+        .await;
+        assert_eq!(result.status, DeliveryStatus::Suppressed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("campaign_target_unsupported")
+        );
+        assert!(sender.get_sent_messages().is_empty());
+        assert_eq!(
+            claim_ttl(&pool, &dedup_key(&pending.idempotency_key)).await,
+            -2
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_profile_reaches_only_capable_devices_and_dedupes_reoffers() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let (mut pending, legacy_token) = registered_delivery(&pool, "mixed-profile").await;
+        let recipient = PublicKey::from_str(&pending.recipient_pubkey).unwrap();
+        let capable_token = format!("capable-{}", pending.recipient_pubkey);
+        redis_store::add_or_update_token(&pool, &recipient, &capable_token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg("token_campaign_target_types")
+            .arg(&capable_token)
+            .arg(r#"["app_route","video_address","creator_profile"]"#)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        pending.tap_target = TapTarget {
+            target_type: "creator_profile".into(),
+            value: Keys::generate().public_key().to_hex(),
+        };
+        let sender = MockFcmSender::new();
+        let state = sending_state(pool, sender.clone());
+        let now = Timestamp::now().as_secs() as i64;
+        assert_eq!(
+            deliver(&state, &pending, now, TEST_LEASE_SECS).await.status,
+            DeliveryStatus::Delivered
+        );
+        assert_eq!(
+            deliver(&state, &pending, now, TEST_LEASE_SECS)
+                .await
+                .reason
+                .as_deref(),
+            Some("already_delivered")
+        );
+        let sent = sender.get_sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, capable_token);
+        assert_ne!(sent[0].0, legacy_token);
     }
 
     #[test]

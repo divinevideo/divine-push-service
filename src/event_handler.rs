@@ -323,12 +323,13 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
         );
     }
 
-    match redis_store::add_or_update_token_with_timezone_name(
+    match redis_store::add_or_update_token_with_campaign_targets(
         &state.redis_pool,
         &event.pubkey,
         fcm_token,
         timezone_offset_minutes,
         token_payload.timezone.as_deref(),
+        token_payload.campaign_target_types.as_deref(),
     )
     .await
     {
@@ -2846,6 +2847,85 @@ mod tests {
             .tag(Tag::public_key(service_keys.public_key()))
             .sign_with_keys(user_keys)
             .expect("test registration should sign")
+    }
+
+    #[tokio::test]
+    async fn registration_replaces_campaign_capabilities_and_removes_them_on_deregistration() {
+        let Some(pool) = test_redis_pool().await else {
+            return;
+        };
+        let user = Keys::generate();
+        let service = Keys::generate();
+        let token = format!("registration-capabilities-{}", user.public_key().to_hex());
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.crypto_service = Some(CryptoService::new(service.clone()));
+        let event = encrypted_registration_event(
+            &user,
+            &service,
+            serde_json::json!({
+                "token": token, "campaignTargetTypes": ["app_route", "video_address", "creator_profile", "unknown"]
+            }),
+        );
+        handle_registration(&state, &event).await.unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg("token_campaign_target_types")
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&stored.expect("capabilities must be stored"))
+                .unwrap(),
+            vec!["app_route", "video_address", "creator_profile"]
+        );
+        drop(conn);
+
+        let event =
+            encrypted_registration_event(&user, &service, serde_json::json!({"token": token}));
+        handle_registration(&state, &event).await.unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg("token_campaign_target_types")
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, None,
+            "a legacy registration must clear stale capabilities"
+        );
+        drop(conn);
+        handle_registration(
+            &state,
+            &encrypted_registration_event(
+                &user,
+                &service,
+                serde_json::json!({
+                    "token": token, "campaignTargetTypes": ["creator_profile"]
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        handle_deregistration(
+            &state,
+            &encrypted_deregistration_event(&user, &service, &token),
+        )
+        .await
+        .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg("token_campaign_target_types")
+            .arg(&token)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
     }
 
     /// The offset is optional and only campaigns read it, so a malformed value

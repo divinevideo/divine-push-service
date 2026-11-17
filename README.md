@@ -135,6 +135,23 @@ Optional. When enabled, the service polls the campaign tool's internal delivery 
 
 It is off by default, and even when enabled it does not poll unless a safe HTTPS `api_base_url` and both Access credentials are set. Normal delivery requires an explicit `campaignsEnabled` kind-3083 preference and a valid device UTC offset from kind 3079, and enforces 21:00–06:59 recipient-local quiet hours. `allow_unverified_consent` is retained only as an explicit staff/internal-test bridge.
 
+Encrypted kind-3079 registration may include `campaignTargetTypes`, an array of
+`app_route`, `video_address`, and `creator_profile`. This describes device support,
+independently of marketing consent. Missing or malformed capabilities mean
+Following-only support. Registrations replace previous capabilities; token removal
+and stale-token cleanup remove them. Only compatible devices receive a video or
+profile campaign; an account with no compatible devices reports
+`campaign_target_unsupported` without spending its notification allowance.
+
+Campaign destinations are `/following/new` (`app_route`), a full
+`34236:<64-hex-pubkey>:<nonempty-d-tag>` coordinate (`video_address`), or a full
+hex pubkey (`creator_profile`). Unsupported destinations are rejected before FCM.
+The delivery API and final send idempotency are unchanged.
+
+Roll out this backend before mobile advertises the additional destinations, then
+enable those choices in the campaign dashboard. Validate with opted-in staff
+devices first. Provider acceptance is not confirmation of display or opening.
+
 ### Environment variables
 
 Any setting can be overridden with the `NOSTR_PUSH__` prefix and `__` as the nesting separator (for example `redis.url` becomes `NOSTR_PUSH__REDIS__URL`).
