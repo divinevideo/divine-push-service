@@ -727,6 +727,19 @@ impl Settings {
             ));
         }
 
+        // The bypass skips the kind 3083 consent and quiet-hours checks for
+        // every recipient, so it is only safe narrowed to known staff. An
+        // empty allowlist means "no restriction", which would let a campaign
+        // reach every registered device whatever its owner chose.
+        if self.campaign_delivery.allow_unverified_consent
+            && self.service.allowed_pubkeys.is_empty()
+        {
+            return Err(ConfigError::Message(
+                "campaign_delivery.allow_unverified_consent requires a non-empty service.allowed_pubkeys: without it the bypass would ignore campaign consent and quiet hours for every registered device"
+                    .to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -1054,5 +1067,28 @@ mod tests {
 
         settings.service.coalesce_flush_timeout_secs = default_coalesce_flush_timeout();
         assert!(settings.validate().is_ok());
+    }
+    #[test]
+    fn test_unverified_campaign_consent_requires_a_recipient_allowlist() {
+        let mut settings = load_runtime_settings("settings.yaml");
+        settings.campaign_delivery.allow_unverified_consent = true;
+        settings.service.allowed_pubkeys = Vec::new();
+        assert!(
+            settings.validate().is_err(),
+            "the consent bypass with no allowlist would reach every registered device"
+        );
+
+        settings.service.allowed_pubkeys = vec!["a".repeat(64)];
+        assert!(
+            settings.validate().is_ok(),
+            "the bypass narrowed to an allowlist is the supported staff bridge"
+        );
+
+        settings.campaign_delivery.allow_unverified_consent = false;
+        settings.service.allowed_pubkeys = Vec::new();
+        assert!(
+            settings.validate().is_ok(),
+            "normal delivery needs no allowlist"
+        );
     }
 }
