@@ -247,54 +247,16 @@ pub async fn add_or_update_token_with_timezone(
 }
 
 /// Store device timezone and offset together with the registration.
+///
+/// Clears campaign capabilities and release metadata: only signed kind-3079
+/// registrations carry them, through `apply_device_registration`, which is
+/// also the only writer that honours the device ordering fence.
 pub async fn add_or_update_token_with_timezone_name(
     pool: &RedisPool,
     pubkey: &PublicKey,
     token: &str,
     timezone_offset_minutes: Option<i32>,
     timezone: Option<&str>,
-) -> Result<()> {
-    add_or_update_token_with_campaign_targets(
-        pool,
-        pubkey,
-        token,
-        timezone_offset_minutes,
-        timezone,
-        None,
-    )
-    .await
-}
-
-/// Atomically replaces a device's registration, timezone and campaign capabilities.
-pub async fn add_or_update_token_with_campaign_targets(
-    pool: &RedisPool,
-    pubkey: &PublicKey,
-    token: &str,
-    timezone_offset_minutes: Option<i32>,
-    timezone: Option<&str>,
-    campaign_target_types: Option<&[String]>,
-) -> Result<()> {
-    add_or_update_token_with_device_metadata(
-        pool,
-        pubkey,
-        token,
-        timezone_offset_minutes,
-        timezone,
-        campaign_target_types,
-        None,
-    )
-    .await
-}
-
-/// Atomically replaces registration metadata; missing fields clear previous values.
-pub async fn add_or_update_token_with_device_metadata(
-    pool: &RedisPool,
-    pubkey: &PublicKey,
-    token: &str,
-    timezone_offset_minutes: Option<i32>,
-    timezone: Option<&str>,
-    campaign_target_types: Option<&[String]>,
-    release_metadata: Option<&crate::release_eligibility::DeviceReleaseMetadata>,
 ) -> Result<()> {
     let now_timestamp = Timestamp::now().as_secs();
     let pubkey_hex = pubkey.to_hex();
@@ -354,43 +316,8 @@ pub async fn add_or_update_token_with_device_metadata(
         }
     }
 
-    match campaign_target_types {
-        Some(targets) => {
-            let targets: Vec<&str> = [
-                "app_route",
-                "video_address",
-                "creator_profile",
-                "announcement",
-                "featured_feed",
-            ]
-            .into_iter()
-            .filter(|target| targets.iter().any(|value| value == target))
-            .collect();
-            pipe.hset(
-                TOKEN_CAMPAIGN_TARGET_TYPES_HASH,
-                token,
-                serde_json::to_string(&targets)
-                    .map_err(|e| ServiceError::Internal(format!("Campaign capabilities: {e}")))?,
-            );
-        }
-        None => {
-            pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token);
-        }
-    }
-
-    match release_metadata {
-        Some(metadata) => {
-            pipe.hset(
-                TOKEN_RELEASE_METADATA_HASH,
-                token,
-                serde_json::to_string(metadata)
-                    .map_err(|e| ServiceError::Internal(format!("Device release metadata: {e}")))?,
-            );
-        }
-        None => {
-            pipe.hdel(TOKEN_RELEASE_METADATA_HASH, token);
-        }
-    }
+    pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
+        .hdel(TOKEN_RELEASE_METADATA_HASH, token);
 
     let _result = pipe
         .query_async::<Value>(&mut *conn)
