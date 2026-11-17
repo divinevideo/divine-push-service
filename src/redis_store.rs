@@ -328,8 +328,9 @@ pub async fn add_or_update_token_with_timezone_name(
 }
 
 /// Applies signed registration state in event order, atomically across replicas.
-/// Equal timestamps choose the lowest event ID, matching the notify-list policy.
-/// Ordering tombstones survive removal and cleanup; their keys hash the token so
+/// Within one author, equal timestamps prefer deregistration, then the lowest
+/// event ID within one operation. Cross-author ties retain registration arrival order.
+/// Ordering tombstones survive removal and cleanup within the replay window; their keys hash the token so
 /// deregistration does not retain the token itself or device metadata.
 pub(crate) async fn apply_device_registration(
     pool: &RedisPool,
@@ -364,9 +365,10 @@ pub(crate) enum DeviceControlOutcome {
     Applied { previous_owner: Option<String> },
     /// An event at or after this one, by `created_at` then event ID, already applied.
     Superseded,
+    /// Outside the accepted replay window or more than five minutes ahead.
+    InvalidTimestamp,
     /// A deregistration from a pubkey that does not own the token. `owner` is the
-    /// current owner, or `None` when the token is unregistered and another
-    /// pubkey applied its last control event.
+    /// current owner, or `None` when there is no device state or fence to remove.
     NotOwner { owner: Option<String> },
 }
 
@@ -379,17 +381,23 @@ static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
         local token = ARGV[2]
         local owner = redis.call('HGET', KEYS[2], token)
         local stored = redis.call('GET', KEYS[1])
+        local operation = incoming.metadata == cjson.null and 'deregister' or 'register'
+        if operation == 'deregister' then
+            if owner and owner ~= incoming.owner then return {2, owner} end
+            if not owner and not stored then return {2, ''} end
+        end
         if stored then
             stored = cjson.decode(stored)
-            if incoming.at < stored.at or
-                (incoming.at == stored.at and incoming.id >= stored.id) then
-                return {0, ''}
-            end
-        end
-        if incoming.metadata == cjson.null then
-            if (owner and owner ~= incoming.owner) or
-                (not owner and stored and stored.owner ~= incoming.owner) then
-                return {2, owner or ''}
+            if incoming.at < stored.at then return {0, ''} end
+            if incoming.at == stored.at and incoming.owner == stored.owner then
+                -- Legacy fences predate operation storage: absent active state
+                -- conservatively represents a sign-out, preserving its privacy fence.
+                local previous_operation = stored.operation or (owner and 'register' or 'deregister')
+                if operation ~= previous_operation then
+                    if operation == 'register' then return {0, ''} end
+                elseif incoming.id >= stored.id then
+                    return {0, ''}
+                end
             end
         end
         if owner then
@@ -410,7 +418,7 @@ static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
                 end
             end
         end
-        redis.call('SET', KEYS[1], cjson.encode({at=incoming.at, id=incoming.id, owner=incoming.owner}))
+        redis.call('SET', KEYS[1], cjson.encode({at=incoming.at, id=incoming.id, owner=incoming.owner, operation=operation}), 'EXAT', incoming.expires_at)
         return {1, owner or ''}
     "#,
     )
@@ -422,11 +430,18 @@ async fn apply_ordered_device_control(
     token: &str,
     metadata: Option<serde_json::Value>,
 ) -> Result<DeviceControlOutcome> {
+    let now = Timestamp::now().as_secs();
+    let at = event.created_at.as_secs();
+    let horizon = crate::event_handler::REPLAY_HORIZON_SECS;
+    let skew = crate::event_handler::CONTROL_EVENT_FUTURE_SKEW_SECS;
+    if at > now.saturating_add(skew) || at < now.saturating_sub(horizon) {
+        return Ok(DeviceControlOutcome::InvalidTimestamp);
+    }
     let incoming = serde_json::json!({
         // Fixed-width decimal preserves the full u64 order in Lua without f64 rounding.
         "at": format!("{:020}", event.created_at.as_secs()),
         "id": event.id.to_hex(), "owner": event.pubkey.to_hex(),
-        "now": Timestamp::now().as_secs(), "metadata": metadata,
+        "now": now, "metadata": metadata, "expires_at": at + horizon + skew,
     });
     let mut conn = pool
         .get()

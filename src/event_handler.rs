@@ -51,6 +51,8 @@ pub const NOTIFY_LIST_D_TAG: &str = "notify";
 
 // Replay horizon: ignore events older than this
 const REPLAY_HORIZON_DAYS: u64 = 7;
+pub(crate) const REPLAY_HORIZON_SECS: u64 = REPLAY_HORIZON_DAYS * 24 * 60 * 60;
+pub(crate) const CONTROL_EVENT_FUTURE_SKEW_SECS: u64 = 300;
 
 /// Whether this event is a notify list, which is exempt from the replay horizon.
 ///
@@ -107,7 +109,7 @@ fn is_event_for_service(event: &Event, service_pubkey: &PublicKey) -> bool {
 pub fn is_event_too_old(event: &Event) -> bool {
     use std::time::Duration;
 
-    let horizon = Timestamp::now() - Duration::from_secs(REPLAY_HORIZON_DAYS * 24 * 60 * 60);
+    let horizon = Timestamp::now() - Duration::from_secs(REPLAY_HORIZON_SECS);
     event.created_at < horizon
 }
 
@@ -347,6 +349,9 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
             }
             info!(event_id = %event.id, pubkey = %event.pubkey, "Registered/Updated encrypted token");
         }
+        Ok(redis_store::DeviceControlOutcome::InvalidTimestamp) => {
+            warn!(event_id = %event.id, pubkey = %event.pubkey, "Rejected device registration outside accepted time window");
+        }
         // Registrations are never ownership-checked, so only superseded ones land here.
         Ok(
             redis_store::DeviceControlOutcome::Superseded
@@ -427,6 +432,9 @@ async fn handle_deregistration(state: &AppState, event: &Event) -> Result<()> {
         }
         redis_store::DeviceControlOutcome::Superseded => {
             debug!(event_id = %event.id, "Ignored superseded device deregistration");
+        }
+        redis_store::DeviceControlOutcome::InvalidTimestamp => {
+            warn!(event_id = %event.id, pubkey = %event.pubkey, "Rejected device deregistration outside accepted time window");
         }
     }
 
@@ -2733,8 +2741,10 @@ mod tests {
     }
 
     fn next_device_control_timestamp() -> Timestamp {
-        static NEXT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1_800_000_000);
+        static NEXT: std::sync::LazyLock<std::sync::atomic::AtomicU64> =
+            std::sync::LazyLock::new(|| {
+                std::sync::atomic::AtomicU64::new(Timestamp::now().as_secs() - 3600)
+            });
         Timestamp::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
@@ -2808,8 +2818,10 @@ mod tests {
         );
         assert_eq!(
             deregister(signed(KIND_DEREGISTRATION, &a)).await,
-            NotOwner { owner: None },
-            "an unregistered token last controlled by another pubkey is not a live ownership clash"
+            Applied {
+                previous_owner: None
+            },
+            "an ownerless token's newer deregistration advances the existing fence"
         );
     }
 
@@ -3045,6 +3057,287 @@ mod tests {
         assert_eq!(stored, None);
     }
 
+    fn signed_device_control(
+        user: &Keys,
+        service: &Keys,
+        token: &str,
+        kind: u16,
+        at: u64,
+    ) -> Event {
+        let encrypted = nostr_sdk::nips::nip44::encrypt(
+            user.secret_key(),
+            &service.public_key(),
+            serde_json::json!({"token": token}).to_string(),
+            nostr_sdk::nips::nip44::Version::V2,
+        )
+        .unwrap();
+        EventBuilder::new(Kind::from(kind), encrypted)
+            .custom_created_at(Timestamp::from(at))
+            .sign_with_keys(user)
+            .unwrap()
+    }
+
+    async fn control_fixture() -> (redis_store::RedisPool, AppState, Keys, Keys, Keys, String) {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let a = Keys::generate();
+        let b = Keys::generate();
+        let service = Keys::generate();
+        let token = format!("synthetic-control-safety-{}", a.public_key().to_hex());
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+        );
+        state.crypto_service = Some(CryptoService::new(service.clone()));
+        (pool, state, a, b, service, token)
+    }
+
+    fn order_key(token: &str) -> String {
+        format!(
+            "device_registration_order:{}",
+            blake3::hash(token.as_bytes()).to_hex()
+        )
+    }
+
+    #[tokio::test]
+    async fn control_safety_cross_account_same_second_switch_keeps_new_registration() {
+        let (pool, state, a, b, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        handle_registration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_REGISTRATION, now - 1),
+        )
+        .await
+        .unwrap();
+        let (deregister, register) = (0..256)
+            .find_map(|_| {
+                let deregister =
+                    signed_device_control(&a, &service, &token, KIND_DEREGISTRATION, now);
+                let register = signed_device_control(&b, &service, &token, KIND_REGISTRATION, now);
+                (register.id > deregister.id).then_some((deregister, register))
+            })
+            .expect("synthetic signed pair with reg ID above dereg ID");
+        assert!(deregister.verify().is_ok() && register.verify().is_ok());
+        handle_deregistration(&state, &deregister).await.unwrap();
+        handle_registration(&state, &register).await.unwrap();
+        assert_eq!(
+            redis_store::get_tokens_for_pubkey(&pool, &b.public_key())
+                .await
+                .unwrap(),
+            vec![token]
+        );
+    }
+
+    #[tokio::test]
+    async fn control_safety_same_author_signout_wins_same_second_and_next_second_signin_succeeds() {
+        let (pool, state, a, _, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        let (register, deregister) = (0..256)
+            .find_map(|_| {
+                let register = signed_device_control(&a, &service, &token, KIND_REGISTRATION, now);
+                let deregister =
+                    signed_device_control(&a, &service, &token, KIND_DEREGISTRATION, now);
+                (deregister.id > register.id).then_some((register, deregister))
+            })
+            .expect("synthetic signed pair with dereg ID above reg ID");
+        handle_registration(&state, &register).await.unwrap();
+        handle_deregistration(&state, &deregister).await.unwrap();
+        handle_registration(&state, &register).await.unwrap();
+        assert!(
+            redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+                .await
+                .unwrap()
+                .is_empty(),
+            "same-second sign-out wins and cannot be restored by delayed registration"
+        );
+        handle_registration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_REGISTRATION, now + 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+                .await
+                .unwrap(),
+            vec![token]
+        );
+    }
+
+    #[tokio::test]
+    async fn control_safety_legacy_ownerless_fence_is_conservatively_treated_as_signout() {
+        let (pool, state, a, _, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        let (register, delayed) = (0..256)
+            .find_map(|_| {
+                let register = signed_device_control(&a, &service, &token, KIND_REGISTRATION, now);
+                let delayed = signed_device_control(&a, &service, &token, KIND_REGISTRATION, now);
+                (delayed.id < register.id).then_some((register, delayed))
+            })
+            .expect("synthetic same-second registration with a lower ID");
+        handle_registration(&state, &register).await.unwrap();
+        redis_store::remove_token(&pool, &a.public_key(), &token)
+            .await
+            .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let raw: String = redis::cmd("GET")
+            .arg(order_key(&token))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        legacy.as_object_mut().unwrap().remove("operation");
+        let _: () = redis::cmd("SET")
+            .arg(order_key(&token))
+            .arg(legacy.to_string())
+            .arg("KEEPTTL")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        handle_registration(&state, &delayed).await.unwrap();
+        assert!(redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_safety_accepts_skew_boundary_and_rejects_expired_control_without_state() {
+        let (pool, state, a, _, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        handle_registration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_REGISTRATION, now - 7 * 86400 - 1),
+        )
+        .await
+        .unwrap();
+        assert!(redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+            .await
+            .unwrap()
+            .is_empty());
+        handle_registration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_REGISTRATION, now + 300),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+                .await
+                .unwrap(),
+            vec![token]
+        );
+    }
+
+    #[tokio::test]
+    async fn control_safety_future_signed_controls_cannot_poison_current_state() {
+        let (pool, state, a, _, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        let current = signed_device_control(&a, &service, &token, KIND_REGISTRATION, now - 1);
+        handle_registration(&state, &current).await.unwrap();
+        for kind in [KIND_REGISTRATION, KIND_DEREGISTRATION] {
+            let event = signed_device_control(&a, &service, &token, kind, now + 3600);
+            assert!(event.verify().is_ok());
+            if kind == KIND_REGISTRATION {
+                handle_registration(&state, &event).await.unwrap();
+            } else {
+                handle_deregistration(&state, &event).await.unwrap();
+            }
+            let mut conn = pool.get().await.unwrap();
+            let stored: String = redis::cmd("GET")
+                .arg(order_key(&token))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stored).unwrap()["id"],
+                current.id.to_hex(),
+                "future signed control must not replace the ordering fence"
+            );
+            assert_eq!(
+                redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+                    .await
+                    .unwrap(),
+                vec![token.clone()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn control_safety_fences_expire_from_event_time_and_unowned_noop_keeps_no_key() {
+        let (pool, state, a, _, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        handle_deregistration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_DEREGISTRATION, now),
+        )
+        .await
+        .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(order_key(&token))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            !exists,
+            "unknown deregistration must not retain an identity-bearing key"
+        );
+        drop(conn);
+        handle_registration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_REGISTRATION, now - 60),
+        )
+        .await
+        .unwrap();
+        let mut conn = pool.get().await.unwrap();
+        let expiry: i64 = redis::cmd("EXPIRETIME")
+            .arg(order_key(&token))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(expiry, (now - 60 + 7 * 86400 + 300) as i64);
+    }
+
+    #[tokio::test]
+    async fn control_safety_ownerless_fence_accepts_new_deregistration_but_active_other_owner_is_protected(
+    ) {
+        let (pool, state, a, b, service, token) = control_fixture().await;
+        let now = Timestamp::now().as_secs();
+        handle_registration(
+            &state,
+            &signed_device_control(&b, &service, &token, KIND_REGISTRATION, now - 100),
+        )
+        .await
+        .unwrap();
+        let deregister = signed_device_control(&a, &service, &token, KIND_DEREGISTRATION, now);
+        handle_deregistration(&state, &deregister).await.unwrap();
+        assert_eq!(
+            redis_store::get_tokens_for_pubkey(&pool, &b.public_key())
+                .await
+                .unwrap(),
+            vec![token.clone()]
+        );
+        redis_store::remove_token(&pool, &b.public_key(), &token)
+            .await
+            .unwrap();
+        handle_deregistration(&state, &deregister).await.unwrap();
+        handle_registration(
+            &state,
+            &signed_device_control(&a, &service, &token, KIND_REGISTRATION, now - 1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            redis_store::get_tokens_for_pubkey(&pool, &a.public_key())
+                .await
+                .unwrap()
+                .is_empty(),
+            "ownerless deregistration must fence its author's delayed older registration"
+        );
+    }
+
     #[tokio::test]
     async fn delayed_signed_registration_cannot_restore_release_or_destination_authority() {
         let pool = test_redis_pool().await.expect("Redis required");
@@ -3057,6 +3350,7 @@ mod tests {
             FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
         );
         state.crypto_service = Some(CryptoService::new(service.clone()));
+        let base = Timestamp::now().as_secs() - 1000;
         let signed = |version: &str, targets: Vec<&str>, at: u64| {
             let payload =
                 serde_json::json!({"token":token,"platform":"ios","installChannel":"app_store",
@@ -3070,7 +3364,7 @@ mod tests {
             )
             .unwrap();
             EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
-                .custom_created_at(Timestamp::from(at))
+                .custom_created_at(Timestamp::from(base + at))
                 .sign_with_keys(&user)
                 .unwrap()
         };
@@ -3159,7 +3453,7 @@ mod tests {
         )
         .unwrap();
         let deregister = EventBuilder::new(Kind::from(KIND_DEREGISTRATION), encrypted)
-            .custom_created_at(Timestamp::from(500))
+            .custom_created_at(Timestamp::from(base + 500))
             .sign_with_keys(&user)
             .unwrap();
         handle_deregistration(&state, &deregister).await.unwrap();
@@ -3206,7 +3500,7 @@ mod tests {
             serde_json::json!({"token":token,"platform":"android","installChannel":"zapstore","appVersion":"0.1.0"}).to_string(),
             nostr_sdk::nips::nip44::Version::V2).unwrap();
         let channel_change = EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
-            .custom_created_at(Timestamp::from(700))
+            .custom_created_at(Timestamp::from(base + 700))
             .sign_with_keys(&user)
             .unwrap();
         handle_registration(&state, &channel_change).await.unwrap();

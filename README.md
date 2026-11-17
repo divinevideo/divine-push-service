@@ -169,13 +169,25 @@ The push service alone stores it, alongside device registrations; campaigns do
 not receive device metadata or tokens.
 
 Signed device registrations and deregistrations apply atomically in publication
-order (`created_at`, with the lowest event ID winning a timestamp tie), across
-replicas and replay. A newer downgrade or install-channel change replaces the
-previous metadata. Ordering tombstones persist after deregistration and stale
-cleanup to prevent delayed registrations restoring removed device authority.
-Their keys contain a hash of the token; their values retain only the ordering
-stamp and owner pubkey, without notification tokens or release metadata. Existing
-registrations gain an ordering stamp on their first accepted signed control event.
+order (`created_at`) across replicas and replay. Within one author, deregistration
+wins a same-second registration tie; the lowest event ID resolves ties within the
+same operation. A subsequent same-author sign-in must use a later timestamp:
+second-resolution events cannot distinguish a same-second sign-in from replay.
+Between different authors, same-second registrations retain arrival-order behavior;
+the signed events cannot establish cross-author chronology. An old account's
+deregistration never removes an active token owned by a different account.
+
+A newer downgrade or install-channel change replaces the previous metadata.
+Signed controls older than the seven-day replay horizon or more than five minutes
+in the future are rejected without changing device state. Ordering fences survive
+deregistration and stale cleanup until the event's `created_at` plus seven days
+plus five minutes, bounding retention while covering accepted replay and clock
+skew. Their keys contain a hash of the token; values retain only the ordering
+stamp, operation, and owner pubkey, without notification tokens or release metadata.
+An unknown-token deregistration with no existing fence retains nothing. When a
+fence exists without active ownership, a newer valid deregistration advances it
+regardless of the previous author. Existing registrations gain an ordering stamp
+on their first accepted signed control event.
 
 A release campaign reaches only devices on the matching platform and install
 channel whose installed version is strictly older than the advertised release.
@@ -186,7 +198,10 @@ first and retain the separate `campaign_target_unsupported` outcome. Eligibility
 never bypasses consent, quiet hours, expiry, visit fencing, caps, or idempotency;
 even the internal-test consent bridge cannot bypass release eligibility.
 
-Roll out this backend before mobile advertises the additional destinations, then
+Cut over all push-service writers together: quiesce the old pods before enabling
+new writers, so no legacy pod can bypass ordering or leave stale metadata during
+a mixed-version rollout. This is a rollout requirement, not a deployment action
+performed by this change. Roll out this backend before mobile advertises the additional destinations, then
 enable those choices in the campaign dashboard. Validate with opted-in staff
 devices first. Provider acceptance is not confirmation of display or opening.
 
