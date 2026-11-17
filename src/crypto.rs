@@ -76,17 +76,11 @@ fn campaign_target_types<'de, D: serde::Deserializer<'de>>(
         .as_array()
         .filter(|values| values.len() <= 16 && values.iter().all(serde_json::Value::is_string))
         .map(|values| {
-            [
-                "app_route",
-                "video_address",
-                "creator_profile",
-                "announcement",
-                "featured_feed",
-            ]
-            .into_iter()
-            .filter(|target| values.iter().any(|value| value.as_str() == Some(target)))
-            .map(str::to_string)
-            .collect()
+            crate::campaign_delivery::CAMPAIGN_TARGET_TYPES
+                .into_iter()
+                .filter(|target| values.iter().any(|value| value.as_str() == Some(target)))
+                .map(str::to_string)
+                .collect()
         }))
 }
 

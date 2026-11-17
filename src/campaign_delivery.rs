@@ -22,6 +22,18 @@ use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// Destination types a device may advertise in `campaignTargetTypes`.
+///
+/// The kind-3079 parser keeps only these, and `TapTarget::is_supported`
+/// accepts only these, each through its own validator arm.
+pub(crate) const CAMPAIGN_TARGET_TYPES: [&str; 5] = [
+    "app_route",
+    "video_address",
+    "creator_profile",
+    "announcement",
+    "featured_feed",
+];
+
 #[derive(Debug, Deserialize)]
 struct TapTarget {
     #[serde(rename = "type")]
@@ -38,6 +50,11 @@ impl TapTarget {
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 && PublicKey::from_hex(key).is_ok()
         };
+        // An arm for an unlisted type stays unreachable, so devices can always
+        // register every destination this accepts.
+        if !CAMPAIGN_TARGET_TYPES.contains(&self.target_type.as_str()) {
+            return false;
+        }
         match self.target_type.as_str() {
             "app_route" => self.value == "/following/new",
             "creator_profile" => full_pubkey(&self.value),
@@ -1309,6 +1326,30 @@ mod tests {
                     valid
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_registrable_campaign_target_type_has_a_destination_validator() {
+        let pubkey = Keys::generate().public_key().to_hex();
+        for target_type in CAMPAIGN_TARGET_TYPES {
+            let value = match target_type {
+                "app_route" => "/following/new".to_string(),
+                "video_address" => format!("34236:{pubkey}:clip"),
+                "creator_profile" => pubkey.clone(),
+                "announcement" | "featured_feed" => {
+                    "5e5503da-455a-4d93-8588-620c4cb2121f".to_string()
+                }
+                other => panic!("add a sample destination for `{other}`"),
+            };
+            assert!(
+                TapTarget {
+                    target_type: target_type.into(),
+                    value
+                }
+                .is_supported(),
+                "`{target_type}` is registrable but no destination of that type is accepted"
+            );
         }
     }
 
