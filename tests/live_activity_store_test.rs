@@ -1185,18 +1185,6 @@ async fn binding_expires_with_the_activity() {
         "binding {binding} vs hash {hash}"
     );
 
-    // An update that moves the window moves the binding with the hash.
-    let mut later = r.clone();
-    later.window_ends_at += 60;
-    upsert(&pool, &x, &hex(40), &later, 101, &ev('1'), FAR_DUE_MS).await;
-    let binding = ttl(&pool, &binding_key(&r.activity_token)).await;
-    let hash = ttl(&pool, &format!("live_activity:{}", id_of(&r))).await;
-    assert!(
-        (binding - hash).abs() <= 1,
-        "binding {binding} vs hash {hash}"
-    );
-    assert!(binding > horizon, "{binding} extended past {horizon}");
-
     store::finish(&pool, &id_of(&r)).await.unwrap();
 }
 
@@ -1246,4 +1234,101 @@ async fn same_owner_rotation_and_updates_still_work() {
     );
 
     store::finish(&pool, &id_of(&rotated)).await.unwrap();
+}
+
+#[tokio::test]
+async fn update_cannot_extend_the_window() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let x = owner();
+    let fcm = hex(40);
+    let r = reg(&x, "a", &[&ev('a')]);
+    let key = format!("live_activity:{}", id_of(&r));
+    upsert(&pool, &x, &fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    let horizon = (r.window_ends_at + 2100 - now_secs()) as i64;
+
+    // Whoever holds the token sends a later window to renew the hash and binding.
+    let mut later = r.clone();
+    later.posted_at += 600;
+    later.window_ends_at += 600;
+    later.post_event_ids = vec![ev('b')];
+    later.show_first_run_note = false;
+    let new_fcm = hex(40);
+    assert_eq!(
+        upsert(&pool, &x, &new_fcm, &later, 101, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Updated
+    );
+
+    let h = hgetall(&pool, &key).await;
+    assert_eq!(h["posted_at"], r.posted_at.to_string());
+    assert_eq!(h["window_ends_at"], r.window_ends_at.to_string());
+    for k in [
+        key.clone(),
+        binding_key(&r.activity_token),
+        device_key(&x, &new_fcm),
+    ] {
+        let t = ttl(&pool, &k).await;
+        assert!(
+            (horizon - 5..=horizon).contains(&t),
+            "{k}: {t} vs {horizon}"
+        );
+    }
+    // Everything else an update carries still applies.
+    assert_eq!(h["fcm_token"], new_fcm);
+    assert_eq!(h["show_first_run_note"], "0");
+    let ids: Vec<String> = serde_json::from_str(&h["post_event_ids"]).unwrap();
+    assert_eq!(ids, vec![ev('a'), ev('b')]);
+
+    store::finish(&pool, &id_of(&r)).await.unwrap();
+}
+
+#[tokio::test]
+async fn rotation_keeps_the_original_window() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let x = owner();
+    let fcm = hex(40);
+    let first = reg(&x, "same", &[&ev('a')]);
+    upsert(&pool, &x, &fcm, &first, 100, &ev('1'), FAR_DUE_MS).await;
+    let horizon = (first.window_ends_at + 2100 - now_secs()) as i64;
+
+    let mut rotated = reg(&x, "same", &[&ev('a')]);
+    rotated.posted_at = first.posted_at + 600;
+    rotated.window_ends_at = first.window_ends_at + 600;
+    assert_eq!(
+        upsert(&pool, &x, &fcm, &rotated, 101, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Superseded {
+            previous_id: id_of(&first)
+        }
+    );
+
+    let key = format!("live_activity:{}", id_of(&rotated));
+    let h = hgetall(&pool, &key).await;
+    assert_eq!(h["posted_at"], first.posted_at.to_string());
+    assert_eq!(h["window_ends_at"], first.window_ends_at.to_string());
+    for k in [
+        key.clone(),
+        binding_key(&rotated.activity_token),
+        device_key(&x, &fcm),
+    ] {
+        let t = ttl(&pool, &k).await;
+        assert!(
+            (horizon - 5..=horizon).contains(&t),
+            "{k}: {t} vs {horizon}"
+        );
+    }
+
+    // A new post on the device is not a rotation: it takes its own window.
+    let mut other = reg(&x, "other", &[&ev('c')]);
+    other.posted_at = first.posted_at + 600;
+    other.window_ends_at = first.window_ends_at + 600;
+    upsert(&pool, &x, &fcm, &other, 102, &ev('1'), FAR_DUE_MS).await;
+    let h = hgetall(&pool, &format!("live_activity:{}", id_of(&other))).await;
+    assert_eq!(h["window_ends_at"], other.window_ends_at.to_string());
+
+    store::finish(&pool, &id_of(&other)).await.unwrap();
 }

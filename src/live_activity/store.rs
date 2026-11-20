@@ -178,9 +178,12 @@ local function displaced_or_stale()
 end
 
 if redis.call('EXISTS', key) == 1 then
-  local s = redis.call('HMGET', key, 'state', 'last_at', 'last_id', 'post_event_ids', 'fcm_hash')
+  local s = redis.call('HMGET', key, 'state', 'last_at', 'last_id', 'post_event_ids', 'fcm_hash', 'window_ends_at')
   if s[1] ~= 'active' then return {4, ''} end
   if not newer(at, eid, s[2], s[3]) then return {3, ''} end
+  -- The first registration's window is final: an update cannot renew the hash or binding.
+  if s[6] then exat = tonumber(s[6]) + 2100 end
+  if exat - 300 <= now then return {3, ''} end
   local displaced, stale = displaced_or_stale()
   if stale then return {3, ''} end
   if displaced then tombstone(displaced) end
@@ -192,7 +195,6 @@ if redis.call('EXISTS', key) == 1 then
     'fcm_token', fcm, 'fcm_hash', fcm_hash,
     'post_coordinate', reg.post_coordinate,
     'post_event_ids', merge(s[4], reg.post_event_ids),
-    'posted_at', reg.posted_at, 'window_ends_at', reg.window_ends_at,
     'show_first_run_note', reg.show_first_run_note,
     'last_at', at, 'last_id', eid)
   redis.call('EXPIREAT', key, exat)
@@ -219,34 +221,42 @@ local total = redis.call('ZCARD', JOBS)
 if prev and redis.call('ZSCORE', JOBS, prev) then total = total - 1 end
 if total >= max_total then return {6, ''} end
 
-local fields = {
-  'owner', owner, 'fcm_token', fcm, 'fcm_hash', fcm_hash,
-  'activity_token', reg.activity_token, 'post_coordinate', reg.post_coordinate,
-  'posted_at', reg.posted_at, 'window_ends_at', reg.window_ends_at,
-  'show_first_run_note', reg.show_first_run_note,
-  'last_at', at, 'last_id', eid, 'state', 'active',
-}
+local extra = {}
 local ids, score = merge(false, reg.post_event_ids), due
 local first_seen, absent = ARGV[11], '0'
+local posted, window = reg.posted_at, reg.window_ends_at
 
 if prev then
   local p = redis.call('HMGET', PREFIX .. prev, 'post_coordinate', 'first_seen_at',
-    'absent_checks', 'last_content', 'last_sent_at', 'post_event_ids')
+    'absent_checks', 'last_content', 'last_sent_at', 'post_event_ids',
+    'posted_at', 'window_ends_at')
   if p[1] == reg.post_coordinate then
-    -- Apple token rotation: the same post continues under the new token.
+    -- Apple token rotation: the same post continues under the new token, keeping
+    -- its schedule, send state and original window (so its horizon cannot move).
+    if p[8] then
+      if tonumber(p[8]) + 1800 <= now then return {3, ''} end
+      posted, window = p[7] or posted, p[8]
+      exat = tonumber(p[8]) + 2100
+    end
     first_seen = p[2] or first_seen
     absent = p[3] or absent
-    if p[4] then fields[#fields + 1] = 'last_content'; fields[#fields + 1] = p[4] end
-    if p[5] then fields[#fields + 1] = 'last_sent_at'; fields[#fields + 1] = p[5] end
+    if p[4] then extra[#extra + 1] = 'last_content'; extra[#extra + 1] = p[4] end
+    if p[5] then extra[#extra + 1] = 'last_sent_at'; extra[#extra + 1] = p[5] end
     ids = merge(p[6], reg.post_event_ids)
     score = redis.call('ZSCORE', JOBS, prev) or due
   end
   tombstone(prev)
 end
 
-for _, v in ipairs({'post_event_ids', ids, 'first_seen_at', first_seen, 'absent_checks', absent}) do
-  fields[#fields + 1] = v
-end
+local fields = {
+  'owner', owner, 'fcm_token', fcm, 'fcm_hash', fcm_hash,
+  'activity_token', reg.activity_token, 'post_coordinate', reg.post_coordinate,
+  'posted_at', posted, 'window_ends_at', window,
+  'show_first_run_note', reg.show_first_run_note,
+  'last_at', at, 'last_id', eid, 'state', 'active',
+  'post_event_ids', ids, 'first_seen_at', first_seen, 'absent_checks', absent,
+}
+for _, v in ipairs(extra) do fields[#fields + 1] = v end
 redis.call('HSET', key, unpack(fields))
 redis.call('EXPIREAT', key, exat)
 redis.call('ZADD', JOBS, score, id)
@@ -372,8 +382,10 @@ async fn conn(
 
 /// Store or update an `active` registration and schedule it.
 ///
-/// `first_due_ms` is used only when a new schedule is created. A registration
-/// whose `window_ends_at` + 1800 s has passed is `Stale`. Caps count live
+/// `first_due_ms` is used only when a new schedule is created. An update, or a
+/// token rotation for the same post, keeps the first registration's `posted_at`
+/// and `window_ends_at`, so the hash's and binding's expiry can never be renewed.
+/// A registration whose `window_ends_at` + 1800 s has passed is `Stale`. Caps count live
 /// activities: per owner from `live_activity_owner:{owner}`, in total from
 /// `ZCARD live_activity_jobs`. A superseded activity (same owner and device)
 /// frees its slot for its replacement.
