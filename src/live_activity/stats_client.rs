@@ -127,8 +127,11 @@ impl StatsClient {
             group_chunks[g].push(idx);
         }
 
-        let results: Vec<Result<BulkStats, StatsError>> = stream::iter(chunks.iter())
-            .map(|ids| self.bulk_request(ids))
+        // Each future owns its chunk. A closure borrowing `&Vec<String>` makes
+        // rustc unable to prove this future `Send` for every lifetime, which
+        // keeps the worker that awaits it off `tokio::spawn`.
+        let results: Vec<Result<BulkStats, StatsError>> = stream::iter(chunks)
+            .map(|ids| async move { self.bulk_request(&ids).await })
             .buffered(self.max_concurrency)
             .collect()
             .await;

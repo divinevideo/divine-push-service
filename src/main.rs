@@ -14,6 +14,8 @@ use divine_push_service::config;
 use divine_push_service::error::Result;
 use divine_push_service::event_handler;
 use divine_push_service::health::{CriticalTask, OnReturn, TaskHealth, TaskTracker};
+use divine_push_service::live_activity;
+use divine_push_service::live_activity::stats_client::StatsClient;
 use divine_push_service::metrics;
 use divine_push_service::nostr_listener;
 use divine_push_service::roster_publisher;
@@ -163,6 +165,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
         tracing::info!("Opt-in roster publisher started");
+    }
+
+    // Start the Live Activity worker, only when the feature is on. Not a
+    // `CriticalTask`: a stalled worker raises the oldest-due alert, and
+    // notifications keep flowing without it. It contains its own panics and
+    // returns only on shutdown.
+    if app_state.settings.live_activity.enabled {
+        match StatsClient::new(&app_state.settings.live_activity) {
+            Ok(stats) => {
+                let state_live_activity = Arc::clone(&app_state);
+                let token_live_activity = token.clone();
+                tracker.spawn("live_activity", None, OnReturn::Tolerated, async move {
+                    live_activity::worker::run(state_live_activity, stats, token_live_activity)
+                        .await;
+                    tracing::info!("Live Activity worker task finished.");
+                });
+                tracing::info!("Live Activity worker started");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Live Activity worker not started: the Funnelcake client could not be built");
+            }
+        }
     }
 
     // Start cleanup service
