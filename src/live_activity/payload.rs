@@ -92,8 +92,15 @@ pub fn parse(
     signer_hex: &str,
     now_unix: u64,
 ) -> Result<LiveActivityRegistration, PayloadError> {
-    let wire: Wire =
-        serde_json::from_value(raw.clone()).map_err(|e| PayloadError::Malformed(e.to_string()))?;
+    let wire: Wire = serde_json::from_value(raw.clone()).map_err(|e| {
+        // serde's own text embeds the offending value, which may be a token.
+        PayloadError::Malformed(format!(
+            "{:?} at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
 
     let token = &wire.activity_push_token;
     if !(32..=512).contains(&token.len()) || !is_lower_hex(token) {
@@ -297,6 +304,24 @@ mod tests {
     fn rejects_unknown_state() {
         let e = parse(&with("state", json!("paused")), SIGNER, NOW).unwrap_err();
         assert!(matches!(e, PayloadError::BadState));
+    }
+
+    #[test]
+    fn malformed_text_never_echoes_client_values() {
+        let secret = "ab".repeat(32);
+        let cases = [
+            with("activityPushToken", json!(123_456_789)),
+            with("postEventIds", json!(secret.clone())),
+            with("postedAt", json!(secret.clone())),
+            with("showFirstRunNote", json!(secret.clone())),
+        ];
+        for raw in cases {
+            let e = parse(&raw, SIGNER, NOW).unwrap_err();
+            assert!(matches!(e, PayloadError::Malformed(_)));
+            let text = e.to_string();
+            assert!(!text.contains(&secret), "{text}");
+            assert!(!text.contains("123456789"), "{text}");
+        }
     }
 
     #[test]

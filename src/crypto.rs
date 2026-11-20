@@ -27,7 +27,7 @@ pub enum CryptoError {
     InvalidToken(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenPayload {
     #[serde(rename = "timezone", default)]
     pub timezone: Option<String>,
@@ -62,6 +62,27 @@ pub struct TokenPayload {
     /// invalid object stays distinguishable from an absent one.
     #[serde(rename = "liveActivity", default)]
     pub live_activity: Option<serde_json::Value>,
+}
+
+/// Hand-written so the FCM token and the raw Live Activity object (which holds the activity
+/// push token) never reach logs through `{:?}`.
+impl std::fmt::Debug for TokenPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenPayload")
+            .field("timezone", &self.timezone)
+            .field("token", &"<redacted>")
+            .field("timezone_offset_minutes", &self.timezone_offset_minutes)
+            .field("campaign_target_types", &self.campaign_target_types)
+            .field("platform", &self.platform)
+            .field("install_channel", &self.install_channel)
+            .field("app_version", &self.app_version)
+            .field("notifications_authorized", &self.notifications_authorized)
+            .field(
+                "live_activity",
+                &self.live_activity.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 // Invalid optional metadata must clear stale eligibility without dropping the token.
@@ -291,6 +312,22 @@ impl CryptoService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_tokens() {
+        let fcm = "fcmtokenfcmtokenfcmtokenfcmtoken1234567890";
+        let act = "ab".repeat(32);
+        let p: TokenPayload = serde_json::from_value(serde_json::json!({
+            "token": fcm,
+            "notificationsAuthorized": true,
+            "liveActivity": {"activityPushToken": act, "state": "active"}
+        }))
+        .unwrap();
+        let text = format!("{p:?}");
+        assert!(!text.contains(fcm), "{text}");
+        assert!(!text.contains(&act), "{text}");
+        assert!(text.contains("notifications_authorized"), "{text}");
+    }
 
     #[test]
     fn test_is_nip44_encrypted() {
