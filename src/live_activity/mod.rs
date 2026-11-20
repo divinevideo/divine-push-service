@@ -2,6 +2,7 @@
 //! routing of Live Activity registrations, and the Redis store for activities
 //! and their schedule.
 
+pub mod content;
 pub mod payload;
 pub mod registration;
 pub mod stats_client;

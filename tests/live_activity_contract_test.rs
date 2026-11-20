@@ -4,6 +4,10 @@
 //! but not drift between them. Changing the contract takes two coordinated
 //! PRs, one per repo, each updating the file and its pin.
 
+use divine_push_service::live_activity::content::{decide, needs_views_fallback, Decision};
+use divine_push_service::live_activity::payload::{ActivityState, LiveActivityRegistration};
+use divine_push_service::live_activity::stats_client::{BulkStats, VersionStats};
+use divine_push_service::live_activity::store::StoredActivity;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -34,6 +38,11 @@ struct Timings {
 #[serde(rename_all = "camelCase")]
 struct CountCase {
     name: String,
+    seconds_since_posted: u64,
+    response: String,
+    versions: Vec<serde_json::Value>,
+    views_fallback: serde_json::Value,
+    absent_checks_before: u32,
     expect_views_lookup: Option<bool>,
     expected: Expected,
 }
@@ -41,6 +50,10 @@ struct CountCase {
 #[derive(Deserialize)]
 struct Expected {
     action: String,
+    phase: Option<String>,
+    views: Option<u64>,
+    likes: Option<u64>,
+    comments: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -102,5 +115,84 @@ fn fixture_parses() {
         assert_eq!(link.post_event_id.len(), 64);
         assert!(link.url.contains(&link.post_event_id));
         assert!(link.post_coordinate.starts_with("34236:"));
+    }
+}
+
+fn event_id(i: usize) -> String {
+    format!("{:064x}", i + 1)
+}
+
+#[test]
+fn count_cases() {
+    let f: Fixture = serde_json::from_str(FIXTURE).unwrap();
+    let now = 1_800_000_000u64;
+    for case in &f.counts {
+        let posted_at = now - case.seconds_since_posted;
+        let ids: Vec<String> = (0..case.versions.len().max(1)).map(event_id).collect();
+        let activity = StoredActivity {
+            id: "a".into(),
+            owner: "b".repeat(64),
+            fcm_token: "fcm".into(),
+            registration: LiveActivityRegistration {
+                activity_token: "ab".into(),
+                post_coordinate: format!("34236:{}:d", "c".repeat(64)),
+                post_event_ids: ids.clone(),
+                posted_at,
+                window_ends_at: posted_at + f.timings.window_seconds,
+                show_first_run_note: false,
+                state: ActivityState::Active,
+            },
+            first_seen_at: posted_at,
+            absent_checks: 0,
+            last_content: None,
+        };
+        let mut bulk = BulkStats::default();
+        for (i, v) in case.versions.iter().enumerate() {
+            if v.as_str() == Some("missing") {
+                bulk.missing.insert(ids[i].clone());
+            } else {
+                let views = v["views"].as_u64();
+                bulk.stats.insert(
+                    ids[i].clone(),
+                    VersionStats {
+                        views,
+                        reactions: v["reactions"].as_u64().unwrap(),
+                        comments: v["comments"].as_u64().unwrap(),
+                    },
+                );
+            }
+        }
+        let stats = if case.response == "failed" {
+            Err(())
+        } else {
+            Ok(&bulk)
+        };
+        let fallback = match &case.views_fallback {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(_) => Err(()),
+            v => Ok(Some(v.as_u64().unwrap())),
+        };
+        if case.expect_views_lookup == Some(false) {
+            assert!(!needs_views_fallback(&activity, &bulk), "{}", case.name);
+        }
+        let (decision, _) = decide(&activity, stats, fallback, case.absent_checks_before, now);
+        let (action, content) = match &decision {
+            Decision::Update(c) => ("update", Some(c)),
+            Decision::End(c) => ("end", Some(c)),
+            Decision::Skip => ("skip", None),
+        };
+        assert_eq!(action, case.expected.action, "{}", case.name);
+        if let Some(c) = content {
+            let phase = serde_json::to_value(c.phase).unwrap();
+            assert_eq!(
+                phase.as_str(),
+                case.expected.phase.as_deref(),
+                "{}",
+                case.name
+            );
+            assert_eq!(c.views, case.expected.views, "{} views", case.name);
+            assert_eq!(c.likes, case.expected.likes, "{} likes", case.name);
+            assert_eq!(c.comments, case.expected.comments, "{} comments", case.name);
+        }
     }
 }
