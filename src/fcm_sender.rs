@@ -278,6 +278,7 @@ pub enum SendOutcome {
 pub fn live_activity_send_outcome(err: &FcmError) -> SendOutcome {
     match err {
         FcmError::TokenNotRegistered | FcmError::InvalidRequest(_) => SendOutcome::Finish,
+        // Also covers a failed access-token fetch: needs ops, not a retry storm.
         FcmError::Unauthorized(_) => SendOutcome::RetryNextCycle,
         FcmError::RetryableInternal(delay) => SendOutcome::RetryAfter(*delay),
         _ => SendOutcome::RetryAfter(LIVE_ACTIVITY_DEFAULT_RETRY),
@@ -616,42 +617,28 @@ impl RealFcmClient {
         let fcm_prefix = token_prefix(&message.fcm_token);
         let activity_prefix = token_prefix(&message.activity_token);
 
-        let access_token =
-            self.token_provider.token(&[FCM_SCOPE]).await.map_err(|e| {
-                FcmError::Unauthorized(format!("Failed to obtain access token: {}", e))
-            })?;
-
-        let response = self
-            .http
-            .post(&self.send_url)
-            .bearer_auth(access_token.as_str())
-            .json(&serde_json::json!({ "message": live_activity_body(message) }))
-            .send()
+        match self
+            .post_message(&live_activity_body(message), &fcm_prefix)
             .await
-            .map_err(|e| FcmError::InternalRequest(format!("FCM request failed: {}", e)))?;
-
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-
-        if status.is_success() {
-            tracing::info!(
-                "Live Activity send successful for fcm token prefix {} activity token prefix {}",
-                fcm_prefix,
-                activity_prefix
-            );
-            return Ok(());
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "Live Activity send successful for fcm token prefix {} activity token prefix {}",
+                    fcm_prefix,
+                    activity_prefix
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Live Activity send failed for fcm token prefix {} activity token prefix {}: {}",
+                    fcm_prefix,
+                    activity_prefix,
+                    error
+                );
+                Err(error)
+            }
         }
-
-        let error = classify_error(status, &headers, &body);
-        tracing::error!(
-            "Live Activity send failed for fcm token prefix {} activity token prefix {}: status={} {}",
-            fcm_prefix,
-            activity_prefix,
-            status,
-            error
-        );
-        Err(error)
     }
 }
 
@@ -695,15 +682,37 @@ impl RealFcmClient {
             message.insert("android".to_string(), android);
         }
 
-        let access_token =
-            self.token_provider.token(&[FCM_SCOPE]).await.map_err(|e| {
-                FcmError::Unauthorized(format!("Failed to obtain access token: {}", e))
-            })?;
-
         tracing::info!(
             "Sending simplified FCM request for token prefix {}...",
             prefix
         );
+
+        match self.post_message(&message, &prefix).await {
+            Ok(()) => {
+                tracing::info!("FCM send successful for token prefix {}", prefix);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!("FCM send failed for token prefix {}: {}", prefix, error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Posts one FCM v1 `message` object and classifies any failure.
+    ///
+    /// Shared by regular and Live Activity sends. `log_context` is a log-safe
+    /// token prefix used only for the debug line carrying the error body. A
+    /// failed access-token fetch maps to `Unauthorized`.
+    async fn post_message(
+        &self,
+        message: &impl serde::Serialize,
+        log_context: &str,
+    ) -> std::result::Result<(), FcmError> {
+        let access_token =
+            self.token_provider.token(&[FCM_SCOPE]).await.map_err(|e| {
+                FcmError::Unauthorized(format!("Failed to obtain access token: {}", e))
+            })?;
 
         let response = self
             .http
@@ -719,20 +728,17 @@ impl RealFcmClient {
         let body = response.text().await.unwrap_or_default();
 
         if status.is_success() {
-            tracing::info!("FCM send successful for token prefix {}", prefix);
             return Ok(());
         }
 
         tracing::debug!(
             "FCM error response for token prefix {}: status={} body={}",
-            prefix,
+            log_context,
             status,
             body
         );
 
-        let error = classify_error(status, &headers, &body);
-        tracing::error!("FCM send failed for token prefix {}: {}", prefix, error);
-        Err(error)
+        Err(classify_error(status, &headers, &body))
     }
 }
 
@@ -1886,6 +1892,13 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
+        // Prove the recorder is live before asserting an absence.
+        crate::metrics::live_activity_send("update", "ok");
+        assert!(
+            handle.render().contains("push_live_activity_sends_total"),
+            "recorder captured nothing"
+        );
+
         let (client, _captured) = stub_fcm(200, &[], "{}").await;
         let fcm = FcmClient::new_with_impl(Box::new(client));
         fcm.send_live_activity(&live_message(LiveActivityEvent::Update))
