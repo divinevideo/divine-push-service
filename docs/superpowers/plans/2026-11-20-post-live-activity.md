@@ -10,7 +10,7 @@
   - Activities live in their own Redis keys. A scored job set drives a worker that batches Funnelcake lookups and sends through a new Firebase method that bypasses the interruption policy.
   - Everything is behind `live_activity.enabled` (default off), except the rule that a Live Activity registration never registers a notification token. That rule holds even with the flag off.
 - **Three small mobile tasks** (Part B) make the widget read standard Unix-seconds dates, put the shared timings in one place, and dim the Lock Screen counts while the card is stale.
-- **One contract fixture file** is run by both repos so their numbers cannot drift.
+- **One contract fixture file** is run by both repos. It keeps their numbers in step as long as contract changes land in both repos together (see the shared fixture rule).
 
 **Tech Stack:** Rust (tokio, deadpool-redis Lua scripts, reqwest 0.12, serde, axum test stubs); Swift (ActivityKit `Codable`); Dart (Flutter tests).
 
@@ -19,6 +19,10 @@
 ## Decisions already made (Matt, 2026-11-20)
 
 - Extend kind 3079's encrypted payload. No new kinds and no HTTP endpoint.
+  - The web route was considered and declined for v1. The app already sends a NIP-98 heartbeat to Funnelcake's `POST /api/v2/notifications/activity`, which forwards to `/internal/v1/activity`.
+  - That route was built so device tokens never pass through Funnelcake ("Device credentials and tokens stay exclusively in push-service", `docs/superpowers/specs/2026-10-29-visit-notification-budget.md:31-34`). The heartbeat carries no tokens, but a card registration carries two.
+  - Relay events also survive a push-service restart through replay.
+  - The cost of the relay route is that the phone gets no accept or reject reply. Daniel may prefer the web route later.
 - The widget decodes `updatedAt` as Unix seconds (Part B, Task M1). The server sends Unix seconds everywhere.
 - Firebase only for v1. Direct-to-Apple stays a named fallback, gated on the device test showing that a phone with notifications declined gets no Firebase token. Evidence that it will get one: the app's Firebase plugin calls `registerForRemoteNotifications` at launch regardless of permission (`FLTFirebaseMessagingPlugin.m:416-422`, auto-init on), the app declares `remote-notification` background mode, and Apple says a token does not need authorization.
 - Matt works through the access steps (Firebase console, staging send, deploys) with Daniel.
@@ -26,6 +30,18 @@
 - An outage across the hour's end: the server ends the card with the last content it actually sent and asks iOS to remove it at once, rather than leaving a "live" card for up to ~11 hours.
 - A stale card dims its Lock Screen counts now (Task M3), and Sebastian reviews the look on the app PR.
 - Execution: subagent-driven.
+- Cadence stays at 180 s. Funnelcake rebuilds `video_stats_summary` every 5 minutes (`crates/clickhouse/src/video_view_diagnostics.rs:336-340`), so 3 minutes brings each rebuild to the card within about 3 minutes and keeps it well inside the 10-minute stale line. At 5 minutes a card could lag about 10 minutes. At 1 minute it would mostly resend unchanged numbers.
+- A Divine-wide ceiling of 5,000 active activities (`max_active_total`), with an alert at 80%. **Daniel to head-check this value.** At the ceiling a new card still appears on the phone, but gets no server updates.
+- If the worker ever stops (a bug, not a panic), the service keeps serving notifications and an alert fires (`OnReturn::Tolerated` plus the oldest-due alert). Daniel may prefer `Fatal`.
+- Ask the Funnelcake maintainers now, as two questions in one message: is `views: null` for a found post guaranteed to mean 0, and could bulk carry fresh views (`get_video_view_stats_bulk` exists internally)? Either would let both sides drop the per-post views lookup.
+
+## Questions for Daniel's review
+
+- The Divine-wide ceiling of 5,000 active activities and the 80% alert: is the value right?
+- Worker failure mode: `Tolerated` plus an alert (chosen), or `Fatal` plus `CriticalTask`.
+- A separate send path rather than a third `DeliveryClass` (see the rulings below).
+- The relay 3079 route rather than the NIP-98 web route (above).
+- Firebase's Apple configuration for Live Activity pushes, the staging test send, and the deploys (see the access checklist).
 - Daniel reviews and may improve or redirect any of this.
 
 ## Engineering rulings in this plan (each one a reviewer can reject)
@@ -34,8 +50,10 @@
 - **A separate send path, not a third `DeliveryClass`.** The policy lives only at its call sites (`event_handler.rs:2063-2101`, `campaign_delivery.rs:591,615`, `coalesce.rs:1347,1459,1536,1595`), and the transport applies none. A class would have to opt out of every line of the shared reservation script (presence `notification_delivery.rs:186`, generation `:185`, hour and day caps `:223-224`). If its reservations were counted, it would spend the creator's own 5/hour and 20/day budget. Note in `docs/notification-delivery.md` that Live Activity is deliberately not a class, and correct "all categories" at `notification_delivery.rs:75`. *Cost if wrong:* a later refactor, if Daniel prefers a class.
 - **When Funnelcake fails, the worker skips the send and reschedules, with jitter.** A blip under ~10 minutes never shows, because the next success refreshes the stale date first. A longer outage shows "Updated … ago" honestly. Sending would refresh the stale date and claim a check-in that did not happen. At the hour's end with stats still failing, the worker sends an `end` carrying the last content it actually sent, with a dismissal date in the past, so iOS removes the card at once. It sends no false summary.
 - **The Funnelcake URL may use `http://` only for in-cluster or loopback hosts**, and `https://` otherwise. It must be origin-only. This matches the existing in-cluster pattern between these same services (funnelcake-api → `http://divine-push-service.push.svc.cluster.local:8000`, divine-iac-coreconfig `k8s/applications/funnelcake-api/overlays/production/kustomization.yaml:294-295`), meshed by Linkerd. The campaign validator is stricter because that client sends Access credentials. This one sends none.
-- **Only a post's author can start its card:** the `postCoordinate` pubkey must equal the event's signer. Each owner may have at most 5 active activities, because each registration creates an hour of recurring work.
-- **The worker must never take the service down:** each activity's processing runs under `catch_unwind`, a tick error is logged and counted and the loop continues, a tick finishes before its lease runs out, and the worker never touches `user_tokens:*` or `token_to_pubkey`.
+- **Only a post's author can start its card:** the `postCoordinate` pubkey must equal the event's signer. Each owner may have at most 5 active activities, and Divine at most `max_active_total` (5,000), because each registration creates an hour of recurring work and pubkeys cost nothing.
+- **The settle point uses the later of `postedAt` and the server's first-seen time**, so a phone with a fast clock cannot cause early confirmed zeros or an early "can't find".
+- **The worker must never take the service down:** each activity's processing runs under `catch_unwind`, a tick error is logged and counted and the loop continues, and the worker never touches `user_tokens:*` or `token_to_pubkey`.
+- **A tick finishes before its lease runs out:** Live Activity sends use their own 10 s timeout (`LIVE_ACTIVITY_SEND_TIMEOUT`, not the 45 s `FCM_OPERATION_TIMEOUT`). `validate()` requires `tick_deadline_secs + max(10, request_timeout_secs) < lease_secs`. Production runs 2 replicas, and staging's single replica will never show an overlap.
 - **No Apple push key and no `apns-topic`.** Firebase sets the topic for `live_activity_token` messages.
 
 ## Global Constraints
@@ -48,13 +66,16 @@
 - **Content state the server sends**, keys exact: `phase` ("posting"|"live"|"notFound"|"summary"), `views`, `likes`, `comments` (int or null), `updatedAt` (Unix seconds, integer), `showFirstRunNote` (bool), `postCoordinate` (string), `postEventId` (string, `postEventIds[0]`). Every content state echoes `postCoordinate`, `postEventIds[0]` and `showFirstRunNote`.
 - **Timings:**
   - cadence 180 s;
-  - settle point `postedAt` + 600 s;
+  - settle point `max(postedAt, first_seen_at)` + 600 s, where `first_seen_at` is the server time the activity was first stored;
   - window = the payload's `windowEndsAt` (the app sends `postedAt` + 3600);
   - `stale-date` = send time + 600 s;
   - `dismissal-date` = end + 1800 s on the end event.
 - **Stats mapping:** `views` → `views`, `reactions` → `likes`, `comments` → `comments`, per id from `POST /api/videos/stats/bulk` (`{event_ids, window?}` → `{stats: {id: {views: u64|null, reactions: u64, comments: u64, ...}}, missing: [id]}`, at most 100 ids per call).
   - Across an edited post's ids, take each counter's maximum, treating null as unknown.
-  - Bulk reports zero views as `views: null`. If bulk gives no views for any of the post's ids, fall back to `GET /api/videos/{id}/views` → `{views: u64, ...}` for `postEventIds[0]`, as the app does. A failed fallback is treated as a failed stats request (skip), never as unknown.
+  - Bulk reports zero views as `views: null`. When at least one of the post's ids is *present* in `stats` and every present id has `views: null`, fall back to `GET /api/videos/{id}/views` → `{views: u64, ...}` for `postEventIds[0]`, as the app does.
+  - Never look up views for a post with no present ids: `/views` answers `views: 0` for unknown posts (`handlers.rs:2731-2740`).
+  - Lookups share a per-replica budget, `views_lookups_per_minute` (default 100, under Funnelcake's 300/min general limit). When the budget is spent, the update reuses the views value from `last_content` (null if nothing was sent yet), and the next cycle tries again.
+  - A failed fallback is treated as a failed stats request (skip), never as unknown.
   - Before the settle point, send any 0 as null. From the settle point on, a 0 is a confirmed 0.
 - **Can't find:** at or after `postedAt` + 600 s, every id must be in `missing` or absent from `stats` in *two consecutive successful* checks (stored as `absent_checks` on the activity) before the worker sends `end` with phase `notFound` and the 1800 s dismissal. This guards against one lagging read. A failed request is never absence and never resets the count. `postedAt` is the device time at publish success (`post_live_activity_repository.dart:152`). For an activity adopted after a cold start it is approximated by `startedAt`, which is earlier and therefore conservative (`:466-476`).
 - **Firebase message:** `{token: <FCM token>, apns: {live_activity_token: <activityPushToken>, headers: {"apns-priority": "5" for update, "10" for end}, payload: {aps: {timestamp: <unix secs>, event: "update"|"end", "content-state": {...}, "stale-date": <unix secs>, "dismissal-date": <unix secs, end only>}}}}`, plus header `"apns-expiration": "<stale-date>"`, so a late update is dropped rather than delivered stale. No `notification` and no `data`.
@@ -65,7 +86,17 @@
   - Preferences (3083), quiet hours and caps do not apply.
   - The worker never prunes `user_tokens:*` or `token_to_pubkey`, even on `TokenNotRegistered`. It finishes the activity only.
   - Live Activity sends do not touch the shared `fcm_send_*` metrics (`metrics.rs:104-113`), only their own.
+  - Ending a 3079 (`state: "ended"`) for an activity the store has never seen writes a tombstone (owner and order stamp, both tokens dropped) that expires at its `windowEndsAt` + 1800 s, so a later or replayed `active` never starts it. Every tombstone drops both tokens.
+  - An update with the same activity token replaces `fcm_token` with the event's token. A new activity token for the same owner, device and `postCoordinate` (an Apple token rotation) carries over `absent_checks`, `last_content`, `first_seen_at` and the schedule.
 - **Logging:** full event ids and pubkeys, and `token_prefix` (8 characters) for FCM and activity tokens. Never log a full token.
+- **Metrics** follow the repo's `push_` prefix (`metrics.rs:6-20`):
+  - `push_live_activity_registrations_total{outcome}`
+  - `push_live_activity_sends_total{event,result}`
+  - `push_live_activity_stats_failures_total{reason}`
+  - `push_live_activity_skipped_total{reason}`
+  - `push_live_activity_views_lookups_total{result}`
+  - gauges `push_live_activity_active` (read from Redis `ZCARD live_activity_jobs`, so it is the same on every replica) and `push_live_activity_oldest_due_age_seconds` (the precedent is `push_coalesce_oldest_due_age_seconds`).
+- **Shared fixture rule:** the file is copied into both repos, and each repo pins the same sha256. That catches an accidental edit in one repo, not drift between them. Changing the contract therefore takes two coordinated PRs, one per repo, each updating the file and the pin. State this in both PR descriptions.
 - **Style** (`AGENTS.md`): `ServiceError` with thiserror, `tracing`, `///` on public items, one module per responsibility. New Redis keys go in both Redis tables (`AGENTS.md`, `docs/developer-guide.md`).
 
 ## Review Focus
@@ -76,7 +107,8 @@
 4. **A payload with `notificationsAuthorized: false`** must never land in `user_tokens:*`, even with the feature flag off. Test in Task 5: `live_activity_payload_never_registers_token_when_disabled`.
 5. **A malformed or hostile `liveActivity`** (bad hex, empty or more than 10 `postEventIds`, a window longer than 3600 s, `windowEndsAt` beyond now + 3600 s, a coordinate naming another author, an ended message from another pubkey, `"liveActivity": null`) must be rejected without touching anything. Tests in Tasks 3 and 5.
 6. **A worker panic or tick error** must not stop the service or the worker. Test in Task 9: `panic_in_one_activity_is_contained`, `tick_error_keeps_loop_running`.
-7. **An outage spanning the hour's end** must remove the card, not leave it. Test in Task 9: `outage_at_window_end_ends_with_last_content_and_immediate_dismissal`.
+7. **An outage spanning the hour's end** must remove the card, not leave it. Test in Task 8: `outage_at_window_end_ends_with_last_content_and_immediate_dismissal`.
+8. **An "ended" message that arrives before its "active" one** (relay order, replay, or the flag off) must still stop the card. Test in Task 4: `ended_before_active_never_starts`.
 
 ---
 
@@ -111,7 +143,8 @@
 
 **Interfaces:**
 - Produces:
-  - `pub struct LiveActivitySettings { pub enabled: bool, pub funnelcake_base_url: String, pub cadence_secs: u64, pub poll_millis: u64, pub request_timeout_secs: u64, pub lease_secs: u64, pub tick_deadline_secs: u64, pub max_concurrency: usize, pub max_active_per_owner: usize }`, with defaults `false, "", 180, 1000, 10, 120, 90, 8, 5`. `validate()` requires `tick_deadline_secs < lease_secs` and `max_concurrency` from 1 to 8, which keeps it under the 10-connection Redis pool (`config/settings.yaml:63`).
+  - `pub struct LiveActivitySettings { pub enabled: bool, pub funnelcake_base_url: String, pub cadence_secs: u64, pub poll_millis: u64, pub request_timeout_secs: u64, pub lease_secs: u64, pub tick_deadline_secs: u64, pub max_concurrency: usize, pub max_active_per_owner: usize, pub max_active_total: usize, pub views_lookups_per_minute: u32 }`, with defaults `false, "", 180, 1000, 10, 120, 90, 8, 5, 5000, 100`. `validate()` requires `tick_deadline_secs + max(10, request_timeout_secs) < lease_secs`, and `max_concurrency` from 1 to 8, which keeps it under the 10-connection Redis pool (`config/settings.yaml:63`).
+  - The metric name constants and their registration (all of the Global Constraints metrics) live in `src/metrics.rs`, added here, so later tasks only emit them.
   - `pub fn validate_funnelcake_base_url(url: &str) -> Result<(), String>`.
   - The fixture's schema below.
 
@@ -134,6 +167,7 @@ Fixture schema (top level):
   - `absent_after_settle_second_miss_is_not_found` (840 s, ["missing"], `absentChecksBefore: 1` → end, notFound)
   - `failed_request_skips` (900 s, response failed → skip)
   - `failed_fallback_skips` (720 s, {null,3,1}, fallback "failed" → skip)
+  - `missing_post_gets_no_fallback` (720 s, ["missing"], fallback null, `absentChecksBefore: 0` → update, live, null, null, null; the fixture asserts no lookup is made)
   - `window_end_is_summary` (3600 s, {40,5,2} → end, summary, 40, 5, 2)
 
   Add two `contentStates` cases: one full, and one with `postCoordinate` and `postEventId` absent, which must decode with both null. `updatedAt` is integer Unix seconds, for example `1763500000`. Add three `links` cases, including a d-tag containing `& = + ? /` and a space. Each `url` is `divine:///post-analytics/<postEventId>?coordinate=<postCoordinate percent-encoded with URLQueryAllowed minus `&=+?/`>`, the rule in divine-mobile's `PostActivityLink.url` (`ios/Shared/PostLiveActivity/PostActivityDisplay.swift`). Task M1's `testLinksMatchFixture` checks every value against that function, so a hand-encoding mistake fails there.
@@ -148,7 +182,7 @@ Fixture schema (top level):
 - [ ] **Step 4: Run** `cargo test --test live_activity_contract_test` and `cargo test config`. Expect FAIL (missing items).
 - [ ] **Step 5: Implement** the settings, defaults and validation (mirror `CampaignDeliverySettings`, `config.rs:44-99`). Add a `live_activity:` block with `enabled: false` to both YAML files.
 - [ ] **Step 6: Run** the same tests and expect PASS. Then `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] **Step 7: Commit** `feat(live-activity): add the shared contract fixture and settings, off by default`.
+- [ ] **Step 7: Commit** `feat(live-activity): add the shared contract fixture, settings and metrics, off by default`.
 
 ### Task 2: Firebase Live Activity send
 
@@ -169,7 +203,7 @@ Fixture schema (top level):
   - `live_activity_end_body_has_dismissal_and_priority_10`.
   - `real_client_posts_live_activity_body` stubs Firebase and asserts that the captured request body's `message` equals `live_activity_body`.
   - `mock_records_live_activity`.
-  - `live_activity_send_times_out`: a stub that never answers ends in a timeout error within `FCM_OPERATION_TIMEOUT`.
+  - `live_activity_send_times_out`: a stub that never answers ends in a timeout error within `LIVE_ACTIVITY_SEND_TIMEOUT` (10 s).
   - `live_activity_send_leaves_shared_fcm_metrics_untouched`.
   - `live_activity_outcome_mapping`, for `pub fn live_activity_send_outcome(err: &FcmError) -> SendOutcome` with `pub enum SendOutcome { Finish, RetryAfter(Duration), RetryNextCycle }`:
     - `TokenNotRegistered` → `Finish`
@@ -178,7 +212,7 @@ Fixture schema (top level):
     - `RetryableInternal(d)` → `RetryAfter(d)`
     - other errors → `RetryAfter(60 s)`
 - [ ] **Step 2: Run** `cargo test live_activity_` and expect FAIL.
-- [ ] **Step 3: Implement.** `RealFcmClient::send_live_activity` reuses the token provider, URL and `classify_error`. It is wrapped in the same `FCM_OPERATION_TIMEOUT` as `send_single` (`fcm_sender.rs:467`), because `gcp_auth` token fetches have no timeout of their own. It logs only `token_prefix` of both tokens and does not call `build_apns_config`. The trait's default method logs at `error!` when it is hit, so a wrapper that forgets to forward it is loud. Capture the exact Firebase error body for a rejected `live_activity_token` during the staging test and refine the mapping then.
+- [ ] **Step 3: Implement.** `RealFcmClient::send_live_activity` reuses the token provider, URL and `classify_error`. It is wrapped in a new `LIVE_ACTIVITY_SEND_TIMEOUT` of 10 s, the same way `send_single` wraps `FCM_OPERATION_TIMEOUT` (`fcm_sender.rs:467`), because `gcp_auth` token fetches have no timeout of their own. It logs only `token_prefix` of both tokens and does not call `build_apns_config`. The trait's default method logs at `error!` when it is hit, so a wrapper that forgets to forward it is loud. Capture the exact Firebase error body for a rejected `live_activity_token` during the staging test and refine the mapping then.
 - [ ] **Step 4: Run** and expect PASS, plus `cargo test fcm_sender` to show no regression.
 - [ ] **Step 5: Commit** `feat(live-activity): send Live Activity updates through Firebase`.
 
@@ -224,14 +258,15 @@ Validation rules:
 **Interfaces:**
 - Produces:
   - Keys:
-    - `live_activity:{blake3(activity_token)}`, a hash with fields `owner`, `fcm_token`, `activity_token`, `post_coordinate`, `post_event_ids` (JSON), `posted_at`, `window_ends_at`, `show_first_run_note`, `last_at` (20-digit `created_at`), `last_id`, `state`, `absent_checks`, `last_content` (the JSON content state of the last successful send), `last_sent_at`. TTL is `window_ends_at` + 1800 + 300 s from now.
+    - `live_activity:{blake3(activity_token)}`, a hash with fields `owner`, `fcm_token`, `activity_token`, `post_coordinate`, `post_event_ids` (JSON), `posted_at`, `window_ends_at`, `show_first_run_note`, `last_at` (20-digit `created_at`), `last_id`, `state`, `absent_checks`, `last_content` (the JSON content state of the last successful send), `last_sent_at`, `first_seen_at`. TTL is `window_ends_at` + 1800 + 300 s from now.
     - `live_activity_owner:{owner}`, a set of active activity ids, used for the per-owner cap. TTL refreshed with each member.
     - `live_activity_device:{owner}:{blake3(fcm_token)}`, which holds the current activity id.
     - `live_activity_jobs`, a sorted set: member is the activity id (the blake3 hex), score is the due time in Unix ms.
   - `pub struct StoredActivity { pub id: String, pub owner: String, pub fcm_token: String, pub registration: LiveActivityRegistration }`.
-  - `pub enum UpsertOutcome { Created, Updated, Superseded { previous_id: String }, Stale, Tombstoned, OverOwnerCap }`.
+  - `pub enum UpsertOutcome { Created, Updated, Superseded { previous_id: String }, Stale, Tombstoned, OverOwnerCap, OverTotalCap }`.
+  - `pub async fn oldest_due_age_secs(pool: &RedisPool, now_ms: u64) -> Result<Option<u64>>` and `pub async fn active_count(pool: &RedisPool) -> Result<u64>`, for the gauges.
   - `pub async fn upsert_active(pool: &RedisPool, owner: &str, fcm_token: &str, reg: &LiveActivityRegistration, event_at: u64, event_id: &str, first_due_ms: u64) -> Result<UpsertOutcome>`.
-  - `pub async fn end_by_token(pool: &RedisPool, owner: &str, activity_token: &str, event_at: u64, event_id: &str) -> Result<EndOutcome>`, where `pub enum EndOutcome { Ended, NotFound, NotOwner, Stale }`.
+  - `pub async fn end_by_token(pool: &RedisPool, owner: &str, reg: &LiveActivityRegistration, event_at: u64, event_id: &str) -> Result<EndOutcome>`, where `pub enum EndOutcome { Ended, TombstonedUnseen, NotOwner, Stale }`. For an unseen activity it writes a tombstone expiring at `reg.window_ends_at` + 1800 s.
   - `pub async fn claim_due(pool: &RedisPool, now_ms: u64, lease_ms: u64, limit: usize) -> Result<Vec<StoredActivity>>`.
   - `pub async fn reschedule(pool: &RedisPool, id: &str, due_ms: u64) -> Result<bool>`. Conditional: it re-adds only if the hash exists and is not tombstoned, so a slow worker cannot revive a job another worker finished.
   - `pub async fn record_sent(pool: &RedisPool, id: &str, content_json: &str, sent_at: u64) -> Result<()>`.
@@ -259,6 +294,11 @@ Store behaviour:
   - `sixth_active_activity_for_owner_is_refused` (OverOwnerCap, with `max_active_per_owner` 5)
   - `reschedule_after_finish_does_not_revive`
   - `record_sent_round_trips_last_content`
+  - `ended_before_active_never_starts`
+  - `update_replaces_fcm_token`
+  - `token_rotation_for_same_post_carries_state`
+  - `total_cap_refuses_new_activity` (OverTotalCap)
+  - `tombstone_drops_tokens`
 - [ ] **Step 2: Run** `cargo test --test live_activity_store_test` and expect FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** and expect PASS.
@@ -295,6 +335,7 @@ Store behaviour:
   - `null_live_activity_never_registers_token`
   - `ended_is_processed_while_disabled`
   - `coordinate_of_another_author_is_dropped`
+  - `ended_before_active_from_relay_never_starts`
 - [ ] **Step 2: Run** `cargo test live_activity` and expect the new tests to FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** and expect PASS, plus `cargo test event_handler` to show no regression.
@@ -343,7 +384,7 @@ Store behaviour:
   - `pub enum Decision { Update(ContentState), End(ContentState), Skip }`.
   - `pub fn decide(activity: &StoredActivity, stats: Result<&BulkStats, ()>, views_fallback: Result<Option<u64>, ()>, absent_checks_before: u32, now_unix: u64) -> (Decision, u32)`. The second value is `absent_checks_after`.
   - `pub fn outage_end(activity: &StoredActivity, last_content: Option<&serde_json::Value>, now_unix: u64) -> ContentState`. It returns the last content unchanged, or phase `live` with null counts when nothing was ever sent.
-  - `pub fn needs_views_fallback(activity: &StoredActivity, stats: &BulkStats) -> bool`.
+  - `pub fn needs_views_fallback(activity: &StoredActivity, stats: &BulkStats) -> bool`: true only when at least one id is present and every present id has null views.
 
 - [ ] **Step 1: Write failing tests.** `count_cases` runs every fixture `counts` case through `decide` and asserts `action`, `phase` and the counts. Add `content_state_serializes_exact_keys`, asserting the JSON keys and value types exactly as Global Constraints lists them.
 - [ ] **Step 2: Run** and expect FAIL.
@@ -354,36 +395,26 @@ Store behaviour:
 - [ ] **Step 4: Run** and expect PASS.
 - [ ] **Step 5: Commit** `feat(live-activity): decide what each Live Activity update shows`.
 
-### Task 8: Metrics
-
-**Files:** Modify `src/metrics.rs`.
-
-**Interfaces:** Produces counters `live_activity_registrations_total{outcome}`, `live_activity_sends_total{event, result}`, `live_activity_stats_failures_total`, `live_activity_skipped_total{reason}`, and a gauge `live_activity_active`. Follow the existing naming and registration in `src/metrics.rs`.
-
-- [ ] **Step 1:** Add a test asserting the names render at `/metrics` (follow the existing metrics test).
-- [ ] **Step 2:** Implement, run, and commit `feat(live-activity): add Live Activity metrics`.
-
-*(Folded into Task 9 if a reviewer judges it too small to stand alone.)*
-
-### Task 9: Worker
+### Task 8: Worker, one activity's cycle
 
 **Files:**
 - Create: `src/live_activity/worker.rs`
-- Modify: `src/main.rs` (spawn with `tracker.spawn("live_activity", None, OnReturn::Tolerated, ...)` beside the existing spawns at `:139-182`, only when `enabled`)
 - Test: inline tests with an `AppState` built using the fake Firebase (`FcmClient::new_with_impl`, harness pattern `coalesce.rs:1907-2002`) and an axum Funnelcake stub
 
 **Interfaces:**
-- Consumes: Tasks 2, 4, 6, 7, 8.
+- Consumes: Tasks 1 (metrics), 2, 4, 6 and 7. This task builds `process_one` and its outcomes. Task 9 builds the loop around it.
 - Produces:
-  - `pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: CancellationToken)`.
-  - `pub async fn tick(state: &AppState, stats: &StatsClient, now: SystemTime) -> Result<TickReport>`, which is testable.
+  - `pub async fn process_one(state: &AppState, activity: &StoredActivity, stats: Result<&BulkStats, &StatsError>, views: ViewsLookup, now_unix: u64) -> ProcessOutcome`, where:
+    - `pub enum ViewsLookup { NotNeeded, Found(Option<u64>), Failed, BudgetSpent }`;
+    - `pub enum ProcessOutcome { Sent, Ended, Skipped, Finished, Deferred(Duration) }`.
+  - In Task 9: `pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: CancellationToken)` and `pub async fn tick(state: &AppState, stats: &StatsClient, now: SystemTime) -> Result<TickReport>`.
 
-Each tick runs under `tick_deadline_secs` (it stops starting new work at the deadline, which is under the lease):
+How the worker runs. Task 8 builds the per-activity part (`process_one`); Task 9 builds the loop and the tick. Each tick runs under `tick_deadline_secs` (it stops starting new work at the deadline, which is under the lease):
 - `claim_due(limit 100, lease lease_secs)`.
 - One `bulk_grouped` over the claimed activities.
 - A `views` fallback where `needs_views_fallback`, run concurrently and capped at `max_concurrency`.
 - Each activity is processed under `catch_unwind` (as `send_batch` does, `fcm_sender.rs:603-616`), with sends concurrent and capped at `max_concurrency`. Every end send is preceded by `is_live`.
-- `RateLimited` from Funnelcake pushes the whole due set back by `retry_after` (default 60 s) and counts it under `live_activity_stats_failures_total{reason="rate_limited"}`.
+- `RateLimited` from Funnelcake pushes the whole due set back by `retry_after` (default 60 s) and counts it under `push_live_activity_stats_failures_total{reason="rate_limited"}`.
 - Then for each activity:
   - **`Update`:** send, `record_sent`, then `reschedule(now + cadence)`. If the next run would pass `window_ends_at`, schedule it at `window_ends_at` instead.
   - **`End`:** send, then `finish`.
@@ -391,23 +422,40 @@ Each tick runs under `tick_deadline_secs` (it stops starting new work at the dea
   - **After a send error,** apply `live_activity_send_outcome`: `Finish` → `finish`; `RetryAfter(d)` → reschedule at `now + d`; `RetryNextCycle` → reschedule at `now + cadence`. Never touch `user_tokens:*`.
 - `run` sleeps `poll_millis` between ticks that claim nothing, and exits on shutdown. A `tick` error is logged and counted, and the loop continues. `run` returns only on shutdown.
 
-- [ ] **Step 1: Write failing tests:**
+- [ ] **Step 1: Write failing `process_one` tests:**
   - `tick_sends_update_and_reschedules`
-  - `tick_batches_one_bulk_call_for_many_activities`
-  - `stats_failure_skips_send_and_reschedules`
   - `window_end_sends_summary_end_and_finishes`
+  - `not_found_needs_two_consecutive_misses`
   - `not_found_sends_end_with_dismissal`
   - `token_not_registered_finishes`
-  - `end_twice_is_noop`: two ticks over the same claimed job after a lease expiry give exactly one end send.
+  - `token_not_registered_never_prunes_registration`
   - `superseded_activity_is_never_sent`
-  - `panic_in_one_activity_is_contained`: a fake Firebase that panics for one token; the others still send and the loop survives.
+  - `outage_at_window_end_ends_with_last_content_and_immediate_dismissal`
+  - `views_budget_spent_reuses_last_views`
+- [ ] **Step 2: Run** `cargo test live_activity::worker` and expect FAIL.
+- [ ] **Step 3: Implement** `process_one`.
+- [ ] **Step 4: Run** and expect PASS.
+- [ ] **Step 5: Commit** `feat(live-activity): decide, send and reschedule one Live Activity`.
+
+### Task 9: Worker, the loop
+
+**Files:** Modify `src/live_activity/worker.rs` and `src/main.rs` (spawn with `tracker.spawn("live_activity", None, OnReturn::Tolerated, ...)` beside the existing spawns at `:139-182`, only when `enabled`). Tests are inline, as in Task 8.
+
+**Interfaces:**
+- Consumes: Task 8 `process_one`.
+- Produces: `run` and `tick` (signatures in Task 8), spawned in `main.rs` with `OnReturn::Tolerated` only when `enabled`. Each tick also updates both gauges.
+
+- [ ] **Step 1: Write failing tests** for `tick` and `run`:
+  - `tick_batches_one_bulk_call_for_many_activities`
+  - `stats_failure_skips_send_and_reschedules`
+  - `panic_in_one_activity_is_contained`
   - `tick_error_keeps_loop_running`
   - `slow_stats_respects_tick_deadline`
-  - `outage_at_window_end_ends_with_last_content_and_immediate_dismissal`
   - `rate_limited_pushes_due_set_back`
-  - `token_not_registered_never_prunes_registration`
-  - `not_found_needs_two_consecutive_misses`
-- [ ] **Step 2: Run** `cargo test live_activity::worker` and expect FAIL.
+  - `end_twice_is_noop`
+  - `views_lookups_respect_per_minute_budget`
+  - `gauges_report_active_and_oldest_due_age`
+- [ ] **Step 2: Run** and expect FAIL.
 - [ ] **Step 3: Implement**, and wire the spawn in `main.rs` behind `enabled`.
 - [ ] **Step 4: Run** and expect PASS. Then run the full `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check`.
 - [ ] **Step 5: Commit** `feat(live-activity): keep each post's Live Activity current for its first hour`.
@@ -416,9 +464,10 @@ Each tick runs under `tick_deadline_secs` (it stops starting new work at the dea
 
 **Files:**
 - `docs/nip-xx-push-notifications.md`: in *Registration (kind 3079)* (~`:34`), document `liveActivity` and `notificationsAuthorized`, ending with `state: "ended"`, never 3080, and an example under *Examples*.
-- `docs/notification-delivery.md`: name the Live Activity delivery class as outside the caps, gap, quiet hours, app-active refusal and preferences, bounded by the window and cadence.
+- `docs/notification-delivery.md`: state that Live Activity updates are deliberately *not* a delivery class. They go out through their own path, outside the caps, gap, quiet hours, app-active refusal and preferences, bounded by the window, the cadence and the per-owner and total ceilings. Correct "all categories" at `src/notification_delivery.rs:75`.
 - `docs/developer-guide.md`: the Live Activity message shape near *iOS APNS shape* (~`:181`), and the new keys in *Redis Keys* (~`:521`).
 - `AGENTS.md`: the new keys in the Redis key list, and a row in *Notification Types*.
+- `config/settings.yaml`: comments on each new `live_activity` setting, with its default.
 
 - [ ] **Step 1:** Write the docs. Every value must match Global Constraints.
 - [ ] **Step 2:** Commit `docs(live-activity): document the Live Activity registration, delivery class and keys`.
@@ -459,7 +508,7 @@ Each tick runs under `tick_deadline_secs` (it stops starting new work at the dea
 - [ ] **Step 1: Write failing tests** in `live_activity_contract_test.dart`:
   - `timings match the contract`: `LiveActivityRegistration.settle.inSeconds == timings.settleSeconds` and `.window.inSeconds == timings.windowSeconds`.
   - `checksum is pinned`.
-  - `links parse to their post`: every `links[]` url, through the app's deep-link parser, yields that `postEventId` and `postCoordinate`. This closes the Task 9 gap where Swift output was never run through the Dart parser.
+  - `links parse to their post`: every `links[]` url, through the app's deep-link parser, yields that `postEventId` and `postCoordinate`. This closes the gap the app's slice 2 Task 9 report recorded: Swift's link output was never run through the Dart parser.
   - `single-version count cases`: for each `counts[]` case with one version, `response: "ok"` and `action: "update"`, the cubit's count rule yields the expected views, likes and comments. Drive it through the cubit's existing `load()` with a stubbed repository, as its current tests do.
 - [ ] **Step 2: Run** `cd mobile && mise exec -- flutter test test/live_activity_contract_test.dart` and expect FAIL.
 - [ ] **Step 3: Implement.**
@@ -498,6 +547,12 @@ Each tick runs under `tick_deadline_secs` (it stops starting new work at the dea
   - and, with Funnelcake made unreachable at the hour's end, get removed immediately.
 
   Capture Firebase's error body for a rejected activity token. This also answers the declined-notifications token question. If the answer is no, the direct-to-Apple fallback becomes a pre-release task.
+- [ ] **Alerts** (a VMRule in `divine-iac-coreconfig`, beside `vmrule-push-delivery.yaml`), in the same PR as the staging config:
+  - `push_live_activity_oldest_due_age_seconds` over 600 for 10 minutes: the worker is stuck or stopped;
+  - `push_live_activity_sends_total{result="unauthorized"}` above 0: Firebase is missing its Apple Live Activity setup;
+  - `push_live_activity_active` above 80% of `max_active_total`;
+  - a sustained rate of `push_live_activity_stats_failures_total`.
+- [ ] **Funnelcake question,** drafted for Matt to send: is `views: null` for a found post guaranteed to mean 0, and could bulk carry fresh views?
 - [ ] **Kill switch:** turning `live_activity.enabled` off takes a redeploy (an ArgoCD sync). Activities already running go stale and iOS removes them. A runtime pause key was considered and left out of v1.
 - [ ] **Production config and deploy**, then the mobile release (#11258 merges only after this).
 
