@@ -128,4 +128,7 @@ live_activity:
   # max_concurrency: 8             # Concurrent sends per tick (1 to 8, under the Redis pool)
   # max_active_per_owner: 5        # Active activities one owner may hold
   # max_active_total: 5000         # Active activities tracked across all owners
-  # views_lookups_per_minute: 100  # Per-replica budget of /views fallback lookups
+  # views_lookups_per_minute: 100  # Budget of /views fallback lookups, PER REPLICA: replicas x
+  #                                #   this, plus each replica's bulk calls (at most one per
+  #                                #   poll_millis unless a tick claims a full batch), must stay
+  #                                #   under Funnelcake's rate limits

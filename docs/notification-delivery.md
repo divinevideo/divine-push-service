@@ -100,6 +100,14 @@ They are bounded by other limits instead:
 - retries after a failed send, which wait at least 30 s and at most one cadence,
   and never later than the point where the activity must end.
 
+Each replica runs its own worker, so its Funnelcake load is per replica too. A
+tick makes one bulk stats call (one per 100 activities), and the worker waits
+`poll_millis` after any tick that did not claim a full batch, so outside a
+backlog of full batches a replica makes at most about one bulk call per
+`poll_millis`. The `/views` fallback budget, `views_lookups_per_minute`, is **per
+replica**: replicas × that budget, plus every replica's bulk calls, must stay
+under Funnelcake's rate limits.
+
 A Live Activity 3079 never registers or refreshes a device for notifications, and
 a kind 3080 never ends an activity (ending is a 3079 with `state: "ended"`). The
 feature is off by default (`live_activity.enabled`). The registration shape is in

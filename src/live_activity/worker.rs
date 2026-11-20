@@ -433,9 +433,10 @@ impl ViewsBudget {
 /// Runs the worker until `shutdown` is cancelled.
 ///
 /// A tick that fails or panics is logged and counted, and the loop goes on: the
-/// worker never takes the service down and returns only on shutdown. Between
-/// ticks that claim nothing it sleeps `poll_millis`; after a rate-limited tick it
-/// waits out Funnelcake's back-off.
+/// worker never takes the service down and returns only on shutdown. Only a
+/// tick that claimed a full batch is followed straight by the next; otherwise
+/// it sleeps `poll_millis`, and after a rate-limited tick it waits out
+/// Funnelcake's back-off (see `pause_after`).
 pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: CancellationToken) {
     let settings = &state.settings.live_activity;
     let budget = ViewsBudget::new(settings.views_lookups_per_minute);
@@ -453,7 +454,7 @@ pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: Cancellatio
                 if report.claimed > 0 {
                     debug!(?report, "live activity tick finished");
                 }
-                report.backoff.or((report.claimed == 0).then_some(poll))
+                pause_after(&report, poll)
             }
             Ok(Err(e)) => {
                 error!(error = %e, "live activity tick failed; retrying after the poll interval");
@@ -475,6 +476,20 @@ pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: Cancellatio
         }
     }
     info!("Live Activity worker stopped");
+}
+
+/// How long the loop waits after a successful tick.
+///
+/// A tick that claimed a full batch ([`CLAIM_LIMIT`]) may have left more due
+/// work, so the next tick starts at once. Any other tick is followed by at least
+/// `poll`, so the bulk request rate is bounded by the poll interval rather than
+/// by how fast ticks finish. A rate-limited tick waits out the back-off, and
+/// never less than `poll`.
+fn pause_after(report: &TickReport, poll: Duration) -> Option<Duration> {
+    if let Some(backoff) = report.backoff {
+        return Some(backoff.max(poll));
+    }
+    (report.claimed < CLAIM_LIMIT).then_some(poll)
 }
 
 /// One pass: sample the gauges, claim due activities, look up their stats in one
@@ -953,6 +968,38 @@ mod tests {
 
     fn content(m: &crate::fcm_sender::LiveActivityMessage) -> ContentState {
         serde_json::from_value(m.content_state.clone()).unwrap()
+    }
+
+    #[test]
+    fn pauses_after_a_partial_claim_but_not_a_full_batch() {
+        let poll = Duration::from_millis(500);
+        let report = |claimed| TickReport {
+            claimed,
+            ..TickReport::default()
+        };
+        assert_eq!(pause_after(&report(0), poll), Some(poll));
+        assert_eq!(pause_after(&report(1), poll), Some(poll));
+        assert_eq!(pause_after(&report(CLAIM_LIMIT - 1), poll), Some(poll));
+        assert_eq!(pause_after(&report(CLAIM_LIMIT), poll), None);
+    }
+
+    #[test]
+    fn rate_limit_backoff_pauses_at_least_the_poll_interval() {
+        let poll = Duration::from_millis(500);
+        let backed_off = |claimed, backoff| TickReport {
+            claimed,
+            backoff: Some(backoff),
+            ..TickReport::default()
+        };
+        let long = Duration::from_secs(60);
+        assert_eq!(
+            pause_after(&backed_off(CLAIM_LIMIT, long), poll),
+            Some(long)
+        );
+        assert_eq!(
+            pause_after(&backed_off(3, Duration::from_millis(10)), poll),
+            Some(poll)
+        );
     }
 
     #[tokio::test]
