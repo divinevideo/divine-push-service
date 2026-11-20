@@ -212,6 +212,10 @@ results influence work.
 - `notification_activity_sessions:{pubkey}` - Expiring admission index capped at 128 retained sessions; excess new sessions get HTTP 429 without resetting visit state
 - `notification_work_generation:{pubkey}:{hash}` - Visit generation a notification was first attempted under, so a retry cannot adopt a later visit
 - `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
+- `live_activity:{blake3(activityToken)}` - One iOS Live Activity (hash): owner, FCM and activity tokens, post coordinate and ids, window, order stamp (`last_at` 20-digit `created_at`, `last_id`), `state`, `absent_checks`, `last_content`, `last_sent_at`, `first_seen_at`. Expires at `windowEndsAt` + 2100 s. Ending, finishing or superseding leaves a tombstone (`state = ended`, both tokens dropped) until `windowEndsAt` + 1800 s, so a replayed `active` never restarts it. Never touches `user_tokens:*` or `token_to_pubkey`
+- `live_activity_owner:{owner}` - Set of an owner's live activity ids, for `max_active_per_owner`; expired or ended members are pruned when the cap is checked
+- `live_activity_device:{owner}:{blake3(fcmToken)}` - The device's current activity id: one active activity per owner and device, a newer one supersedes it
+- `live_activity_jobs` - Sorted set of active activity ids scored by due time (Unix ms); a claim leases by rescoring to now + lease. `ZCARD` is the active count and the `max_active_total` cap
 
 ### Notification Types
 | Type | Trigger Kind | Description |

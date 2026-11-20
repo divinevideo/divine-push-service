@@ -69,7 +69,8 @@ pub struct LiveActivitySettings {
     /// Redis pool.
     #[serde(default = "default_la_max_concurrency")]
     pub max_concurrency: usize,
-    /// Active activities one owner may hold; the oldest is superseded past this.
+    /// Active activities one owner may hold. A new activity past this is refused
+    /// (nothing stored); superseding one on the same device does not count as new.
     #[serde(default = "default_la_max_active_per_owner")]
     pub max_active_per_owner: usize,
     /// Active activities across all owners that this service will track.
