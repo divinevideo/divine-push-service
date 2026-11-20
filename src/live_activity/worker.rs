@@ -33,6 +33,10 @@ use crate::state::AppState;
 pub const STALE_AFTER_SECS: u64 = 600;
 /// Seconds after an end that iOS removes the activity from the Lock Screen.
 pub const DISMISS_AFTER_SECS: u64 = 1800;
+/// Shortest wait before a failed send is retried. Firebase answers a 5xx or 429
+/// without `Retry-After` with a 1 s retry; honouring that would resend every
+/// active activity about once a second while Firebase is failing.
+pub const LIVE_ACTIVITY_MIN_RETRY: Duration = Duration::from_secs(30);
 /// Seconds past `window_ends_at` that failing stats are waited out before the
 /// activity is ended on its last content.
 pub const OUTAGE_GRACE_SECS: u64 = 600;
@@ -324,8 +328,8 @@ async fn after_send_error(
             finish(state, activity).await;
             return ProcessOutcome::Finished;
         }
-        // Firebase's delay is not trusted past one cadence.
-        SendOutcome::RetryAfter(delay) => delay.min(cadence),
+        // Firebase's delay is kept between the floor and one cadence.
+        SendOutcome::RetryAfter(delay) => delay.max(LIVE_ACTIVITY_MIN_RETRY).min(cadence),
         SendOutcome::RetryNextCycle => cadence,
     };
     let now_ms = now_unix.saturating_mul(1000);
@@ -1482,6 +1486,66 @@ mod tests {
             Some((now + f.cadence()) * 1000)
         );
         assert!(f.live(&activity.id).await);
+        f.done().await;
+    }
+
+    #[tokio::test]
+    async fn short_retry_after_is_floored() {
+        for delay in [Duration::from_secs(1), Duration::ZERO] {
+            let Some(f) = Fixture::new().await else {
+                return;
+            };
+            let now = now_secs();
+            let reg = f.registration(now - 900, now + 2700);
+            f.mock
+                .set_error_for_token(&reg.activity_token, FcmError::RetryableInternal(delay));
+            let activity = f.seed(reg, now).await;
+
+            let outcome = process_one(
+                &f.state,
+                &activity,
+                Ok(&f.stats(Some(5), 2, 1)),
+                ViewsLookup::NotNeeded,
+                now,
+            )
+            .await;
+
+            assert_eq!(
+                outcome,
+                ProcessOutcome::Deferred(LIVE_ACTIVITY_MIN_RETRY),
+                "retry-after {delay:?}"
+            );
+            assert_eq!(f.due_ms(&activity.id).await, Some((now + 30) * 1000));
+            assert!(f.live(&activity.id).await);
+            f.done().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_grace_cap_wins_over_the_retry_floor() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let now = now_secs();
+        // The window closed 590 s ago: the latest a retry may run is now + 10.
+        let reg = f.registration(now - 4190, now - 590);
+        f.mock.set_error_for_token(
+            &reg.activity_token,
+            FcmError::RetryableInternal(Duration::from_secs(1)),
+        );
+        let activity = f.seed(reg, now).await;
+
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.stats(Some(5), 2, 1)),
+            ViewsLookup::NotNeeded,
+            now,
+        )
+        .await;
+
+        assert_eq!(outcome, ProcessOutcome::Deferred(Duration::from_secs(10)));
+        assert_eq!(f.due_ms(&activity.id).await, Some((now + 10) * 1000));
         f.done().await;
     }
 
