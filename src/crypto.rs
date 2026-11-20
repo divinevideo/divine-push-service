@@ -55,6 +55,13 @@ pub struct TokenPayload {
         deserialize_with = "optional_device_string"
     )]
     pub app_version: Option<String>,
+    /// Whether the device allows notifications (sent with Live Activity registrations).
+    #[serde(rename = "notificationsAuthorized", default)]
+    pub notifications_authorized: Option<bool>,
+    /// Raw Live Activity object, validated in `live_activity::payload` so a present but
+    /// invalid object stays distinguishable from an absent one.
+    #[serde(rename = "liveActivity", default)]
+    pub live_activity: Option<serde_json::Value>,
 }
 
 // Invalid optional metadata must clear stale eligibility without dropping the token.
