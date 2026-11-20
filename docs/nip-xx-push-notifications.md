@@ -132,7 +132,8 @@ Fields (all `liveActivity` fields are required):
 - The author in `postCoordinate` MUST equal the event signer. An invalid object
   is dropped without a response.
 - `windowEndsAt` MUST be after `postedAt` by at most 3600 seconds, and no more
-  than an hour after the service's current time.
+  than an hour plus 300 seconds of allowed clock skew after the service's
+  current time (the app computes it from the phone's clock).
 - Ending is a 3079 with `state: "ended"`, matched by `activityPushToken` and the
   signer's pubkey. It is never a 3080: a kind 3080 deregistration does not end
   an activity. An `ended` registration for an activity the service has never

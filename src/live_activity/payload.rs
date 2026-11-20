@@ -49,7 +49,7 @@ pub enum PayloadError {
     BadEventIds(String),
     #[error("windowEndsAt must be after postedAt by at most 3600 seconds")]
     BadWindow,
-    #[error("windowEndsAt is more than an hour in the future")]
+    #[error("windowEndsAt is more than an hour plus the allowed clock skew in the future")]
     WindowTooFarAhead,
     #[error("state must be \"active\" or \"ended\"")]
     BadState,
@@ -143,7 +143,12 @@ pub fn parse(
         Some(w) if w > 0 && w <= MAX_WINDOW_SECS => {}
         _ => return Err(PayloadError::BadWindow),
     }
-    if wire.window_ends_at > now_unix.saturating_add(MAX_WINDOW_SECS) {
+    // The app derives `windowEndsAt` from the phone's clock, and the event
+    // reaches us later, so allow the same future skew as control events.
+    let latest_window_end = now_unix
+        .saturating_add(MAX_WINDOW_SECS)
+        .saturating_add(crate::event_handler::CONTROL_EVENT_FUTURE_SKEW_SECS);
+    if wire.window_ends_at > latest_window_end {
         return Err(PayloadError::WindowTooFarAhead);
     }
 
@@ -298,6 +303,29 @@ mod tests {
         g["windowEndsAt"] = json!(NOW + 3000 + 3600);
         let e = parse(&g, SIGNER, NOW).unwrap_err();
         assert!(matches!(e, PayloadError::WindowTooFarAhead));
+    }
+
+    /// The app computes `windowEndsAt` from the phone's clock, so a phone a
+    /// second ahead of the service must still be accepted.
+    #[test]
+    fn accepts_window_from_a_clock_slightly_ahead() {
+        let mut g = good();
+        g["postedAt"] = json!(NOW + 1);
+        g["windowEndsAt"] = json!(NOW + 1 + 3600);
+        let r = parse(&g, SIGNER, NOW).unwrap();
+        assert_eq!(r.window_ends_at, NOW + 3601);
+    }
+
+    #[test]
+    fn rejects_window_beyond_the_skew_allowance() {
+        let mut g = good();
+        g["postedAt"] = json!(NOW + 301);
+        g["windowEndsAt"] = json!(NOW + 301 + 3600);
+        let e = parse(&g, SIGNER, NOW).unwrap_err();
+        assert!(matches!(e, PayloadError::WindowTooFarAhead));
+        g["postedAt"] = json!(NOW + 300);
+        g["windowEndsAt"] = json!(NOW + 300 + 3600);
+        assert!(parse(&g, SIGNER, NOW).is_ok());
     }
 
     #[test]
