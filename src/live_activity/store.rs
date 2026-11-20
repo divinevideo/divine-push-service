@@ -4,7 +4,8 @@
 //! `user_tokens:*`, `token_to_pubkey` or any other registration key, so ending,
 //! finishing or failing an activity can never deregister a device.
 //!
-//! Keys (id = blake3 hex of the activity token):
+//! Keys (id = blake3 hex of `{owner}:{activity_token}`, so each signer's records
+//! live in its own namespace and no signer can block or hijack another's activity):
 //! - `live_activity:{id}`: hash of one activity. Live until `window_ends_at` + 2100 s.
 //!   A tombstone (`state = ended`, both tokens dropped) lives until `window_ends_at` + 1800 s.
 //! - `live_activity_owner:{owner}`: set of the owner's activity ids, for the per-owner cap.
@@ -35,7 +36,7 @@ const LIVE_EXTRA_SECS: u64 = 300;
 /// An active activity claimed from the schedule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredActivity {
-    /// blake3 hex of the activity token.
+    /// blake3 hex of `{owner}:{activity_token}`.
     pub id: String,
     /// Hex pubkey that registered the activity.
     pub owner: String,
@@ -66,8 +67,6 @@ pub enum UpsertOutcome {
     Stale,
     /// The activity was ended or finished; it never starts again.
     Tombstoned,
-    /// The activity token belongs to another owner. Nothing changed.
-    NotOwner,
     /// The owner already holds `max_per_owner` active activities. Nothing stored.
     OverOwnerCap,
     /// The service already tracks `max_total` active activities. Nothing stored.
@@ -81,8 +80,6 @@ pub enum EndOutcome {
     Ended,
     /// The activity was never seen; a tombstone now prevents it from starting.
     TombstonedUnseen,
-    /// The activity token belongs to another owner. It keeps running.
-    NotOwner,
     /// The activity was already ended, or the event is older than its last update.
     Stale,
 }
@@ -162,28 +159,26 @@ end
 local function displaced_or_stale()
   local cur = redis.call('GET', dkey)
   if not cur or cur == id or not is_live(cur) then return false, false end
-  local c = redis.call('HMGET', PREFIX .. cur, 'last_at', 'last_id', 'owner')
-  if c[3] ~= owner then return false, false end
+  local c = redis.call('HMGET', PREFIX .. cur, 'last_at', 'last_id')
   if not newer(at, eid, c[1], c[2]) then return false, true end
   return cur, false
 end
 
 if redis.call('EXISTS', key) == 1 then
-  local s = redis.call('HMGET', key, 'owner', 'state', 'last_at', 'last_id', 'post_event_ids', 'fcm_hash')
-  if s[1] ~= owner then return {7, ''} end
-  if s[2] ~= 'active' then return {4, ''} end
-  if not newer(at, eid, s[3], s[4]) then return {3, ''} end
+  local s = redis.call('HMGET', key, 'state', 'last_at', 'last_id', 'post_event_ids', 'fcm_hash')
+  if s[1] ~= 'active' then return {4, ''} end
+  if not newer(at, eid, s[2], s[3]) then return {3, ''} end
   local displaced, stale = displaced_or_stale()
   if stale then return {3, ''} end
   if displaced then tombstone(displaced) end
-  if s[6] and s[6] ~= fcm_hash then
-    local old = DEVICE_PREFIX .. owner .. ':' .. s[6]
+  if s[5] and s[5] ~= fcm_hash then
+    local old = DEVICE_PREFIX .. owner .. ':' .. s[5]
     if redis.call('GET', old) == id then redis.call('DEL', old) end
   end
   redis.call('HSET', key,
     'fcm_token', fcm, 'fcm_hash', fcm_hash,
     'post_coordinate', reg.post_coordinate,
-    'post_event_ids', merge(s[5], reg.post_event_ids),
+    'post_event_ids', merge(s[4], reg.post_event_ids),
     'posted_at', reg.posted_at, 'window_ends_at', reg.window_ends_at,
     'show_first_run_note', reg.show_first_run_note,
     'last_at', at, 'last_id', eid)
@@ -256,12 +251,11 @@ static END: LazyLock<Script> = LazyLock::new(|| {
 local key = KEYS[1]
 local id, owner, at, eid = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 if redis.call('EXISTS', key) == 1 then
-  local s = redis.call('HMGET', key, 'owner', 'state', 'last_at')
-  if s[1] ~= owner then return 2 end
-  if s[2] ~= 'active' then return 3 end
+  local s = redis.call('HMGET', key, 'state', 'last_at')
+  if s[1] ~= 'active' then return 2 end
   -- Only a strictly older end is stale: like a deregistration, an end wins a
   -- same-second tie, so the person's end is never lost to an id comparison.
-  if s[3] and at < s[3] then return 3 end
+  if s[2] and at < s[2] then return 2 end
   tombstone(id, at, eid)
   return 0
 end
@@ -343,9 +337,10 @@ fn blake3_hex(s: &str) -> String {
     blake3::hash(s.as_bytes()).to_hex().to_string()
 }
 
-/// Activity id for an activity token: blake3 hex, so the key never holds the token.
-pub fn activity_id(activity_token: &str) -> String {
-    blake3_hex(activity_token)
+/// Activity id: blake3 hex of `{owner}:{activity_token}`. Scoping by owner means a
+/// signer can only ever address its own records, and the key never holds the token.
+pub fn activity_id(owner: &str, activity_token: &str) -> String {
+    blake3_hex(&format!("{owner}:{activity_token}"))
 }
 
 /// Fixed-width decimal so Lua compares the full u64 order as strings.
@@ -381,7 +376,7 @@ pub async fn upsert_active(
     max_per_owner: usize,
     max_total: usize,
 ) -> Result<UpsertOutcome> {
-    let id = activity_id(&reg.activity_token);
+    let id = activity_id(owner, &reg.activity_token);
     let fcm_hash = blake3_hex(fcm_token);
     // Numbers travel as strings so Lua never rounds them through a double.
     let reg_json = serde_json::json!({
@@ -430,7 +425,6 @@ pub async fn upsert_active(
         4 => UpsertOutcome::Tombstoned,
         5 => UpsertOutcome::OverOwnerCap,
         6 => UpsertOutcome::OverTotalCap,
-        7 => UpsertOutcome::NotOwner,
         other => {
             return Err(ServiceError::Internal(format!(
                 "live activity upsert returned unknown code {other}"
@@ -451,7 +445,7 @@ pub async fn end_by_token(
     event_at: u64,
     event_id: &str,
 ) -> Result<EndOutcome> {
-    let id = activity_id(&reg.activity_token);
+    let id = activity_id(owner, &reg.activity_token);
     let mut conn = conn(pool).await?;
     let code: i64 = END
         .key(format!("{ACTIVITY_PREFIX}{id}"))
@@ -466,7 +460,6 @@ pub async fn end_by_token(
     Ok(match code {
         0 => EndOutcome::Ended,
         1 => EndOutcome::TombstonedUnseen,
-        2 => EndOutcome::NotOwner,
         _ => EndOutcome::Stale,
     })
 }
@@ -513,7 +506,8 @@ fn parse_stored(id: String, h: HashMap<String, String>) -> Result<StoredActivity
 /// Claim up to `limit` due activities, leasing each by rescoring it to `now_ms + lease_ms`.
 ///
 /// Members whose hash is gone or tombstoned are dropped from the schedule. A hash
-/// that cannot be parsed is finished, so it cannot be claimed again every lease.
+/// that cannot be parsed is left out of the batch and finished, so it is not claimed
+/// again every lease; a failure to finish it is logged and the batch still returns.
 pub async fn claim_due(
     pool: &RedisPool,
     now_ms: u64,
@@ -537,7 +531,10 @@ pub async fn claim_due(
             Ok(stored) => claimed.push(stored),
             Err(e) => {
                 tracing::warn!(activity_id = %id, error = %e, "finishing unreadable live activity");
-                finish(pool, &id).await?;
+                // The rest of the batch is already leased: never drop it for this row.
+                if let Err(e) = finish(pool, &id).await {
+                    tracing::warn!(activity_id = %id, error = %e, "could not finish unreadable live activity");
+                }
             }
         }
     }

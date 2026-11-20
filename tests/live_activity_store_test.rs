@@ -62,8 +62,11 @@ fn reg(owner: &str, d: &str, ids: &[&str]) -> LiveActivityRegistration {
     }
 }
 
+/// Activity ids are scoped by owner: blake3 of `{owner}:{activity_token}`. The
+/// owner is the coordinate's author, which payload validation pins to the signer.
 fn id_of(reg: &LiveActivityRegistration) -> String {
-    blake3::hash(reg.activity_token.as_bytes())
+    let owner = reg.post_coordinate.split(':').nth(1).unwrap();
+    blake3::hash(format!("{owner}:{}", reg.activity_token).as_bytes())
         .to_hex()
         .to_string()
 }
@@ -325,7 +328,7 @@ async fn older_event_is_stale() {
 }
 
 #[tokio::test]
-async fn end_by_token_owner_check() {
+async fn end_by_token_orders_and_ends() {
     let Some(pool) = test_pool().await else {
         println!("Skipping test: Redis not available");
         return;
@@ -337,13 +340,6 @@ async fn end_by_token_owner_check() {
     upsert(&pool, &o, &fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
 
     r.state = ActivityState::Ended;
-    let out = store::end_by_token(&pool, &owner(), &r, 200, &ev('2'))
-        .await
-        .unwrap();
-    assert_eq!(out, EndOutcome::NotOwner);
-    assert!(store::is_live(&pool, &id).await.unwrap());
-    assert_eq!(job_score(&pool, &id).await, Some(FAR_DUE_MS));
-
     let out = store::end_by_token(&pool, &o, &r, 50, &ev('2'))
         .await
         .unwrap();
@@ -360,6 +356,142 @@ async fn end_by_token_owner_check() {
         .await
         .is_empty());
     assert_eq!(get(&pool, &device_key(&o, &fcm)).await, None);
+}
+
+#[tokio::test]
+async fn another_owner_never_affects_an_activity() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let y = owner();
+    let fcm_y = hex(40);
+    let r_y = reg(&y, "a", &[&ev('a')]);
+    let id_y = id_of(&r_y);
+    upsert(&pool, &y, &fcm_y, &r_y, 100, &ev('1'), FAR_DUE_MS).await;
+
+    // Other signers send registrations carrying Y's activity token for their own posts.
+    let borrow = |o: &str| {
+        let mut r = reg(o, "a", &[&ev('b')]);
+        r.activity_token = r_y.activity_token.clone();
+        r
+    };
+
+    let x_active = owner();
+    let r = borrow(&x_active);
+    assert_ne!(id_of(&r), id_y);
+    let out = upsert(&pool, &x_active, &hex(40), &r, 300, &ev('3'), FAR_DUE_MS).await;
+    assert_eq!(out, UpsertOutcome::Created, "stored in X's own namespace");
+    assert_eq!(
+        hgetall(&pool, &format!("live_activity:{}", id_of(&r))).await["owner"],
+        x_active
+    );
+    store::finish(&pool, &id_of(&r)).await.unwrap();
+
+    let x_end = owner();
+    let mut r = borrow(&x_end);
+    r.state = ActivityState::Ended;
+    let out = store::end_by_token(&pool, &x_end, &r, 300, &ev('3'))
+        .await
+        .unwrap();
+    assert_eq!(out, EndOutcome::TombstonedUnseen, "X's own tombstone");
+    assert_eq!(
+        hgetall(&pool, &format!("live_activity:{}", id_of(&r))).await["owner"],
+        x_end
+    );
+
+    // Y keeps running and scheduled, untouched.
+    assert!(store::is_live(&pool, &id_y).await.unwrap());
+    assert_eq!(job_score(&pool, &id_y).await, Some(FAR_DUE_MS));
+    let h = hgetall(&pool, &format!("live_activity:{id_y}")).await;
+    assert_eq!(h["owner"], y);
+    assert_eq!(h["fcm_token"], fcm_y);
+    assert_eq!(h["last_at"], format!("{:020}", 100));
+    assert_eq!(
+        get(&pool, &device_key(&y, &fcm_y)).await,
+        Some(id_y.clone())
+    );
+    assert_eq!(
+        smembers(&pool, &format!("live_activity_owner:{y}")).await,
+        vec![id_y.clone()]
+    );
+    // Y can still update and end its own activity.
+    assert_eq!(
+        upsert(&pool, &y, &fcm_y, &r_y, 400, &ev('4'), FAR_DUE_MS).await,
+        UpsertOutcome::Updated
+    );
+    let mut end_y = r_y.clone();
+    end_y.state = ActivityState::Ended;
+    assert_eq!(
+        store::end_by_token(&pool, &y, &end_y, 500, &ev('5'))
+            .await
+            .unwrap(),
+        EndOutcome::Ended
+    );
+}
+
+#[tokio::test]
+async fn claim_due_skips_a_bad_row_and_keeps_the_batch() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let _guard = CLAIM_LOCK.lock().await;
+    let o = owner();
+    let good = reg(&o, "good", &[&ev('a')]);
+    upsert(&pool, &o, &hex(40), &good, 100, &ev('1'), 7_000).await;
+
+    // A live-looking row that cannot be parsed and whose tombstone write fails
+    // (non-numeric window), scheduled ahead of the good one.
+    let bad_id = hex(64);
+    {
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg(format!("live_activity:{bad_id}"))
+            .arg("state")
+            .arg("active")
+            .arg("owner")
+            .arg(&o)
+            .arg("window_ends_at")
+            .arg("not-a-number")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("EXPIRE")
+            .arg(format!("live_activity:{bad_id}"))
+            .arg(60)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("ZADD")
+            .arg("live_activity_jobs")
+            .arg(6_000)
+            .arg(&bad_id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    let claimed = store::claim_due(&pool, 8_000, 60_000, 1_000).await.unwrap();
+    assert!(
+        claimed.iter().any(|s| s.id == id_of(&good)),
+        "good row kept"
+    );
+    assert!(claimed.iter().all(|s| s.id != bad_id), "bad row dropped");
+
+    store::finish(&pool, &id_of(&good)).await.unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg(format!("live_activity:{bad_id}"))
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("ZREM")
+        .arg("live_activity_jobs")
+        .arg(&bad_id)
+        .query_async(&mut *conn)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
