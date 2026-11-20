@@ -8,7 +8,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const FIXTURE: &str = include_str!("fixtures/live_activity_contract.json");
-const CONTRACT_SHA256: &str = "4e8fd159739a6dcfec5c5e37794c5a34768b7350ef101b41ba3fc0f632a449d0";
+const CONTRACT_SHA256: &str = "52c18d40f29b4a24458e1fd33a211b86ec1bab96d74f30d1f3de57e072089f55";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +34,7 @@ struct Timings {
 #[serde(rename_all = "camelCase")]
 struct CountCase {
     name: String,
+    expect_views_lookup: Option<bool>,
     expected: Expected,
 }
 
@@ -83,6 +84,13 @@ fn fixture_parses() {
             case.name
         );
     }
+    let no_lookup: Vec<&str> = f
+        .counts
+        .iter()
+        .filter(|c| c.expect_views_lookup == Some(false))
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(no_lookup, ["missing_post_gets_no_fallback"]);
     assert!(f.content_states.len() >= 2);
     assert!(f.content_states.iter().all(|c| !c.name.is_empty()));
     assert!(f

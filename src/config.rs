@@ -69,8 +69,10 @@ pub struct LiveActivitySettings {
     /// Redis pool.
     #[serde(default = "default_la_max_concurrency")]
     pub max_concurrency: usize,
+    /// Active activities one owner may hold; the oldest is superseded past this.
     #[serde(default = "default_la_max_active_per_owner")]
     pub max_active_per_owner: usize,
+    /// Active activities across all owners that this service will track.
     #[serde(default = "default_la_max_active_total")]
     pub max_active_total: usize,
     /// Per-replica budget of `/views` fallback lookups per minute (under
@@ -103,7 +105,23 @@ impl LiveActivitySettings {
         if !(1..=8).contains(&self.max_concurrency) {
             return Err("live_activity.max_concurrency must be between 1 and 8".to_string());
         }
-        let worst_tick = self.tick_deadline_secs + self.request_timeout_secs.max(10);
+        for (name, zero) in [
+            ("cadence_secs", self.cadence_secs == 0),
+            ("poll_millis", self.poll_millis == 0),
+            ("max_active_per_owner", self.max_active_per_owner == 0),
+            ("max_active_total", self.max_active_total == 0),
+            (
+                "views_lookups_per_minute",
+                self.views_lookups_per_minute == 0,
+            ),
+        ] {
+            if zero {
+                return Err(format!("live_activity.{name} must be greater than 0"));
+            }
+        }
+        let worst_tick = self
+            .tick_deadline_secs
+            .saturating_add(self.request_timeout_secs.max(10));
         if worst_tick >= self.lease_secs {
             return Err(format!(
                 "live_activity.tick_deadline_secs + max(10, request_timeout_secs) ({worst_tick}) must be below lease_secs ({})",
@@ -1250,6 +1268,8 @@ mod tests {
         for ok in [
             "http://funnelcake-api.funnelcake.svc.cluster.local:8080",
             "http://127.0.0.1:4000",
+            "http://localhost:4000",
+            "http://[::1]:4000",
             "https://relay.divine.video",
         ] {
             assert!(validate_funnelcake_base_url(ok).is_ok(), "{ok}");
@@ -1286,6 +1306,35 @@ mod tests {
         assert!(la.validate().is_err());
         la.max_concurrency = 8;
         la.tick_deadline_secs = 110; // 110 + 10 >= 120
+        assert!(la.validate().is_err());
+    }
+
+    #[test]
+    fn live_activity_zero_values_are_rejected() {
+        type Break = fn(&mut LiveActivitySettings);
+        let breakers: [(&str, Break); 5] = [
+            ("cadence_secs", |l| l.cadence_secs = 0),
+            ("poll_millis", |l| l.poll_millis = 0),
+            ("max_active_per_owner", |l| l.max_active_per_owner = 0),
+            ("max_active_total", |l| l.max_active_total = 0),
+            ("views_lookups_per_minute", |l| {
+                l.views_lookups_per_minute = 0
+            }),
+        ];
+        for (name, brk) in breakers {
+            let mut la = LiveActivitySettings::default();
+            brk(&mut la);
+            let err = la.validate().expect_err(name);
+            assert!(err.contains(name), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn live_activity_overflowing_timings_are_rejected_not_wrapped() {
+        let la = LiveActivitySettings {
+            request_timeout_secs: u64::MAX,
+            ..Default::default()
+        };
         assert!(la.validate().is_err());
     }
 }

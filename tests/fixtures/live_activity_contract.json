@@ -235,6 +235,7 @@
       ],
       "viewsFallback": null,
       "absentChecksBefore": 0,
+      "expectViewsLookup": false,
       "expected": {
         "action": "update",
         "phase": "live",
