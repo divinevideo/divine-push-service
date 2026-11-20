@@ -168,9 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start the Live Activity worker, only when the feature is on. Not a
-    // `CriticalTask`: a stalled worker raises the oldest-due alert, and
-    // notifications keep flowing without it. It contains its own panics and
-    // returns only on shutdown.
+    // `CriticalTask`: notifications keep flowing without it. A stalled worker
+    // stops advancing `push_live_activity_last_tick_unix` (the oldest-due gauge
+    // is written by the worker itself, so it freezes rather than rises). It
+    // contains its own panics and returns only on shutdown.
     if app_state.settings.live_activity.enabled {
         match StatsClient::new(&app_state.settings.live_activity) {
             Ok(stats) => {

@@ -275,7 +275,8 @@ All use the shared `push_` prefix and are separate from the `fcm_send_*` metrics
 | `push_live_activity_skipped_total` | `reason`: `stats_failed`, `views_failed`, `store_failed`, `tick_failed`, `tick_panicked`, `panicked` | Cycles that sent nothing |
 | `push_live_activity_views_lookups_total` | `result`: `ok`, `failed`, `budget_spent` | `/views` fallback lookups |
 | `push_live_activity_active` | none (gauge) | Active activities, read from `ZCARD live_activity_jobs`, so identical on every replica |
-| `push_live_activity_oldest_due_age_seconds` | none (gauge) | Age of the oldest overdue activity (compare `push_coalesce_oldest_due_age_seconds`) |
+| `push_live_activity_oldest_due_age_seconds` | none (gauge) | Age of the oldest overdue activity (compare `push_coalesce_oldest_due_age_seconds`). Written by the worker, so it freezes rather than rises when the worker stalls |
+| `push_live_activity_last_tick_unix` | none (gauge) | Unix seconds of this replica's last finished worker pass, whatever its outcome. The stall signal: alert when it stops advancing while `live_activity.enabled` is on |
 
 ### Avoiding duplicate banners
 

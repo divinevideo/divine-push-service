@@ -467,6 +467,12 @@ pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: Cancellatio
                 Some(poll)
             }
         };
+        // Set on every finished pass, whatever its outcome, so a worker that
+        // hangs or stops looping shows up as a gauge that stops advancing.
+        let finished_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        metrics::live_activity_last_tick(finished_at as f64);
         if let Some(pause) = pause {
             tokio::select! {
                 biased;
@@ -2254,6 +2260,49 @@ mod tests {
             let report = w.tick(&budget, later).await;
             assert_eq!((report.claimed, report.sent, report.panicked), (3, 2, 1));
             assert_eq!(w.sent_to(&a).len(), 2);
+        }
+
+        /// The loop records each finished tick, so a stalled worker shows up as
+        /// a gauge that stops advancing even when nothing is due.
+        #[tokio::test]
+        async fn run_records_the_last_tick_time() {
+            let Some(w) = World::new(Opts::default()).await else {
+                return;
+            };
+            let (recorder, handle) = recorder();
+            let _metrics = ::metrics::set_default_local_recorder(&recorder);
+            let World { _db, state, .. } = w;
+            let state = Arc::new(state);
+            let stats = StatsClient::new(&state.settings.live_activity).unwrap();
+            let before = now_secs();
+            let shutdown = CancellationToken::new();
+            let worker = tokio::spawn(run(Arc::clone(&state), stats, shutdown.clone()));
+
+            let started = tokio::time::Instant::now();
+            let value = loop {
+                let text = rendered(&handle);
+                if let Some(v) = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("push_live_activity_last_tick_unix "))
+                {
+                    break v.trim().parse::<f64>().unwrap();
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "no tick recorded"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(
+                value >= before as f64 && value <= now_secs() as f64,
+                "{value}"
+            );
+
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .expect("worker stops on shutdown")
+                .unwrap();
         }
 
         #[tokio::test]

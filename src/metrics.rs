@@ -24,6 +24,7 @@ pub const LIVE_ACTIVITY_SKIPPED_TOTAL: &str = "push_live_activity_skipped_total"
 pub const LIVE_ACTIVITY_VIEWS_LOOKUPS_TOTAL: &str = "push_live_activity_views_lookups_total";
 pub const LIVE_ACTIVITY_ACTIVE: &str = "push_live_activity_active";
 pub const LIVE_ACTIVITY_OLDEST_DUE_AGE_SECONDS: &str = "push_live_activity_oldest_due_age_seconds";
+pub const LIVE_ACTIVITY_LAST_TICK_UNIX: &str = "push_live_activity_last_tick_unix";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
 
@@ -116,6 +117,10 @@ pub fn init() -> PrometheusHandle {
     metrics::describe_gauge!(
         LIVE_ACTIVITY_OLDEST_DUE_AGE_SECONDS,
         "Age in seconds of the oldest due Live Activity job, sampled on every worker pass"
+    );
+    metrics::describe_gauge!(
+        LIVE_ACTIVITY_LAST_TICK_UNIX,
+        "Unix timestamp of the last finished Live Activity worker pass on this replica"
     );
     metrics::describe_gauge!(
         LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS,
@@ -215,6 +220,10 @@ pub fn live_activity_active(count: f64) {
 
 pub fn live_activity_oldest_due_age(age_seconds: f64) {
     metrics::gauge!(LIVE_ACTIVITY_OLDEST_DUE_AGE_SECONDS).set(age_seconds);
+}
+
+pub fn live_activity_last_tick(unix_secs: f64) {
+    metrics::gauge!(LIVE_ACTIVITY_LAST_TICK_UNIX).set(unix_secs);
 }
 
 fn set_last_event_processed_timestamp(timestamp: f64) {
@@ -345,6 +354,7 @@ mod tests {
             live_activity_views_lookup("budget_spent");
             live_activity_active(3.0);
             live_activity_oldest_due_age(7.0);
+            live_activity_last_tick(1_800_000_000.0);
         });
         handle.run_upkeep();
         let rendered = handle.render();
@@ -356,6 +366,7 @@ mod tests {
             r#"push_live_activity_views_lookups_total{result="budget_spent"} 1"#,
             "push_live_activity_active 3",
             "push_live_activity_oldest_due_age_seconds 7",
+            "push_live_activity_last_tick_unix 1800000000",
         ] {
             assert!(rendered.contains(expected), "{expected}\n{rendered}");
         }
