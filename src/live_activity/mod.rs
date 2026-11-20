@@ -4,4 +4,5 @@
 
 pub mod payload;
 pub mod registration;
+pub mod stats_client;
 pub mod store;
