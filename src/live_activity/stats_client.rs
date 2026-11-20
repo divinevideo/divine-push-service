@@ -110,10 +110,11 @@ impl StatsClient {
                 }
                 continue;
             }
-            let fits = chunks.last().is_some_and(|c| {
-                // Oversized parts are always full, so this never joins one.
-                c.len() + ids.len() <= MAX_BULK_IDS
-            });
+            // This may join the short tail part of an oversized group; that is
+            // harmless, since each group reads only its own ids from a chunk.
+            let fits = chunks
+                .last()
+                .is_some_and(|c| c.len() + ids.len() <= MAX_BULK_IDS);
             if !fits {
                 chunks.push(Vec::new());
             }
@@ -127,14 +128,20 @@ impl StatsClient {
             group_chunks[g].push(idx);
         }
 
-        // Each future owns its chunk. A closure borrowing `&Vec<String>` makes
-        // rustc unable to prove this future `Send` for every lifetime, which
-        // keeps the worker that awaits it off `tokio::spawn`.
-        let results: Vec<Result<BulkStats, StatsError>> = stream::iter(chunks)
-            .map(|ids| async move { self.bulk_request(&ids).await })
-            .buffered(self.max_concurrency)
-            .collect()
-            .await;
+        // Each future owns its chunk and carries the chunk's index, so results
+        // are placed by index and completion order does not matter. A closure
+        // borrowing `&Vec<String>` makes rustc unable to prove this future
+        // `Send` for every lifetime, which keeps the worker that awaits it off
+        // `tokio::spawn`.
+        let mut indexed: Vec<(usize, Result<BulkStats, StatsError>)> =
+            stream::iter(chunks.into_iter().enumerate())
+                .map(|(i, ids)| async move { (i, self.bulk_request(&ids).await) })
+                .buffer_unordered(self.max_concurrency)
+                .collect()
+                .await;
+        indexed.sort_unstable_by_key(|(i, _)| *i);
+        let results: Vec<Result<BulkStats, StatsError>> =
+            indexed.into_iter().map(|(_, r)| r).collect();
 
         groups
             .iter()
@@ -236,6 +243,8 @@ mod tests {
         delay: Duration,
         /// Respond 500 to bulk requests containing this id.
         fail_id: Option<&'static str>,
+        /// Delay bulk requests containing an id with this prefix by 300 ms.
+        slow_prefix: Option<&'static str>,
     }
 
     async fn bulk(
@@ -250,6 +259,11 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
+        if s.slow_prefix
+            .is_some_and(|p| ids.iter().any(|i| i.starts_with(p)))
+        {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         s.seen.lock().unwrap().push(ids.clone());
         let mut status = s.status;
         if s.fail_id.is_some_and(|f| ids.iter().any(|i| i == f)) {
@@ -301,6 +315,7 @@ mod tests {
             retry_after: None,
             delay: Duration::ZERO,
             fail_id: None,
+            slow_prefix: None,
         }
     }
 
@@ -359,6 +374,26 @@ mod tests {
             assert_eq!(r.stats.len(), g.len());
             assert!(g.iter().all(|id| r.stats.contains_key(id)));
         }
+    }
+
+    /// Results are placed by chunk index, so a slow first request that finishes
+    /// last still lands on its own groups.
+    #[tokio::test]
+    async fn results_match_groups_when_requests_finish_out_of_order() {
+        let s = Stub {
+            slow_prefix: Some("s"),
+            fail_id: Some("f0"),
+            ..stub()
+        };
+        let (c, _) = client_for(s, 5).await;
+        let groups = vec![ids("s", 60), ids("b", 60), ids("f", 60)];
+        let out = c.bulk_grouped(&groups).await;
+        for (g, r) in groups.iter().zip(&out).take(2) {
+            let r = r.as_ref().unwrap();
+            assert_eq!(r.stats.len(), g.len());
+            assert!(g.iter().all(|id| r.stats.contains_key(id)));
+        }
+        assert_eq!(out[2], Err(StatsError::Status(500)));
     }
 
     #[tokio::test]
