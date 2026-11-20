@@ -228,6 +228,94 @@ fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> FcmErr
     }
 }
 
+/// Bounds one Live Activity send end to end, including the `gcp_auth` token
+/// fetch, which has no timeout of its own.
+pub const LIVE_ACTIVITY_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Retry delay for Live Activity send errors that carry no better hint.
+const LIVE_ACTIVITY_DEFAULT_RETRY: Duration = Duration::from_secs(60);
+
+/// Which Live Activity event a message carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveActivityEvent {
+    /// Refresh the activity's content state.
+    Update,
+    /// End the activity; iOS removes it from the Lock Screen at `dismissal_unix`.
+    End { dismissal_unix: u64 },
+}
+
+/// One Live Activity push, addressed through Firebase to an APNs activity token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveActivityMessage {
+    /// FCM registration token of the device that owns the activity.
+    pub fcm_token: String,
+    /// APNs push token of the activity itself.
+    pub activity_token: String,
+    pub event: LiveActivityEvent,
+    /// The activity's `ContentState`, serialized exactly as the app decodes it.
+    pub content_state: serde_json::Value,
+    /// Send time, Unix seconds.
+    pub timestamp_unix: u64,
+    /// After this instant iOS marks the activity stale and APNs drops the push.
+    pub stale_unix: u64,
+}
+
+/// What the worker should do with an activity after a failed Live Activity send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Stop updating this activity.
+    Finish,
+    /// Try again after the given delay.
+    RetryAfter(Duration),
+    /// Leave the schedule alone and try again on the next normal cycle.
+    RetryNextCycle,
+}
+
+/// Maps a Live Activity send error onto the worker's next step.
+///
+/// A rejected payload or a dead token will not improve by retrying. A missing
+/// APNs key (`Unauthorized`) needs ops, so it must not become a retry storm.
+pub fn live_activity_send_outcome(err: &FcmError) -> SendOutcome {
+    match err {
+        FcmError::TokenNotRegistered | FcmError::InvalidRequest(_) => SendOutcome::Finish,
+        FcmError::Unauthorized(_) => SendOutcome::RetryNextCycle,
+        FcmError::RetryableInternal(delay) => SendOutcome::RetryAfter(*delay),
+        _ => SendOutcome::RetryAfter(LIVE_ACTIVITY_DEFAULT_RETRY),
+    }
+}
+
+/// Builds the FCM v1 `message` object for a Live Activity push.
+///
+/// Carries no `notification`, `data` or `android` block: the activity is driven
+/// purely by the APNs `aps` payload. `apns-expiration` equals `stale-date`, so a
+/// late update is dropped rather than delivered stale.
+pub fn live_activity_body(message: &LiveActivityMessage) -> serde_json::Value {
+    let (event, priority) = match message.event {
+        LiveActivityEvent::Update => ("update", "5"),
+        LiveActivityEvent::End { .. } => ("end", "10"),
+    };
+    let mut aps = serde_json::json!({
+        "timestamp": message.timestamp_unix,
+        "event": event,
+        "content-state": message.content_state,
+        "stale-date": message.stale_unix,
+    });
+    if let LiveActivityEvent::End { dismissal_unix } = message.event {
+        aps["dismissal-date"] = serde_json::json!(dismissal_unix);
+    }
+    serde_json::json!({
+        "token": message.fcm_token,
+        "apns": {
+            "live_activity_token": message.activity_token,
+            "headers": {
+                "apns-priority": priority,
+                "apns-expiration": message.stale_unix.to_string(),
+            },
+            "payload": { "aps": aps },
+        },
+    })
+}
+
 // Define the trait for sending FCM messages
 #[async_trait]
 pub trait FcmSend: Send + Sync {
@@ -240,6 +328,20 @@ pub trait FcmSend: Send + Sync {
         token: &str,
         payload: FcmPayload,
     ) -> std::result::Result<(), FcmError>;
+
+    /// Sends a Live Activity update or end push.
+    ///
+    /// The default refuses, so existing fakes keep compiling; a wrapper that
+    /// forgets to forward this is loud rather than silently dropping updates.
+    async fn send_live_activity(
+        &self,
+        _message: &LiveActivityMessage,
+    ) -> std::result::Result<(), FcmError> {
+        tracing::error!("live activity send not supported by this FcmSend implementation");
+        Err(FcmError::InternalRequest(
+            "live activity unsupported".into(),
+        ))
+    }
 }
 
 /// Sends to the FCM v1 REST API over `reqwest`, authenticating with Application
@@ -476,6 +578,81 @@ impl FcmSend for RealFcmClient {
             }
         }
     }
+
+    /// Posts a Live Activity push, bounded by [`LIVE_ACTIVITY_SEND_TIMEOUT`].
+    async fn send_live_activity(
+        &self,
+        message: &LiveActivityMessage,
+    ) -> std::result::Result<(), FcmError> {
+        match tokio::time::timeout(
+            LIVE_ACTIVITY_SEND_TIMEOUT,
+            self.send_live_activity_inner(message),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let error = FcmError::InternalRequest(format!(
+                    "Live Activity send exceeded {:?}",
+                    LIVE_ACTIVITY_SEND_TIMEOUT
+                ));
+                tracing::error!(
+                    "Live Activity send failed for fcm token prefix {} activity token prefix {}: {}",
+                    token_prefix(&message.fcm_token),
+                    token_prefix(&message.activity_token),
+                    error
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
+impl RealFcmClient {
+    async fn send_live_activity_inner(
+        &self,
+        message: &LiveActivityMessage,
+    ) -> std::result::Result<(), FcmError> {
+        let fcm_prefix = token_prefix(&message.fcm_token);
+        let activity_prefix = token_prefix(&message.activity_token);
+
+        let access_token =
+            self.token_provider.token(&[FCM_SCOPE]).await.map_err(|e| {
+                FcmError::Unauthorized(format!("Failed to obtain access token: {}", e))
+            })?;
+
+        let response = self
+            .http
+            .post(&self.send_url)
+            .bearer_auth(access_token.as_str())
+            .json(&serde_json::json!({ "message": live_activity_body(message) }))
+            .send()
+            .await
+            .map_err(|e| FcmError::InternalRequest(format!("FCM request failed: {}", e)))?;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+
+        if status.is_success() {
+            tracing::info!(
+                "Live Activity send successful for fcm token prefix {} activity token prefix {}",
+                fcm_prefix,
+                activity_prefix
+            );
+            return Ok(());
+        }
+
+        let error = classify_error(status, &headers, &body);
+        tracing::error!(
+            "Live Activity send failed for fcm token prefix {} activity token prefix {}: status={} {}",
+            fcm_prefix,
+            activity_prefix,
+            status,
+            error
+        );
+        Err(error)
+    }
 }
 
 impl RealFcmClient {
@@ -643,6 +820,17 @@ impl FcmClient {
         // Delegate to the trait object's method
         self.client.send_single(token, payload).await
     }
+
+    /// Sends a Live Activity update or end push.
+    ///
+    /// Deliberately records none of the shared `fcm_send_*` metrics; callers
+    /// count Live Activity sends under their own metric.
+    pub async fn send_live_activity(
+        &self,
+        message: &LiveActivityMessage,
+    ) -> std::result::Result<(), FcmError> {
+        self.client.send_live_activity(message).await
+    }
 }
 
 // Define the mock FCM sender struct (Now public and outside cfg(test))
@@ -652,6 +840,7 @@ pub struct MockFcmSender {
     sent_messages: Arc<Mutex<Vec<(String, FcmPayload)>>>, // Made fields crate-public for direct access if needed, or keep private and use methods
     // Optional: Simulate specific errors for certain tokens
     error_tokens: Arc<Mutex<HashMap<String, FcmError>>>,
+    live_activity_messages: Arc<Mutex<Vec<LiveActivityMessage>>>,
 }
 
 // Make methods public
@@ -660,7 +849,13 @@ impl MockFcmSender {
         Self {
             sent_messages: Arc::new(Mutex::new(Vec::new())),
             error_tokens: Arc::new(Mutex::new(HashMap::new())),
+            live_activity_messages: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Live Activity messages recorded so far.
+    pub fn get_live_activity_messages(&self) -> Vec<LiveActivityMessage> {
+        self.live_activity_messages.lock().unwrap().clone()
     }
 
     // Helper to retrieve sent messages for assertions
@@ -680,6 +875,7 @@ impl MockFcmSender {
     pub fn clear(&self) {
         self.sent_messages.lock().unwrap().clear();
         self.error_tokens.lock().unwrap().clear();
+        self.live_activity_messages.lock().unwrap().clear();
     }
 }
 
@@ -707,6 +903,25 @@ impl FcmSend for MockFcmSender {
         );
         let mut messages = self.sent_messages.lock().unwrap();
         messages.push((token.to_string(), payload));
+        Ok(())
+    }
+
+    async fn send_live_activity(
+        &self,
+        message: &LiveActivityMessage,
+    ) -> std::result::Result<(), FcmError> {
+        if let Some(error) = self
+            .error_tokens
+            .lock()
+            .unwrap()
+            .get(&message.activity_token)
+        {
+            return Err(error.clone());
+        }
+        self.live_activity_messages
+            .lock()
+            .unwrap()
+            .push(message.clone());
         Ok(())
     }
 }
@@ -1551,5 +1766,165 @@ mod tests {
 
         let result = client.send_single("dead-token", social_payload()).await;
         assert!(matches!(result, Err(FcmError::TokenNotRegistered)));
+    }
+
+    // ---------------------------------------------------------------------
+    // Live Activity sends
+    // ---------------------------------------------------------------------
+
+    fn live_message(event: LiveActivityEvent) -> LiveActivityMessage {
+        LiveActivityMessage {
+            fcm_token: "fcm-token-abcdef".to_string(),
+            activity_token: "activity-token-123456".to_string(),
+            event,
+            content_state: serde_json::json!({"phase": "live", "views": 5, "likes": null}),
+            timestamp_unix: 1_000,
+            stale_unix: 1_600,
+        }
+    }
+
+    #[test]
+    fn live_activity_update_body_shape() {
+        let body = live_activity_body(&live_message(LiveActivityEvent::Update));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "token": "fcm-token-abcdef",
+                "apns": {
+                    "live_activity_token": "activity-token-123456",
+                    "headers": {"apns-priority": "5", "apns-expiration": "1600"},
+                    "payload": {"aps": {
+                        "timestamp": 1000,
+                        "event": "update",
+                        "content-state": {"phase": "live", "views": 5, "likes": null},
+                        "stale-date": 1600,
+                    }},
+                },
+            })
+        );
+        for key in ["notification", "data", "android"] {
+            assert!(body.get(key).is_none(), "{key} must be absent");
+        }
+        assert!(body["apns"]["payload"]["aps"]
+            .get("dismissal-date")
+            .is_none());
+    }
+
+    #[test]
+    fn live_activity_end_body_has_dismissal_and_priority_10() {
+        let body = live_activity_body(&live_message(LiveActivityEvent::End {
+            dismissal_unix: 2_800,
+        }));
+        let aps = &body["apns"]["payload"]["aps"];
+        assert_eq!(aps["event"], "end");
+        assert_eq!(aps["dismissal-date"], 2_800);
+        assert_eq!(aps["stale-date"], 1_600);
+        assert_eq!(body["apns"]["headers"]["apns-priority"], "10");
+        assert_eq!(body["apns"]["headers"]["apns-expiration"], "1600");
+    }
+
+    #[tokio::test]
+    async fn real_client_posts_live_activity_body() {
+        let (client, captured) =
+            stub_fcm(200, &[], r#"{"name":"projects/test-project/messages/1"}"#).await;
+        let message = live_message(LiveActivityEvent::Update);
+        client
+            .send_live_activity(&message)
+            .await
+            .expect("send should succeed");
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.as_deref(), Some("Bearer stub-access-token"));
+        assert_eq!(requests[0].0["message"], live_activity_body(&message));
+    }
+
+    #[tokio::test]
+    async fn mock_records_live_activity() {
+        let mock = MockFcmSender::new();
+        let client = FcmClient::new_with_impl(Box::new(mock.clone()));
+        let message = live_message(LiveActivityEvent::Update);
+        client.send_live_activity(&message).await.unwrap();
+        assert_eq!(mock.get_live_activity_messages(), vec![message]);
+        assert!(mock.get_sent_messages().is_empty());
+    }
+
+    struct HangingTokenProvider;
+
+    #[async_trait]
+    impl TokenProvider for HangingTokenProvider {
+        async fn token(
+            &self,
+            _scopes: &[&str],
+        ) -> std::result::Result<Arc<gcp_auth::Token>, gcp_auth::Error> {
+            std::future::pending().await
+        }
+
+        async fn project_id(&self) -> std::result::Result<Arc<str>, gcp_auth::Error> {
+            Ok(Arc::from("test-project"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_activity_send_times_out() {
+        let client = RealFcmClient::with_parts(
+            reqwest::Client::new(),
+            Arc::new(HangingTokenProvider),
+            "http://127.0.0.1:1",
+            "test-project",
+        );
+        let started = tokio::time::Instant::now();
+        let result = client
+            .send_live_activity(&live_message(LiveActivityEvent::Update))
+            .await;
+        assert!(matches!(result, Err(FcmError::InternalRequest(_))));
+        assert_eq!(started.elapsed(), LIVE_ACTIVITY_SEND_TIMEOUT);
+        assert_eq!(LIVE_ACTIVITY_SEND_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn live_activity_send_leaves_shared_fcm_metrics_untouched() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (client, _captured) = stub_fcm(200, &[], "{}").await;
+        let fcm = FcmClient::new_with_impl(Box::new(client));
+        fcm.send_live_activity(&live_message(LiveActivityEvent::Update))
+            .await
+            .unwrap();
+        let rendered = handle.render();
+        assert!(!rendered.contains("push_fcm_sends"), "{rendered}");
+    }
+
+    #[test]
+    fn live_activity_outcome_mapping() {
+        assert!(matches!(
+            live_activity_send_outcome(&FcmError::TokenNotRegistered),
+            SendOutcome::Finish
+        ));
+        assert!(matches!(
+            live_activity_send_outcome(&FcmError::InvalidRequest("x".into())),
+            SendOutcome::Finish
+        ));
+        assert!(matches!(
+            live_activity_send_outcome(&FcmError::Unauthorized("x".into())),
+            SendOutcome::RetryNextCycle
+        ));
+        assert!(matches!(
+            live_activity_send_outcome(&FcmError::RetryableInternal(Duration::from_secs(7))),
+            SendOutcome::RetryAfter(d) if d == Duration::from_secs(7)
+        ));
+        for err in [
+            FcmError::InternalError,
+            FcmError::InternalRequest("x".into()),
+            FcmError::Unknown {
+                code: 418,
+                hint: None,
+            },
+        ] {
+            assert!(matches!(
+                live_activity_send_outcome(&err),
+                SendOutcome::RetryAfter(d) if d == Duration::from_secs(60)
+            ));
+        }
     }
 }
