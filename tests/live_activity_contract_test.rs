@@ -4,7 +4,9 @@
 //! but not drift between them. Changing the contract takes two coordinated
 //! PRs, one per repo, each updating the file and its pin.
 
-use divine_push_service::live_activity::content::{decide, needs_views_fallback, Decision};
+use divine_push_service::live_activity::content::{
+    decide, needs_views_fallback, ContentState, Decision,
+};
 use divine_push_service::live_activity::payload::{ActivityState, LiveActivityRegistration};
 use divine_push_service::live_activity::stats_client::{BulkStats, VersionStats};
 use divine_push_service::live_activity::store::StoredActivity;
@@ -195,4 +197,27 @@ fn count_cases() {
             assert_eq!(c.comments, case.expected.comments, "{} comments", case.name);
         }
     }
+}
+
+/// Every content state the server could send (one carrying `postCoordinate`)
+/// survives a round trip through the server's own type unchanged, so the keys
+/// and value shapes the server writes are exactly the ones the app reads.
+#[test]
+fn content_states_round_trip_through_the_server_type() {
+    let f: Fixture = serde_json::from_str(FIXTURE).unwrap();
+    let mut checked = 0;
+    for case in &f.content_states {
+        if case.json.get("postCoordinate").is_none() {
+            continue;
+        }
+        let state: ContentState = serde_json::from_value(case.json.clone())
+            .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        let back = serde_json::to_value(&state).unwrap();
+        assert_eq!(back, case.json, "{}", case.name);
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no content state with a postCoordinate was checked"
+    );
 }
