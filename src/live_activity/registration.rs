@@ -99,10 +99,14 @@ pub async fn handle(state: &AppState, event: &Event, fcm_token: &str, raw: &Valu
         UpsertOutcome::Tombstoned => "tombstoned",
         UpsertOutcome::OverOwnerCap => "over_owner_cap",
         UpsertOutcome::OverTotalCap => "over_total_cap",
+        UpsertOutcome::TokenOwnedElsewhere => "token_owned_elsewhere",
     };
     match &outcome {
         UpsertOutcome::OverOwnerCap | UpsertOutcome::OverTotalCap => {
             warn!(%event_id, pubkey = %owner, activity_token_prefix = %activity_prefix, fcm_token_prefix = %fcm_prefix, outcome = label, "Refused Live Activity over its cap");
+        }
+        UpsertOutcome::TokenOwnedElsewhere => {
+            warn!(%event_id, pubkey = %owner, activity_token_prefix = %activity_prefix, outcome = label, "Refused Live Activity whose token is bound to another pubkey");
         }
         UpsertOutcome::Stale | UpsertOutcome::Tombstoned => {
             debug!(%event_id, pubkey = %owner, activity_token_prefix = %activity_prefix, outcome = label, "Ignored Live Activity registration");

@@ -4009,6 +4009,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_from_other_pubkey_for_a_live_token_is_refused() {
+        let victim = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        handle_registration(&victim.state, &victim.la_event(&token, "active", now - 10))
+            .await
+            .unwrap();
+
+        // The attacker learned the activity token and signs an `active` for its own post.
+        let attacker = Keys::generate();
+        let attacker_hex = attacker.public_key().to_hex();
+        let attacker_event = {
+            let payload = serde_json::json!({
+                "token": format!("synthetic-la-fcm-{attacker_hex}"),
+                "notificationsAuthorized": true,
+                "liveActivity": la_object(&attacker_hex, &token, "active", now),
+            });
+            let encrypted = nostr_sdk::nips::nip44::encrypt(
+                attacker.secret_key(),
+                &victim.service.public_key(),
+                payload.to_string(),
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+                .custom_created_at(Timestamp::from(now))
+                .sign_with_keys(&attacker)
+                .unwrap()
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            handle_registration(&victim.state, &attacker_event)
+                .await
+                .unwrap();
+        }
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                r#"push_live_activity_registrations_total{outcome="token_owned_elsewhere"} 1"#
+            ),
+            "{rendered}"
+        );
+
+        assert!(la_hash(&victim.pool, &attacker_hex, &token)
+            .await
+            .is_empty());
+        assert_eq!(
+            la_job_score(&victim.pool, &attacker_hex, &token).await,
+            None
+        );
+        let stored = victim.activity(&token).await;
+        assert_eq!(stored.get("state").map(String::as_str), Some("active"));
+        assert_eq!(stored.get("fcm_token"), Some(&victim.fcm));
+        assert!(la_job_score(&victim.pool, &victim.owner(), &token)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn invalid_live_activity_is_dropped_not_registered() {
         let f = LaFixture::new(true).await;
         let token = random_hex64();

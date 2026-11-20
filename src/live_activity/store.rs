@@ -11,6 +11,10 @@
 //! - `live_activity_owner:{owner}`: set of the owner's activity ids, for the per-owner cap.
 //! - `live_activity_device:{owner}:{blake3(fcm_token)}`: the device's current activity id.
 //! - `live_activity_jobs`: sorted set of active ids scored by due time in Unix ms.
+//! - `live_activity_token_owner:{blake3(activity_token)}`: the owner pubkey the
+//!   token is bound to. The first owner to store an activity for a token holds it
+//!   until the activity hash's horizon, so nobody who learns the token can attach
+//!   their own counts to it. Ends do not need it: they stay in the signer's namespace.
 //!
 //! Every write is one Lua script, so concurrent replicas cannot interleave. The
 //! deployment uses a single Redis primary, so scripts may touch keys they derive.
@@ -27,6 +31,7 @@ const ACTIVITY_PREFIX: &str = "live_activity:";
 const OWNER_PREFIX: &str = "live_activity_owner:";
 const DEVICE_PREFIX: &str = "live_activity_device:";
 const JOBS_ZSET: &str = "live_activity_jobs";
+const TOKEN_OWNER_PREFIX: &str = "live_activity_token_owner:";
 
 /// Seconds a tombstone outlives the window: matches the end event's dismissal date.
 const TOMBSTONE_GRACE_SECS: u64 = 1800;
@@ -71,6 +76,9 @@ pub enum UpsertOutcome {
     OverOwnerCap,
     /// The service already tracks `max_total` active activities. Nothing stored.
     OverTotalCap,
+    /// The activity token is bound to another owner's live or recent activity.
+    /// Nothing stored.
+    TokenOwnedElsewhere,
 }
 
 /// Result of an `ended` registration.
@@ -125,7 +133,7 @@ static UPSERT: LazyLock<Script> = LazyLock::new(|| {
     Script::new(&format!(
         "{PRELUDE}{}",
         r#"
-local key, okey, dkey = KEYS[1], KEYS[2], KEYS[3]
+local key, okey, dkey, tkey = KEYS[1], KEYS[2], KEYS[3], KEYS[5]
 local id, owner, fcm, fcm_hash = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 local reg = cjson.decode(ARGV[5])
 local at, eid, due = ARGV[6], ARGV[7], ARGV[8]
@@ -148,7 +156,12 @@ local function merge(stored_json, incoming)
   return cjson.encode(out)
 end
 
+-- First owner wins the token until the activity's horizon; refreshed like the hash.
+local bound = redis.call('GET', tkey)
+if bound and bound ~= owner then return {8, ''} end
+
 local function attach()
+  redis.call('SET', tkey, owner, 'EXAT', exat)
   redis.call('SET', dkey, id, 'EXAT', exat)
   redis.call('SADD', okey, id)
   local ttl = redis.call('TTL', okey)
@@ -402,6 +415,10 @@ pub async fn upsert_active(
         .key(format!("{OWNER_PREFIX}{owner}"))
         .key(format!("{DEVICE_PREFIX}{owner}:{fcm_hash}"))
         .key(JOBS_ZSET)
+        .key(format!(
+            "{TOKEN_OWNER_PREFIX}{}",
+            blake3_hex(&reg.activity_token)
+        ))
         .arg(&id)
         .arg(owner)
         .arg(fcm_token)
@@ -425,6 +442,7 @@ pub async fn upsert_active(
         4 => UpsertOutcome::Tombstoned,
         5 => UpsertOutcome::OverOwnerCap,
         6 => UpsertOutcome::OverTotalCap,
+        8 => UpsertOutcome::TokenOwnedElsewhere,
         other => {
             return Err(ServiceError::Internal(format!(
                 "live activity upsert returned unknown code {other}"

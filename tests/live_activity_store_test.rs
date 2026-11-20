@@ -381,12 +381,14 @@ async fn another_owner_never_affects_an_activity() {
     let r = borrow(&x_active);
     assert_ne!(id_of(&r), id_y);
     let out = upsert(&pool, &x_active, &hex(40), &r, 300, &ev('3'), FAR_DUE_MS).await;
-    assert_eq!(out, UpsertOutcome::Created, "stored in X's own namespace");
     assert_eq!(
-        hgetall(&pool, &format!("live_activity:{}", id_of(&r))).await["owner"],
-        x_active
+        out,
+        UpsertOutcome::TokenOwnedElsewhere,
+        "Y's live token is bound to Y"
     );
-    store::finish(&pool, &id_of(&r)).await.unwrap();
+    assert!(hgetall(&pool, &format!("live_activity:{}", id_of(&r)))
+        .await
+        .is_empty());
 
     let x_end = owner();
     let mut r = borrow(&x_end);
@@ -1091,4 +1093,157 @@ async fn active_past_its_dismissal_horizon_is_stale() {
     );
 
     store::finish(&pool, &id_of(&held)).await.unwrap();
+}
+
+fn binding_key(activity_token: &str) -> String {
+    format!(
+        "live_activity_token_owner:{}",
+        blake3::hash(activity_token.as_bytes()).to_hex()
+    )
+}
+
+#[tokio::test]
+async fn second_owner_cannot_claim_a_live_token() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let x = owner();
+    let fcm_x = hex(40);
+    let r_x = reg(&x, "a", &[&ev('a')]);
+    let id_x = id_of(&r_x);
+    assert_eq!(
+        upsert(&pool, &x, &fcm_x, &r_x, 100, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Created
+    );
+    assert_eq!(
+        get(&pool, &binding_key(&r_x.activity_token)).await,
+        Some(x.clone())
+    );
+
+    let y = owner();
+    let fcm_y = hex(40);
+    let mut r_y = reg(&y, "a", &[&ev('b')]);
+    r_y.activity_token = r_x.activity_token.clone();
+    let out = upsert(&pool, &y, &fcm_y, &r_y, 200, &ev('2'), FAR_DUE_MS).await;
+    assert_eq!(out, UpsertOutcome::TokenOwnedElsewhere);
+
+    // Y has nothing: no hash, job, device pointer or owner-set entry.
+    let id_y = id_of(&r_y);
+    assert!(hgetall(&pool, &format!("live_activity:{id_y}"))
+        .await
+        .is_empty());
+    assert_eq!(job_score(&pool, &id_y).await, None);
+    assert_eq!(get(&pool, &device_key(&y, &fcm_y)).await, None);
+    assert!(smembers(&pool, &format!("live_activity_owner:{y}"))
+        .await
+        .is_empty());
+
+    // X is unaffected, and the binding still names X.
+    assert!(store::is_live(&pool, &id_x).await.unwrap());
+    assert_eq!(job_score(&pool, &id_x).await, Some(FAR_DUE_MS));
+    assert_eq!(
+        get(&pool, &device_key(&x, &fcm_x)).await,
+        Some(id_x.clone())
+    );
+    assert_eq!(
+        get(&pool, &binding_key(&r_x.activity_token)).await,
+        Some(x.clone())
+    );
+
+    // Once X ends it, the binding stays until its expiry: Y is still refused.
+    let mut end_x = r_x.clone();
+    end_x.state = ActivityState::Ended;
+    store::end_by_token(&pool, &x, &end_x, 300, &ev('3'))
+        .await
+        .unwrap();
+    assert_eq!(
+        upsert(&pool, &y, &fcm_y, &r_y, 400, &ev('4'), FAR_DUE_MS).await,
+        UpsertOutcome::TokenOwnedElsewhere
+    );
+}
+
+#[tokio::test]
+async fn binding_expires_with_the_activity() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let x = owner();
+    let r = reg(&x, "a", &[&ev('a')]);
+    upsert(&pool, &x, &hex(40), &r, 100, &ev('1'), FAR_DUE_MS).await;
+
+    let horizon = (r.window_ends_at + 2100 - now_secs()) as i64;
+    let binding = ttl(&pool, &binding_key(&r.activity_token)).await;
+    let hash = ttl(&pool, &format!("live_activity:{}", id_of(&r))).await;
+    assert!(
+        (horizon - 5..=horizon).contains(&binding),
+        "{binding} vs {horizon}"
+    );
+    assert!(
+        (binding - hash).abs() <= 1,
+        "binding {binding} vs hash {hash}"
+    );
+
+    // An update that moves the window moves the binding with the hash.
+    let mut later = r.clone();
+    later.window_ends_at += 60;
+    upsert(&pool, &x, &hex(40), &later, 101, &ev('1'), FAR_DUE_MS).await;
+    let binding = ttl(&pool, &binding_key(&r.activity_token)).await;
+    let hash = ttl(&pool, &format!("live_activity:{}", id_of(&r))).await;
+    assert!(
+        (binding - hash).abs() <= 1,
+        "binding {binding} vs hash {hash}"
+    );
+    assert!(binding > horizon, "{binding} extended past {horizon}");
+
+    store::finish(&pool, &id_of(&r)).await.unwrap();
+}
+
+#[tokio::test]
+async fn same_owner_rotation_and_updates_still_work() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let x = owner();
+    let fcm = hex(40);
+    let first = reg(&x, "same", &[&ev('a')]);
+    assert_eq!(
+        upsert(&pool, &x, &fcm, &first, 100, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Created
+    );
+    assert_eq!(
+        upsert(&pool, &x, &fcm, &first, 101, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Updated
+    );
+
+    let mut rotated = reg(&x, "same", &[&ev('a')]);
+    rotated.posted_at = first.posted_at;
+    rotated.window_ends_at = first.window_ends_at;
+    assert_eq!(
+        upsert(&pool, &x, &fcm, &rotated, 102, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Superseded {
+            previous_id: id_of(&first)
+        }
+    );
+    // The binding follows the new token; the old one keeps naming X until it expires.
+    assert_eq!(
+        get(&pool, &binding_key(&rotated.activity_token)).await,
+        Some(x.clone())
+    );
+    assert_eq!(
+        get(&pool, &binding_key(&first.activity_token)).await,
+        Some(x.clone())
+    );
+
+    let y = owner();
+    let mut steal = reg(&y, "same", &[&ev('b')]);
+    steal.activity_token = rotated.activity_token.clone();
+    assert_eq!(
+        upsert(&pool, &y, &hex(40), &steal, 103, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::TokenOwnedElsewhere
+    );
+
+    store::finish(&pool, &id_of(&rotated)).await.unwrap();
 }

@@ -216,6 +216,7 @@ results influence work.
 - `live_activity_owner:{owner}` - Set of an owner's live activity ids, for `max_active_per_owner`; expired or ended members are pruned when the cap is checked
 - `live_activity_device:{owner}:{blake3(fcmToken)}` - The device's current activity id: one active activity per owner and device, a newer one supersedes it
 - `live_activity_jobs` - Sorted set of active activity ids scored by due time (Unix ms); a claim leases by rescoring to now + lease. `ZCARD` is the active count and the `max_active_total` cap
+- `live_activity_token_owner:{blake3(activityToken)}` - Owner pubkey an activity token is bound to: set by the first owner to store an activity for it and refreshed with that activity's hash (expires at `windowEndsAt` + 2100 s, outliving a tombstone). Any other owner's `active` for the token is refused (`token_owned_elsewhere`), so someone who learns a token cannot attach their counts to another person's card
 
 ### Notification Types
 | Type | Trigger Kind | Description |
