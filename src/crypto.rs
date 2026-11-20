@@ -232,19 +232,29 @@ impl CryptoService {
         encrypted_content: &str,
         sender_pubkey: &PublicKey,
     ) -> Result<TokenPayload, CryptoError> {
+        self.decrypt_token_payload_json(encrypted_content, sender_pubkey)
+            .map(|(payload, _)| payload)
+    }
+
+    /// Like [`Self::decrypt_token_payload`], also returning the decrypted JSON as a
+    /// `Value`, so a caller can tell a key that is present (even as `null`) from an
+    /// absent one. The plaintext is parsed twice so `TokenPayload` validation is
+    /// unchanged.
+    pub fn decrypt_token_payload_json(
+        &self,
+        encrypted_content: &str,
+        sender_pubkey: &PublicKey,
+    ) -> Result<(TokenPayload, serde_json::Value), CryptoError> {
         let decrypted = self.decrypt_nip44(encrypted_content, sender_pubkey)?;
-
-        // Parse JSON payload
         let payload: TokenPayload = serde_json::from_str(&decrypted)?;
-
         // Validate token is not empty
         if payload.token.is_empty() {
             return Err(CryptoError::InvalidToken(
                 "Token cannot be empty".to_string(),
             ));
         }
-
-        Ok(payload)
+        let raw: serde_json::Value = serde_json::from_str(&decrypted)?;
+        Ok((payload, raw))
     }
 
     /// Decrypt and parse filter upsert payload from NIP-44 encrypted content
