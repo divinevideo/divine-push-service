@@ -34,6 +34,146 @@ pub struct Settings {
     pub notification: NotificationSettings,
     #[serde(default)]
     pub campaign_delivery: CampaignDeliverySettings,
+    #[serde(default)]
+    pub live_activity: LiveActivitySettings,
+}
+
+/// iOS Live Activity updates for a just-published post.
+///
+/// Env override: `NOSTR_PUSH__LIVE_ACTIVITY__<FIELD>`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiveActivitySettings {
+    /// Off by default. Disabled: no worker is spawned and no active activity is
+    /// stored or sent; an `ended` registration is still tombstoned.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Origin of the Funnelcake API (scheme, host, optional port; no path).
+    #[serde(default)]
+    pub funnelcake_base_url: String,
+    /// Seconds between updates for one activity.
+    #[serde(default = "default_la_cadence_secs")]
+    pub cadence_secs: u64,
+    /// Milliseconds between worker polls of the due set.
+    #[serde(default = "default_la_poll_millis")]
+    pub poll_millis: u64,
+    /// Timeout for one Funnelcake request.
+    #[serde(default = "default_la_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Lease taken on a due activity while it is being processed.
+    #[serde(default = "default_la_lease_secs")]
+    pub lease_secs: u64,
+    /// Deadline for one worker tick.
+    #[serde(default = "default_la_tick_deadline_secs")]
+    pub tick_deadline_secs: u64,
+    /// Concurrent sends per tick. Capped at 8 to stay under the 10-connection
+    /// Redis pool.
+    #[serde(default = "default_la_max_concurrency")]
+    pub max_concurrency: usize,
+    #[serde(default = "default_la_max_active_per_owner")]
+    pub max_active_per_owner: usize,
+    #[serde(default = "default_la_max_active_total")]
+    pub max_active_total: usize,
+    /// Per-replica budget of `/views` fallback lookups per minute (under
+    /// Funnelcake's 300/min general limit).
+    #[serde(default = "default_la_views_lookups_per_minute")]
+    pub views_lookups_per_minute: u32,
+}
+
+impl Default for LiveActivitySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            funnelcake_base_url: String::new(),
+            cadence_secs: default_la_cadence_secs(),
+            poll_millis: default_la_poll_millis(),
+            request_timeout_secs: default_la_request_timeout_secs(),
+            lease_secs: default_la_lease_secs(),
+            tick_deadline_secs: default_la_tick_deadline_secs(),
+            max_concurrency: default_la_max_concurrency(),
+            max_active_per_owner: default_la_max_active_per_owner(),
+            max_active_total: default_la_max_active_total(),
+            views_lookups_per_minute: default_la_views_lookups_per_minute(),
+        }
+    }
+}
+
+impl LiveActivitySettings {
+    /// Checks timing and concurrency invariants, and the Funnelcake URL when enabled.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=8).contains(&self.max_concurrency) {
+            return Err("live_activity.max_concurrency must be between 1 and 8".to_string());
+        }
+        let worst_tick = self.tick_deadline_secs + self.request_timeout_secs.max(10);
+        if worst_tick >= self.lease_secs {
+            return Err(format!(
+                "live_activity.tick_deadline_secs + max(10, request_timeout_secs) ({worst_tick}) must be below lease_secs ({})",
+                self.lease_secs
+            ));
+        }
+        if self.enabled {
+            validate_funnelcake_base_url(&self.funnelcake_base_url)
+                .map_err(|e| format!("live_activity.funnelcake_base_url: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Accepts an origin-only Funnelcake URL: `https`, or `http` only for in-cluster
+/// and loopback hosts. Rejects userinfo, a path, a query and a fragment.
+pub fn validate_funnelcake_base_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("not a valid URL: {e}"))?;
+    let host = parsed.host_str().ok_or("missing host")?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let local = host.ends_with(".svc.cluster.local")
+                || host.ends_with(".svc")
+                || matches!(host, "localhost" | "127.0.0.1" | "::1");
+            if !local {
+                return Err("http is only allowed for in-cluster and loopback hosts".to_string());
+            }
+        }
+        other => return Err(format!("unsupported scheme {other}")),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("must not contain userinfo".to_string());
+    }
+    if !(parsed.path().is_empty() || parsed.path() == "/") {
+        return Err("must not contain a path".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("must not contain a query or fragment".to_string());
+    }
+    Ok(())
+}
+
+fn default_la_cadence_secs() -> u64 {
+    180
+}
+fn default_la_poll_millis() -> u64 {
+    1000
+}
+fn default_la_request_timeout_secs() -> u64 {
+    10
+}
+fn default_la_lease_secs() -> u64 {
+    120
+}
+fn default_la_tick_deadline_secs() -> u64 {
+    90
+}
+fn default_la_max_concurrency() -> usize {
+    8
+}
+fn default_la_max_active_per_owner() -> usize {
+    5
+}
+fn default_la_max_active_total() -> usize {
+    5000
+}
+fn default_la_views_lookups_per_minute() -> u32 {
+    100
 }
 
 /// Collecting campaign notifications from `divine-engagement`.
@@ -740,6 +880,10 @@ impl Settings {
             ));
         }
 
+        self.live_activity
+            .validate()
+            .map_err(ConfigError::Message)?;
+
         Ok(())
     }
 
@@ -1090,5 +1234,58 @@ mod tests {
             settings.validate().is_ok(),
             "normal delivery needs no allowlist"
         );
+    }
+
+    #[test]
+    fn live_activity_defaults_off() {
+        let settings = load_runtime_settings("settings.development.yaml");
+        assert!(!settings.live_activity.enabled);
+        let prod = load_runtime_settings("settings.yaml");
+        assert!(!prod.live_activity.enabled);
+        assert!(prod.validate().is_ok());
+    }
+
+    #[test]
+    fn funnelcake_url_validation() {
+        for ok in [
+            "http://funnelcake-api.funnelcake.svc.cluster.local:8080",
+            "http://127.0.0.1:4000",
+            "https://relay.divine.video",
+        ] {
+            assert!(validate_funnelcake_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "ftp://x",
+            "https://user:pw@x",
+            "http://relay.divine.video",
+            "https://relay.divine.video/api",
+            "https://relay.divine.video?x=1",
+        ] {
+            assert!(validate_funnelcake_base_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn enabled_requires_url() {
+        let mut settings = load_runtime_settings("settings.yaml");
+        settings.live_activity.enabled = true;
+        settings.live_activity.funnelcake_base_url = String::new();
+        assert!(settings.validate().is_err());
+        settings.live_activity.funnelcake_base_url = "https://relay.divine.video".to_string();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn live_activity_timing_and_concurrency_bounds() {
+        let mut la = LiveActivitySettings::default();
+        assert!(la.validate().is_ok());
+        la.max_concurrency = 9;
+        assert!(la.validate().is_err());
+        la.max_concurrency = 0;
+        assert!(la.validate().is_err());
+        la.max_concurrency = 8;
+        la.tick_deadline_secs = 110; // 110 + 10 >= 120
+        assert!(la.validate().is_err());
     }
 }

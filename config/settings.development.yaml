@@ -97,3 +97,7 @@ campaign_delivery:
   # Staff-only bridge for an internal-test audience that opted in out of band.
   # Normal delivery verifies kind 3083 consent and registration timezone.
   allow_unverified_consent: false
+
+live_activity:
+  enabled: false  # Off until the server routing is rolled out ahead of app builds
+  funnelcake_base_url: ""  # Origin only; http allowed only for in-cluster/loopback hosts
