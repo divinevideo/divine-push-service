@@ -55,8 +55,9 @@ pub enum ViewsLookup {
     Found(Option<u64>),
     /// The fallback failed; treated like a failed stats request.
     Failed,
-    /// No lookup was made, because the per-replica budget is spent or the tick
-    /// is past its deadline; the last views sent are reused.
+    /// The last views sent are reused: the per-replica budget is spent, or
+    /// paused because Funnelcake rate limited `/views`, or the tick is past its
+    /// deadline.
     BudgetSpent,
 }
 
@@ -415,7 +416,8 @@ pub struct TickReport {
     pub released: usize,
     /// `/views` fallback lookups made.
     pub views_lookups: usize,
-    /// Fallbacks that found the per-minute budget spent.
+    /// Fallbacks that found the per-minute budget spent, or paused after
+    /// Funnelcake rate limited `/views`.
     pub views_budget_spent: usize,
     /// The tick stopped starting work at its deadline.
     pub deadline_hit: bool,
@@ -428,11 +430,14 @@ pub struct TickReport {
 }
 
 /// Per-replica budget of `/views` fallback lookups: at most `per_minute` in any
-/// 60 s, so the fallback stays under Funnelcake's general rate limit.
+/// 60 s, so the fallback stays under Funnelcake's general rate limit, and none
+/// while a `/views` rate limit's `Retry-After` runs.
 #[derive(Debug)]
 pub struct ViewsBudget {
     per_minute: usize,
     taken: std::sync::Mutex<VecDeque<SystemTime>>,
+    /// When the current pause started and when it ends.
+    paused: std::sync::Mutex<Option<(SystemTime, SystemTime)>>,
 }
 
 impl ViewsBudget {
@@ -441,12 +446,28 @@ impl ViewsBudget {
         Self {
             per_minute: usize::try_from(per_minute).unwrap_or(usize::MAX),
             taken: std::sync::Mutex::new(VecDeque::new()),
+            paused: std::sync::Mutex::new(None),
         }
     }
 
-    /// Takes one lookup if the last minute has room. Lookups stamped after
-    /// `now` (the clock stepped back) no longer count.
+    /// Takes no lookup for `wait` from `now`, after Funnelcake rate limited
+    /// `/views`. A pause already running past that end is kept.
+    pub fn pause(&self, now: SystemTime, wait: Duration) {
+        let until = now + wait;
+        let mut paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        if !paused.is_some_and(|(_, end)| end >= until) {
+            *paused = Some((now, until));
+        }
+    }
+
+    /// Takes one lookup if no pause is running and the last minute has room.
+    /// Lookups stamped after `now` (the clock stepped back) no longer count,
+    /// and neither does a pause that started after it.
     pub fn try_take(&self, now: SystemTime) -> bool {
+        let paused = *self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        if paused.is_some_and(|(start, end)| start <= now && now < end) {
+            return false;
+        }
         let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         taken.retain(|at| {
             now.duration_since(*at)
@@ -554,11 +575,13 @@ pub async fn tick(
     now: SystemTime,
 ) -> Result<TickReport> {
     let settings = &state.settings.live_activity;
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(settings.tick_deadline_secs);
     let clock = TickClock {
         now,
-        started: Instant::now(),
+        started,
+        deadline,
     };
-    let deadline = clock.started + Duration::from_secs(settings.tick_deadline_secs);
     let since_epoch = now
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ServiceError::Internal(format!("system clock before Unix epoch: {e}")))?;
@@ -641,8 +664,9 @@ pub async fn tick(
                 return None;
             }
             let processed = AssertUnwindSafe(async {
+                let cadence = cadence_secs(state);
                 let views =
-                    views_fallback(stats, budget, &activity, &result, clock, deadline, tally).await;
+                    views_fallback(stats, budget, &activity, &result, clock, cadence, tally).await;
                 process_one(state, &activity, result.as_ref(), views, now_unix).await
             })
             .catch_unwind()
@@ -732,8 +756,8 @@ fn count_stats_failures(results: &[std::result::Result<BulkStats, StatsError>]) 
     }
 }
 
-/// The back-off when any group was rate limited: the longest `Retry-After`
-/// (60 s when absent), kept between 1 s and one cadence.
+/// The back-off when any group was rate limited: the longest of their
+/// [`rate_limit_wait`]s.
 fn rate_limit_backoff(
     results: &[std::result::Result<BulkStats, StatsError>],
     cadence_secs: u64,
@@ -742,17 +766,22 @@ fn rate_limit_backoff(
         .iter()
         .filter_map(|r| match r {
             Err(StatsError::RateLimited { retry_after }) => {
-                Some(retry_after.unwrap_or(Duration::from_secs(DEFAULT_RATE_LIMIT_RETRY_SECS)))
+                Some(rate_limit_wait(*retry_after, cadence_secs))
             }
             _ => None,
         })
         .max()
-        .map(|d| {
-            d.clamp(
-                Duration::from_secs(1),
-                Duration::from_secs(cadence_secs.max(1)),
-            )
-        })
+}
+
+/// How long to wait after a rate limit: Funnelcake's `Retry-After` (60 s when
+/// absent), kept between 1 s and one cadence.
+fn rate_limit_wait(retry_after: Option<Duration>, cadence_secs: u64) -> Duration {
+    retry_after
+        .unwrap_or(Duration::from_secs(DEFAULT_RATE_LIMIT_RETRY_SECS))
+        .clamp(
+            Duration::from_secs(1),
+            Duration::from_secs(cadence_secs.max(1)),
+        )
 }
 
 /// `/views` fallbacks made and refused for lack of budget during one tick.
@@ -762,12 +791,14 @@ struct ViewsTally {
     budget_spent: AtomicUsize,
 }
 
-/// The tick's clock: `now` as the tick read it, advanced by the time elapsed
-/// since, so a synthetic `now` in a test moves on as the real clock would.
+/// The tick's clock and deadline. The clock is `now` as the tick read it,
+/// advanced by the time elapsed since, so a synthetic `now` in a test moves on
+/// as the real clock would.
 #[derive(Debug, Clone, Copy)]
 struct TickClock {
     now: SystemTime,
     started: Instant,
+    deadline: Instant,
 }
 
 impl TickClock {
@@ -783,13 +814,17 @@ impl TickClock {
 /// lookup still running at the tick deadline counts as failed. Past the
 /// deadline none is started: only activities past their outage grace are
 /// processed then, and they reuse the last views sent.
+///
+/// A rate-limited lookup is Funnelcake asking this replica to slow down, not a
+/// stats outage: the bulk counts are still good, so it reuses the last views
+/// like a spent budget, and the budget takes no lookup until its `Retry-After`.
 async fn views_fallback(
     stats: &StatsClient,
     budget: &ViewsBudget,
     activity: &StoredActivity,
     result: &std::result::Result<BulkStats, StatsError>,
     clock: TickClock,
-    deadline: Instant,
+    cadence_secs: u64,
     tally: &ViewsTally,
 ) -> ViewsLookup {
     let Ok(bulk) = result else {
@@ -801,7 +836,7 @@ async fn views_fallback(
     let Some(first_id) = activity.registration.post_event_ids.first() else {
         return ViewsLookup::NotNeeded;
     };
-    if Instant::now() >= deadline {
+    if Instant::now() >= clock.deadline {
         return ViewsLookup::BudgetSpent;
     }
     if !budget.try_take(clock.read()) {
@@ -810,10 +845,21 @@ async fn views_fallback(
         return ViewsLookup::BudgetSpent;
     }
     tally.lookups.fetch_add(1, Ordering::Relaxed);
-    match tokio::time::timeout_at(deadline, stats.views(first_id)).await {
+    match tokio::time::timeout_at(clock.deadline, stats.views(first_id)).await {
         Ok(Ok(views)) => {
             metrics::live_activity_views_lookup("ok");
             ViewsLookup::Found(views)
+        }
+        Ok(Err(StatsError::RateLimited { retry_after })) => {
+            let wait = rate_limit_wait(retry_after, cadence_secs);
+            warn!(
+                wait_secs = wait.as_secs(),
+                "Funnelcake rate limited live activity views; reusing the last views until it passes"
+            );
+            metrics::live_activity_views_lookup("failed");
+            metrics::live_activity_stats_failure("rate_limited");
+            budget.pause(clock.read(), wait);
+            ViewsLookup::BudgetSpent
         }
         Ok(Err(e)) => {
             metrics::live_activity_views_lookup("failed");
@@ -1989,6 +2035,8 @@ mod tests {
             present: HashMap<String, (Option<u64>, u64, u64)>,
             views: HashMap<String, u64>,
             views_delay: Duration,
+            views_status: Option<u16>,
+            views_retry_after: Option<&'static str>,
         }
 
         #[derive(Clone, Default)]
@@ -2047,15 +2095,25 @@ mod tests {
         async fn views(
             axum::extract::State(stub): axum::extract::State<Stub>,
             axum::extract::Path(id): axum::extract::Path<String>,
-        ) -> axum::Json<serde_json::Value> {
-            let delay = {
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let (delay, status, retry_after) = {
                 let mut c = stub.conf();
                 c.views_calls.push(id.clone());
-                c.views_delay
+                (c.views_delay, c.views_status, c.views_retry_after)
             };
             tokio::time::sleep(delay).await;
+            if let Some(status) = status {
+                let mut r = axum::http::StatusCode::from_u16(status)
+                    .unwrap()
+                    .into_response();
+                if let Some(ra) = retry_after {
+                    r.headers_mut().insert("retry-after", ra.parse().unwrap());
+                }
+                return r;
+            }
             let views = stub.conf().views.get(&id).copied().unwrap_or(0);
-            axum::Json(json!({"views": views}))
+            axum::Json(json!({"views": views})).into_response()
         }
 
         async fn serve(stub: Stub) -> String {
@@ -2310,6 +2368,22 @@ mod tests {
             assert!(budget.try_take(t + Duration::from_secs(60)));
             assert!(!budget.try_take(t + Duration::from_secs(61)));
             // A clock stepped backwards does not freeze the budget.
+            assert!(budget.try_take(t - Duration::from_secs(3600)));
+        }
+
+        #[test]
+        fn views_budget_takes_nothing_while_paused() {
+            let budget = ViewsBudget::new(100);
+            let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+            budget.pause(t, Duration::from_secs(120));
+            assert!(!budget.try_take(t));
+            assert!(!budget.try_take(t + Duration::from_secs(119)));
+            // A shorter pause does not cut the running one short.
+            budget.pause(t + Duration::from_secs(10), Duration::from_secs(5));
+            assert!(!budget.try_take(t + Duration::from_secs(20)));
+            assert!(budget.try_take(t + Duration::from_secs(120)));
+            // A clock stepped back before the pause does not extend it.
+            budget.pause(t + Duration::from_secs(200), Duration::from_secs(60));
             assert!(budget.try_take(t - Duration::from_secs(3600)));
         }
 
@@ -2851,6 +2925,74 @@ mod tests {
             let report = w.tick(&budget, now + w.cadence()).await;
             assert_eq!((report.views_lookups, report.views_budget_spent), (2, 1));
             assert_eq!(w.stub.conf().views_calls.len(), 4);
+        }
+
+        /// A rate-limited `/views` is not a stats outage: the activity is still
+        /// sent, with the bulk counts and its last views, and no further lookup
+        /// is made until Funnelcake's `Retry-After` has passed.
+        #[tokio::test]
+        async fn rate_limited_views_reuse_last_views_until_retry_after() {
+            let Some(w) = World::new(Opts {
+                max_concurrency: 1,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            let (recorder, handle) = recorder();
+            let _metrics = ::metrics::set_default_local_recorder(&recorder);
+            {
+                let mut c = w.stub.conf();
+                c.views_status = Some(429);
+                c.views_retry_after = Some("120");
+            }
+            let now = now_secs();
+            let a = w.seed(now - 900, now + 2700, (now - 1) * 1000, None).await;
+            let last = json!({
+                "phase": "live", "views": 42, "likes": 1, "comments": 0,
+                "updatedAt": now - 180, "showFirstRunNote": false,
+                "postCoordinate": a.registration.post_coordinate,
+                "postEventId": a.registration.post_event_ids[0],
+            });
+            store::record_sent(w.pool(), &a.id, &last.to_string(), now - 180)
+                .await
+                .unwrap();
+            let b = w.seed(now - 900, now + 2700, now * 1000, None).await;
+            // Bulk reports null views for both, so each needs the fallback.
+            w.present(&a, None, 4, 2);
+            w.present(&b, None, 3, 0);
+            let budget = w.budget();
+
+            let report = w.tick(&budget, now).await;
+
+            assert_eq!((report.sent, report.skipped), (2, 0));
+            assert_eq!((report.views_lookups, report.views_budget_spent), (1, 1));
+            assert_eq!(w.stub.conf().views_calls.len(), 1);
+            let c = content(&w.sent_to(&a)[0]);
+            assert_eq!((c.views, c.likes, c.comments), (Some(42), Some(4), Some(2)));
+            let c = content(&w.sent_to(&b)[0]);
+            assert_eq!((c.views, c.likes), (None, Some(3)));
+            assert!(rendered(&handle)
+                .contains(r#"push_live_activity_stats_failures_total{reason="rate_limited"} 1"#));
+
+            // Still inside the Retry-After: no request goes out.
+            let during = w
+                .seed(now - 900, now + 2700, (now + 100) * 1000, None)
+                .await;
+            w.present(&during, None, 1, 0);
+            let report = w.tick(&budget, now + 100).await;
+            assert_eq!((report.sent, report.views_lookups), (1, 0));
+            assert_eq!(w.stub.conf().views_calls.len(), 1);
+
+            // Once it has passed, lookups resume.
+            let after = w
+                .seed(now - 900, now + 2700, (now + 121) * 1000, None)
+                .await;
+            w.present(&after, None, 1, 0);
+            let report = w.tick(&budget, now + 121).await;
+            assert_eq!(report.views_lookups, 1);
+            assert_eq!(w.stub.conf().views_calls.len(), 2);
         }
 
         /// A budget slot counts from when its lookup went out, not from when the
