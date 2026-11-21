@@ -38,14 +38,17 @@ pub enum PayloadError {
     Malformed(String),
     #[error("activityPushToken must be 32 to 512 lowercase hex characters")]
     BadActivityToken,
-    #[error("postCoordinate is not <kind>:<64 hex>:<d>: {0}")]
+    #[error("postCoordinate is not <kind>:<64 hex>:<d>: {}", clip(.0))]
     BadCoordinate(String),
     #[error("postCoordinate author {coordinate_author} is not the signer {signer}")]
     CoordinateAuthorMismatch {
         coordinate_author: String,
         signer: String,
     },
-    #[error("postEventIds must hold 1 to 10 entries of 64 lowercase hex characters: {0}")]
+    #[error(
+        "postEventIds must hold 1 to 10 entries of 64 lowercase hex characters: {}",
+        clip(.0)
+    )]
     BadEventIds(String),
     #[error("windowEndsAt must be after postedAt by at most 3600 seconds")]
     BadWindow,
@@ -53,6 +56,19 @@ pub enum PayloadError {
     WindowTooFarAhead,
     #[error("state must be \"active\" or \"ended\"")]
     BadState,
+}
+
+/// Most characters of client-supplied text an error's Display shows; the text
+/// reaches warn logs.
+const MAX_ECHOED_CHARS: usize = 80;
+
+/// The first [`MAX_ECHOED_CHARS`] characters of `s`, cut on a char boundary,
+/// with `…` appended when anything was cut.
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(MAX_ECHOED_CHARS) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -257,6 +273,32 @@ mod tests {
             let e = parse(&with("postCoordinate", json!(c)), SIGNER, NOW).unwrap_err();
             assert!(matches!(e, PayloadError::BadCoordinate(_)), "{c}");
         }
+    }
+
+    #[test]
+    fn error_text_clips_long_client_values() {
+        let long_d = "é".repeat(500);
+        let coordinate = format!("34236:{}:{long_d}", "A".repeat(64));
+        let e = parse(&with("postCoordinate", json!(coordinate)), SIGNER, NOW).unwrap_err();
+        assert!(matches!(e, PayloadError::BadCoordinate(_)));
+        let text = e.to_string();
+        assert!(!text.contains(&long_d), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        let echoed = text.split_once(": ").unwrap().1;
+        assert_eq!(echoed.chars().count(), MAX_ECHOED_CHARS + 1);
+
+        let bad_id = "ü".repeat(300);
+        let e = parse(&with("postEventIds", json!([bad_id])), SIGNER, NOW).unwrap_err();
+        assert!(matches!(e, PayloadError::BadEventIds(_)));
+        let text = e.to_string();
+        assert!(!text.contains(&bad_id), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+
+        assert_eq!(clip("short"), "short");
+        assert_eq!(
+            clip(&"x".repeat(MAX_ECHOED_CHARS)),
+            "x".repeat(MAX_ECHOED_CHARS)
+        );
     }
 
     #[test]
