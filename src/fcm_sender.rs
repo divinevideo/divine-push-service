@@ -274,13 +274,17 @@ pub enum SendOutcome {
 
 /// Maps a Live Activity send error onto the worker's next step.
 ///
-/// A rejected payload or a dead token will not improve by retrying. A missing
-/// APNs key (`Unauthorized`) needs ops, so it must not become a retry storm.
+/// Only a dead token finishes the activity. Finishing is permanent, so it needs
+/// the same positive evidence `classify_error` requires before pruning a token.
+/// `InvalidRequest` is every other 4xx, including a sender mismatch and a bare
+/// 404 from a wrong project path or a proxy, which an ops fix repairs. Like a
+/// missing APNs key (`Unauthorized`), it is retried a cycle later rather than
+/// becoming a retry storm.
 pub fn live_activity_send_outcome(err: &FcmError) -> SendOutcome {
     match err {
-        FcmError::TokenNotRegistered | FcmError::InvalidRequest(_) => SendOutcome::Finish,
-        // Also covers a failed access-token fetch: needs ops, not a retry storm.
-        FcmError::Unauthorized(_) => SendOutcome::RetryNextCycle,
+        FcmError::TokenNotRegistered => SendOutcome::Finish,
+        // Unauthorized also covers a failed access-token fetch.
+        FcmError::Unauthorized(_) | FcmError::InvalidRequest(_) => SendOutcome::RetryNextCycle,
         FcmError::RetryableInternal(delay) => SendOutcome::RetryAfter(*delay),
         _ => SendOutcome::RetryAfter(LIVE_ACTIVITY_DEFAULT_RETRY),
     }
@@ -1938,7 +1942,7 @@ mod tests {
         ));
         assert!(matches!(
             live_activity_send_outcome(&FcmError::InvalidRequest("x".into())),
-            SendOutcome::Finish
+            SendOutcome::RetryNextCycle
         ));
         assert!(matches!(
             live_activity_send_outcome(&FcmError::Unauthorized("x".into())),
@@ -1960,6 +1964,43 @@ mod tests {
                 live_activity_send_outcome(&err),
                 SendOutcome::RetryAfter(d) if d == Duration::from_secs(60)
             ));
+        }
+    }
+
+    /// Only Firebase's dead-token answer ends an activity for good. A 404 or 400
+    /// that carries no such evidence, as a wrong project path or a proxy returns
+    /// for every send at once, is retried next cycle instead.
+    #[tokio::test]
+    async fn only_a_dead_token_response_finishes_a_live_activity() {
+        let cases = [
+            (
+                404,
+                r#"{"error":{"code":404,"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}"#,
+                SendOutcome::Finish,
+            ),
+            (
+                404,
+                "<html>404 Not Found</html>",
+                SendOutcome::RetryNextCycle,
+            ),
+            (
+                404,
+                r#"{"error":{"code":404,"message":"Method not found.","status":"NOT_FOUND"}}"#,
+                SendOutcome::RetryNextCycle,
+            ),
+            (
+                400,
+                r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"errorCode":"SENDER_ID_MISMATCH"}]}}"#,
+                SendOutcome::RetryNextCycle,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let (client, _captured) = stub_fcm(status, &[], body).await;
+            let error = client
+                .send_live_activity(&live_message(LiveActivityEvent::Update))
+                .await
+                .expect_err("stubbed failure");
+            assert_eq!(live_activity_send_outcome(&error), expected, "{body}");
         }
     }
 }

@@ -67,8 +67,8 @@ pub enum ProcessOutcome {
     Ended,
     /// Nothing was sent; the activity is retried next cycle.
     Skipped,
-    /// The activity was finished without an end send (dead token, rejected
-    /// payload, or no longer live).
+    /// The activity was finished without an end send (dead token, or no longer
+    /// live).
     Finished,
     /// A send failed and is retried after the given delay.
     Deferred(Duration),
@@ -289,7 +289,8 @@ async fn send(
     content: &ContentState,
     now_unix: u64,
 ) -> Result<serde_json::Value, FcmError> {
-    // A content state that cannot serialize never will: a rejected payload.
+    // Reported like a payload Firebase rejected. ContentState is plain data, so
+    // serializing it does not fail in practice.
     let content_state =
         serde_json::to_value(content).map_err(|e| FcmError::InvalidRequest(e.to_string()))?;
     let message = LiveActivityMessage {
