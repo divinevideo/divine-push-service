@@ -2022,8 +2022,9 @@ mod tests {
         f.done().await;
     }
     /// Tests of `tick` and `run`. A tick claims every due activity in Redis, so
-    /// these run in their own logical database, flushed at the start of each
-    /// test and serialized by [`TICK_DB`], so no other test's leftovers are claimed.
+    /// these run in a logical database no other test uses, with its schedule
+    /// cleared at the start of each test and the tests serialized by
+    /// [`TICK_DB`], so no other test's leftovers are claimed.
     mod looped {
         use super::*;
         use crate::fcm_sender::{FcmSend, LiveActivityMessage};
@@ -2204,7 +2205,8 @@ mod tests {
             handle.render()
         }
 
-        /// One tick test's world: its own Redis database, stub Funnelcake and fake Firebase.
+        /// One tick test's world: the tick tests' Redis database with an empty
+        /// schedule, stub Funnelcake and fake Firebase.
         struct World {
             _db: tokio::sync::MutexGuard<'static, ()>,
             state: AppState,

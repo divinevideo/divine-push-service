@@ -98,7 +98,9 @@ They are bounded by other limits instead:
 - the per-owner ceiling (`max_active_per_owner`, 5) and the service-wide ceiling
   (`max_active_total`, 5000) on active activities, past which a new one is refused;
 - retries after a failed send, which wait at least 30 s and at most one cadence,
-  and never later than the point where the activity must end.
+  and never later than the point where the activity must end. The exception is a
+  dead-token answer for a token a re-registration has since replaced: that is
+  retried at once, for the new token.
 
 Each replica runs its own worker, so its Funnelcake load is per replica too. A
 tick makes one bulk stats request per 100 post ids. An edited post carries up to
