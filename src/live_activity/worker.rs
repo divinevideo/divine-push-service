@@ -452,11 +452,13 @@ impl ViewsBudget {
     }
 
     /// Takes no lookup for `wait` from `now`, after Funnelcake rate limited
-    /// `/views`. A pause already running past that end is kept.
+    /// `/views`. A pause already running past that end is kept; one that starts
+    /// after `now` (the clock stepped back) is replaced, since `try_take` would
+    /// not honour it.
     pub fn pause(&self, now: SystemTime, wait: Duration) {
         let until = now + wait;
         let mut paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
-        if !paused.is_some_and(|(_, end)| end >= until) {
+        if !paused.is_some_and(|(start, end)| start <= now && end >= until) {
             *paused = Some((now, until));
         }
     }
@@ -2409,6 +2411,10 @@ mod tests {
             // A clock stepped back before the pause does not extend it.
             budget.pause(t + Duration::from_secs(200), Duration::from_secs(60));
             assert!(budget.try_take(t - Duration::from_secs(3600)));
+            // But a rate limit answered after the step is honoured, not
+            // swallowed by the pause that now lies in the future.
+            budget.pause(t + Duration::from_secs(180), Duration::from_secs(60));
+            assert!(!budget.try_take(t + Duration::from_secs(181)));
         }
 
         #[tokio::test]
