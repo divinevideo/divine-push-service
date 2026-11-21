@@ -327,7 +327,21 @@ async fn after_send_error(
     let cadence = Duration::from_secs(cadence_secs(state));
     let delay = match outcome {
         SendOutcome::Finish => {
-            finish(state, activity).await;
+            // The claim's token is the one that failed. A re-registration may
+            // have replaced it since: that activity is due again now, for its
+            // new token, rather than finished for good.
+            match store::finish_if_token(&state.redis_pool, &activity.id, &activity.fcm_token).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(activity_id = %activity.id, "live activity token replaced since the claim; retrying on the new token");
+                    schedule(state, activity, now_unix.saturating_mul(1000)).await;
+                    return ProcessOutcome::Deferred(Duration::ZERO);
+                }
+                Err(e) => {
+                    warn!(activity_id = %activity.id, error = %e, "failed to finish live activity");
+                }
+            }
             return ProcessOutcome::Finished;
         }
         // Firebase's delay is kept between the floor and one cadence.
@@ -1248,6 +1262,54 @@ mod tests {
         assert_eq!(outcome, ProcessOutcome::Finished);
         assert!(!f.live(&activity.id).await);
         assert_eq!(f.due_ms(&activity.id).await, None);
+        f.done().await;
+    }
+
+    /// A dead-token answer for the token the claim held must not finish an
+    /// activity that was re-registered with a new token while the claim was in
+    /// flight: it is due again at once, for the new token.
+    #[tokio::test]
+    async fn dead_token_replaced_since_the_claim_keeps_the_activity() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let now = now_secs();
+        let reg = f.registration(now - 900, now + 2700);
+        f.mock
+            .set_error_for_token(&reg.activity_token, FcmError::TokenNotRegistered);
+        let claimed = f.seed(reg.clone(), now - 10).await;
+        let replacement = format!("fcm-{}", hex(40));
+        let rereg = store::upsert_active(
+            f.pool(),
+            &f.owner,
+            &replacement,
+            &reg,
+            now,
+            &hex(64),
+            FAR_DUE_MS,
+            5,
+            100_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rereg, store::UpsertOutcome::Updated);
+
+        let outcome = process_one(
+            &f.state,
+            &claimed,
+            Ok(&f.stats(Some(5), 2, 1)),
+            ViewsLookup::NotNeeded,
+            now,
+        )
+        .await;
+
+        assert_eq!(outcome, ProcessOutcome::Deferred(Duration::ZERO));
+        assert!(f.live(&claimed.id).await);
+        assert_eq!(f.due_ms(&claimed.id).await, Some(now * 1000));
+        assert_eq!(
+            f.hget(&claimed.id, "fcm_token").await.as_deref(),
+            Some(replacement.as_str())
+        );
         f.done().await;
     }
 

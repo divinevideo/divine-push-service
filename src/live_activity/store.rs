@@ -340,6 +340,10 @@ static FINISH: LazyLock<Script> = LazyLock::new(|| {
         "{PRELUDE}{}",
         r#"
 if is_live(ARGV[1]) then
+  -- With ARGV[2], only finish while the stored Firebase token is still that one.
+  if ARGV[2] and redis.call('HGET', PREFIX .. ARGV[1], 'fcm_hash') ~= ARGV[2] then
+    return 0
+  end
   tombstone(ARGV[1])
 else
   redis.call('ZREM', JOBS, ARGV[1])
@@ -656,6 +660,23 @@ pub async fn finish(pool: &RedisPool, id: &str) -> Result<()> {
         .await
         .map_err(ServiceError::Redis)?;
     Ok(())
+}
+
+/// Finish an activity after a send to `fcm_token` failed for good, unless a
+/// re-registration has replaced that token since the activity was claimed.
+/// Returns false, and leaves the activity live and scheduled as it was, when the
+/// stored token is another one. Otherwise behaves like [`finish`].
+pub async fn finish_if_token(pool: &RedisPool, id: &str, fcm_token: &str) -> Result<bool> {
+    let mut conn = conn(pool).await?;
+    let finished: i64 = FINISH
+        .key(format!("{ACTIVITY_PREFIX}{id}"))
+        .key(JOBS_ZSET)
+        .arg(id)
+        .arg(blake3_hex(fcm_token))
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(finished == 1)
 }
 
 /// Age in seconds of the oldest due activity, or `None` when nothing is due.
