@@ -106,9 +106,14 @@ impl LiveActivitySettings {
         if !(1..=8).contains(&self.max_concurrency) {
             return Err("live_activity.max_concurrency must be between 1 and 8".to_string());
         }
+        // A zero timeout fails every Funnelcake request at once, and a zero tick
+        // deadline releases every claimed batch unprocessed: both stop all
+        // updates while the service looks healthy.
         for (name, zero) in [
             ("cadence_secs", self.cadence_secs == 0),
             ("poll_millis", self.poll_millis == 0),
+            ("request_timeout_secs", self.request_timeout_secs == 0),
+            ("tick_deadline_secs", self.tick_deadline_secs == 0),
             ("max_active_per_owner", self.max_active_per_owner == 0),
             ("max_active_total", self.max_active_total == 0),
             (
@@ -1313,9 +1318,11 @@ mod tests {
     #[test]
     fn live_activity_zero_values_are_rejected() {
         type Break = fn(&mut LiveActivitySettings);
-        let breakers: [(&str, Break); 5] = [
+        let breakers: [(&str, Break); 7] = [
             ("cadence_secs", |l| l.cadence_secs = 0),
             ("poll_millis", |l| l.poll_millis = 0),
+            ("request_timeout_secs", |l| l.request_timeout_secs = 0),
+            ("tick_deadline_secs", |l| l.tick_deadline_secs = 0),
             ("max_active_per_owner", |l| l.max_active_per_owner = 0),
             ("max_active_total", |l| l.max_active_total = 0),
             ("views_lookups_per_minute", |l| {
