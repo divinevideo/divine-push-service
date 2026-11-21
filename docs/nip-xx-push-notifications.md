@@ -131,6 +131,10 @@ Fields (all `liveActivity` fields are required):
   notifications is never stored as a notification token.
 - The author in `postCoordinate` MUST equal the event signer. An invalid object
   is dropped without a response.
+- A Live Activity registration whose `created_at` is outside the service's
+  accepted time window (more than 300 seconds in the future, or older than the
+  seven-day replay horizon) is dropped without a response, counted as
+  `out_of_window`.
 - `windowEndsAt` MUST be after `postedAt` by at most 3600 seconds, and no more
   than an hour plus 300 seconds of allowed clock skew after the service's
   current time (the app computes it from the phone's clock).
