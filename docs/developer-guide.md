@@ -238,8 +238,10 @@ no `notification` and no `data`, addressed to the activity rather than the app
   also carries `aps.dismissal-date`. A summary or "can't find" end uses the send
   time + 1800 s; an end sent after stats stayed unreachable past the window uses a
   time just before the send, so the frozen numbers leave the Lock Screen at once.
-- `stale-date` is the send time + 600 s, and `apns-expiration` carries the same
-  value as a string, so APNs drops a late update rather than delivering it stale.
+- `stale-date` is the send time + 600 s, and an update's `apns-expiration` carries
+  the same value as a string, so APNs drops a late update rather than delivering it
+  stale. An `end` has no `apns-expiration`: the activity is finished once Firebase
+  accepts it, so APNs must keep it until a phone that was offline reconnects.
 - `content-state` keys are a contract with the app: `phase` (`posting`, `live`,
   `notFound` or `summary`), `views`, `likes`, `comments` (integer or `null` when
   unknown), `updatedAt`, `showFirstRunNote`, `postCoordinate`, and `postEventId`

@@ -256,7 +256,8 @@ pub struct LiveActivityMessage {
     pub content_state: serde_json::Value,
     /// Send time, Unix seconds.
     pub timestamp_unix: u64,
-    /// After this instant iOS marks the activity stale and APNs drops the push.
+    /// After this instant iOS marks the activity stale, and APNs drops an update
+    /// it has not yet delivered. An end is kept until it is delivered.
     pub stale_unix: u64,
 }
 
@@ -288,8 +289,11 @@ pub fn live_activity_send_outcome(err: &FcmError) -> SendOutcome {
 /// Builds the FCM v1 `message` object for a Live Activity push.
 ///
 /// Carries no `notification`, `data` or `android` block: the activity is driven
-/// purely by the APNs `aps` payload. `apns-expiration` equals `stale-date`, so a
-/// late update is dropped rather than delivered stale.
+/// purely by the APNs `aps` payload. An update's `apns-expiration` equals
+/// `stale-date`, so a late update is dropped rather than delivered stale. An end
+/// carries no `apns-expiration`: the worker finishes the activity as soon as
+/// Firebase accepts the end, so nothing sends it again, and a phone that was
+/// offline past the stale date must still receive it when it reconnects.
 pub fn live_activity_body(message: &LiveActivityMessage) -> serde_json::Value {
     let (event, priority) = match message.event {
         LiveActivityEvent::Update => ("update", "5"),
@@ -301,17 +305,20 @@ pub fn live_activity_body(message: &LiveActivityMessage) -> serde_json::Value {
         "content-state": message.content_state,
         "stale-date": message.stale_unix,
     });
-    if let LiveActivityEvent::End { dismissal_unix } = message.event {
-        aps["dismissal-date"] = serde_json::json!(dismissal_unix);
+    let mut headers = serde_json::json!({ "apns-priority": priority });
+    match message.event {
+        LiveActivityEvent::Update => {
+            headers["apns-expiration"] = serde_json::json!(message.stale_unix.to_string());
+        }
+        LiveActivityEvent::End { dismissal_unix } => {
+            aps["dismissal-date"] = serde_json::json!(dismissal_unix);
+        }
     }
     serde_json::json!({
         "token": message.fcm_token,
         "apns": {
             "live_activity_token": message.activity_token,
-            "headers": {
-                "apns-priority": priority,
-                "apns-expiration": message.stale_unix.to_string(),
-            },
+            "headers": headers,
             "payload": { "aps": aps },
         },
     })
@@ -1825,8 +1832,23 @@ mod tests {
         assert_eq!(aps["event"], "end");
         assert_eq!(aps["dismissal-date"], 2_800);
         assert_eq!(aps["stale-date"], 1_600);
-        assert_eq!(body["apns"]["headers"]["apns-priority"], "10");
-        assert_eq!(body["apns"]["headers"]["apns-expiration"], "1600");
+        assert_eq!(
+            body["apns"]["headers"],
+            serde_json::json!({"apns-priority": "10"})
+        );
+    }
+
+    /// An end that expired with the stale date would never reach a phone that
+    /// was offline for ten minutes, and nothing sends it again.
+    #[test]
+    fn live_activity_end_body_never_expires_with_the_stale_date() {
+        for dismissal_unix in [2_800, 999] {
+            let body = live_activity_body(&live_message(LiveActivityEvent::End { dismissal_unix }));
+            assert!(
+                body["apns"]["headers"].get("apns-expiration").is_none(),
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -29,7 +29,8 @@ use crate::live_activity::store::{self, StoredActivity};
 use crate::metrics;
 use crate::state::AppState;
 
-/// Seconds after a send that iOS marks the activity stale and APNs drops the push.
+/// Seconds after a send that iOS marks the activity stale and APNs drops an
+/// undelivered update.
 pub const STALE_AFTER_SECS: u64 = 600;
 /// Seconds after an end that iOS removes the activity from the Lock Screen.
 pub const DISMISS_AFTER_SECS: u64 = 1800;
