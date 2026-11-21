@@ -55,17 +55,9 @@ pub struct TokenPayload {
         deserialize_with = "optional_device_string"
     )]
     pub app_version: Option<String>,
-    /// Whether the device allows notifications (sent with Live Activity registrations).
-    #[serde(rename = "notificationsAuthorized", default)]
-    pub notifications_authorized: Option<bool>,
-    /// Raw Live Activity object, validated in `live_activity::payload` so a present but
-    /// invalid object stays distinguishable from an absent one.
-    #[serde(rename = "liveActivity", default)]
-    pub live_activity: Option<serde_json::Value>,
 }
 
-/// Hand-written so the FCM token and the raw Live Activity object (which holds the activity
-/// push token) never reach logs through `{:?}`.
+/// Hand-written so the FCM token never reaches logs through `{:?}`.
 impl std::fmt::Debug for TokenPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenPayload")
@@ -76,11 +68,6 @@ impl std::fmt::Debug for TokenPayload {
             .field("platform", &self.platform)
             .field("install_channel", &self.install_channel)
             .field("app_version", &self.app_version)
-            .field("notifications_authorized", &self.notifications_authorized)
-            .field(
-                "live_activity",
-                &self.live_activity.as_ref().map(|_| "<redacted>"),
-            )
             .finish()
     }
 }
@@ -232,29 +219,24 @@ impl CryptoService {
         encrypted_content: &str,
         sender_pubkey: &PublicKey,
     ) -> Result<TokenPayload, CryptoError> {
-        self.decrypt_token_payload_json(encrypted_content, sender_pubkey)
-            .map(|(payload, _)| payload)
+        let decrypted = self.decrypt_nip44(encrypted_content, sender_pubkey)?;
+        parse_token_payload(&decrypted)
     }
 
-    /// Like [`Self::decrypt_token_payload`], also returning the decrypted JSON as a
-    /// `Value`, so a caller can tell a key that is present (even as `null`) from an
-    /// absent one. The plaintext is parsed twice so `TokenPayload` validation is
-    /// unchanged.
-    pub fn decrypt_token_payload_json(
+    /// Decrypt a registration and read its Live Activity routing fields.
+    pub(crate) fn decrypt_registration_payload(
         &self,
         encrypted_content: &str,
         sender_pubkey: &PublicKey,
-    ) -> Result<(TokenPayload, serde_json::Value), CryptoError> {
+    ) -> Result<
+        (
+            TokenPayload,
+            crate::live_activity::payload::RegistrationRoute,
+        ),
+        CryptoError,
+    > {
         let decrypted = self.decrypt_nip44(encrypted_content, sender_pubkey)?;
-        let payload: TokenPayload = serde_json::from_str(&decrypted)?;
-        // Validate token is not empty
-        if payload.token.is_empty() {
-            return Err(CryptoError::InvalidToken(
-                "Token cannot be empty".to_string(),
-            ));
-        }
-        let raw: serde_json::Value = serde_json::from_str(&decrypted)?;
-        Ok((payload, raw))
+        parse_registration_payload(&decrypted)
     }
 
     /// Decrypt and parse filter upsert payload from NIP-44 encrypted content
@@ -319,6 +301,31 @@ impl CryptoService {
     }
 }
 
+fn parse_token_payload(decrypted: &str) -> Result<TokenPayload, CryptoError> {
+    let payload: TokenPayload = serde_json::from_str(decrypted)?;
+    if payload.token.is_empty() {
+        return Err(CryptoError::InvalidToken(
+            "Token cannot be empty".to_string(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn parse_registration_payload(
+    decrypted: &str,
+) -> Result<
+    (
+        TokenPayload,
+        crate::live_activity::payload::RegistrationRoute,
+    ),
+    CryptoError,
+> {
+    Ok((
+        parse_token_payload(decrypted)?,
+        serde_json::from_str(decrypted)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,7 +343,25 @@ mod tests {
         let text = format!("{p:?}");
         assert!(!text.contains(fcm), "{text}");
         assert!(!text.contains(&act), "{text}");
-        assert!(text.contains("notifications_authorized"), "{text}");
+    }
+
+    #[test]
+    fn deregistration_ignores_live_activity_metadata() {
+        let p = parse_token_payload(
+            r#"{"token":"synthetic","notificationsAuthorized":"unknown","liveActivity":1e400}"#,
+        )
+        .unwrap();
+        assert_eq!(p.token, "synthetic");
+    }
+
+    #[test]
+    fn registration_ignores_unknown_metadata_without_losing_route() {
+        let (p, route) = parse_registration_payload(
+            r#"{"token":"synthetic","futureExtension":1e400,"liveActivity":null}"#,
+        )
+        .unwrap();
+        assert_eq!(p.token, "synthetic");
+        assert!(route.is_live_activity());
     }
 
     #[test]

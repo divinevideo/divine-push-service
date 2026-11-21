@@ -18,12 +18,16 @@ use tracing::{debug, info, warn};
 
 /// Apply a Live Activity registration.
 ///
-/// `raw` is the whole decrypted 3079 JSON; its `liveActivity` object is
-/// validated against the event's signer. Events outside the accepted time
+/// The `activity` object is validated against the event's signer. Events outside the accepted time
 /// window and invalid objects are dropped with `Ok`. An `ended` registration is
 /// always applied, so turning the feature on later never resumes an activity
 /// the person ended; an `active` one is stored only while the feature is on.
-pub async fn handle(state: &AppState, event: &Event, fcm_token: &str, raw: &Value) -> Result<()> {
+pub async fn handle(
+    state: &AppState,
+    event: &Event,
+    fcm_token: &str,
+    activity: Option<&Value>,
+) -> Result<()> {
     let event_id = event.id.to_hex();
     let owner = event.pubkey.to_hex();
     let now = Timestamp::now().as_secs();
@@ -37,7 +41,7 @@ pub async fn handle(state: &AppState, event: &Event, fcm_token: &str, raw: &Valu
         return Ok(());
     }
 
-    let Some(object) = raw.get("liveActivity") else {
+    let Some(object) = activity else {
         warn!(%event_id, pubkey = %owner, reason = "no liveActivity object", "Dropped invalid Live Activity registration");
         metrics::live_activity_registration("invalid");
         return Ok(());

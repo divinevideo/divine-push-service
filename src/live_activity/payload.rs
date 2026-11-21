@@ -1,6 +1,7 @@
 //! Parsing and validation of the `liveActivity` object in a decrypted kind 3079 payload.
 
-use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -100,12 +101,60 @@ fn is_lower_hex(s: &str) -> bool {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// True when the decrypted JSON carries the `liveActivity` key (even as `null`) or
-/// `notificationsAuthorized`, so routing never lets one fall through to a normal registration.
-pub fn is_live_activity_payload(raw_json: &Value) -> bool {
-    raw_json.as_object().is_some_and(|o| {
-        o.contains_key("liveActivity") || o.contains_key("notificationsAuthorized")
-    })
+/// Only routing fields from a decrypted kind 3079 payload.
+#[derive(Default)]
+pub(crate) struct RegistrationRoute {
+    pub(crate) activity: Option<Value>,
+    has_notification_authorization: bool,
+}
+
+impl RegistrationRoute {
+    pub(crate) fn is_live_activity(&self) -> bool {
+        self.activity.is_some() || self.has_notification_authorization
+    }
+}
+
+impl<'de> Deserialize<'de> for RegistrationRoute {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RouteVisitor;
+
+        impl<'de> Visitor<'de> for RouteVisitor {
+            type Value = RegistrationRoute;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a registration object")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut route = RegistrationRoute::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "liveActivity" => route.activity = Some(map.next_value()?),
+                        "notificationsAuthorized" => {
+                            map.next_value::<IgnoredAny>()?;
+                            route.has_notification_authorization = true;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(route)
+            }
+
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: S,
+            ) -> Result<Self::Value, S::Error> {
+                // Preserve serde's legacy positional TokenPayload decoding. No
+                // object keys means no Live Activity route.
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RegistrationRoute::default())
+            }
+        }
+
+        deserializer.deserialize_any(RouteVisitor)
+    }
 }
 
 /// Validate a raw `liveActivity` object against the signer of the 3079 event.
@@ -194,7 +243,6 @@ pub fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::TokenPayload;
     use serde_json::{json, Value};
 
     const SIGNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -237,15 +285,15 @@ mod tests {
     }
 
     #[test]
-    fn token_payload_keeps_unknown_live_activity_raw() {
-        let p: TokenPayload = serde_json::from_value(json!({
+    fn routing_keeps_live_activity_raw() {
+        let p: RegistrationRoute = serde_json::from_value(json!({
             "token": "fcm",
             "notificationsAuthorized": false,
             "liveActivity": {"anything": [1, 2]}
         }))
         .unwrap();
-        assert_eq!(p.notifications_authorized, Some(false));
-        assert_eq!(p.live_activity, Some(json!({"anything": [1, 2]})));
+        assert!(p.is_live_activity());
+        assert_eq!(p.activity, Some(json!({"anything": [1, 2]})));
     }
 
     #[test]
@@ -410,13 +458,13 @@ mod tests {
 
     #[test]
     fn null_live_activity_is_still_a_live_activity_payload() {
-        let raw = json!({"token": "fcm", "liveActivity": null});
-        let p: TokenPayload = serde_json::from_value(raw.clone()).unwrap();
-        assert!(p.live_activity.is_none());
-        assert!(is_live_activity_payload(&raw));
-        assert!(is_live_activity_payload(
-            &json!({"token": "fcm", "notificationsAuthorized": true})
-        ));
-        assert!(!is_live_activity_payload(&json!({"token": "fcm"})));
+        let p: RegistrationRoute = serde_json::from_value(json!({"liveActivity": null})).unwrap();
+        assert_eq!(p.activity, Some(Value::Null));
+        assert!(p.is_live_activity());
+        let p: RegistrationRoute =
+            serde_json::from_value(json!({"notificationsAuthorized": "unknown"})).unwrap();
+        assert!(p.is_live_activity());
+        let p: RegistrationRoute = serde_json::from_value(json!({"token": "fcm"})).unwrap();
+        assert!(!p.is_live_activity());
     }
 }

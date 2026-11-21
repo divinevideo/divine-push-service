@@ -292,8 +292,8 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
     };
 
     // Decrypt the NIP-44 content
-    let (token_payload, raw_payload) =
-        match crypto_service.decrypt_token_payload_json(&event.content, &event.pubkey) {
+    let (token_payload, route) =
+        match crypto_service.decrypt_registration_payload(&event.content, &event.pubkey) {
             Ok(decrypted) => decrypted,
             Err(e) => {
                 error!(
@@ -316,8 +316,14 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
     // A Live Activity registration never registers the device, whatever the
     // feature flag or `notificationsAuthorized` say: a phone that declined
     // notifications must not land in `user_tokens:*`.
-    if live_activity::payload::is_live_activity_payload(&raw_payload) {
-        return live_activity::registration::handle(state, event, fcm_token, &raw_payload).await;
+    if route.is_live_activity() {
+        return live_activity::registration::handle(
+            state,
+            event,
+            fcm_token,
+            route.activity.as_ref(),
+        )
+        .await;
     }
 
     // An invalid optional timezone must not drop the registration. Legacy
