@@ -258,6 +258,8 @@ no `notification` and no `data`, addressed to the activity rather than the app
 - Before the settle point (`max(postedAt, first_seen_at)` + 600 s) a 0 count is sent
   as `null`; from then on a 0 is a confirmed 0. From the settle point, a post none of
   whose ids is found in two consecutive successful checks ends with phase `notFound`.
+  A miss counts once the update showing it has been sent, so the two checks are at
+  least a cadence apart even when a send fails and is retried sooner.
   At `windowEndsAt` the activity ends with phase `summary`. If stats stay unreachable
   until `windowEndsAt` + 600 s, it ends on the last content sent.
 - The worker never prunes `user_tokens:*` or `token_to_pubkey`, even when Firebase

@@ -105,17 +105,23 @@ pub async fn process_one(
         activity.absent_checks,
         now_unix,
     );
-    // The count reflects stats checks, not sends, so it is kept even if the send fails.
-    if absent_checks != activity.absent_checks {
-        if let Err(e) =
-            store::set_absent_checks(&state.redis_pool, &activity.id, absent_checks).await
-        {
-            warn!(activity_id = %activity.id, error = %e, "failed to store live activity absent checks");
-        }
+    // A found post resets the count at once, whatever the send does. A miss
+    // counts only once the update showing it is sent: a failed send is retried
+    // within a minute, possibly against the same not-yet-indexed Funnelcake
+    // data, and that second look must not count as a second consecutive miss.
+    // A sent update's next check comes a cadence later.
+    if absent_checks < activity.absent_checks {
+        store_absent_checks(state, activity, absent_checks).await;
     }
 
     match decision {
-        Decision::Update(content) => send_update(state, activity, &content, now_unix).await,
+        Decision::Update(content) => {
+            let outcome = send_update(state, activity, &content, now_unix).await;
+            if outcome == ProcessOutcome::Sent && absent_checks > activity.absent_checks {
+                store_absent_checks(state, activity, absent_checks).await;
+            }
+            outcome
+        }
         Decision::End(content) => {
             let dismissal = now_unix.saturating_add(DISMISS_AFTER_SECS);
             send_end(state, activity, &content, dismissal, now_unix).await
@@ -152,6 +158,12 @@ pub async fn process_one(
 
 fn cadence_secs(state: &AppState) -> u64 {
     state.settings.live_activity.cadence_secs
+}
+
+async fn store_absent_checks(state: &AppState, activity: &StoredActivity, count: u32) {
+    if let Err(e) = store::set_absent_checks(&state.redis_pool, &activity.id, count).await {
+        warn!(activity_id = %activity.id, error = %e, "failed to store live activity absent checks");
+    }
 }
 
 /// The views value of the last content sent, or `None` if nothing was sent.
@@ -1195,6 +1207,57 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(content(&sent[1]).phase, Phase::NotFound);
         assert!(!f.live(&activity.id).await);
+        f.done().await;
+    }
+
+    /// A miss counts only once its update is sent. A failed send is retried 30 s
+    /// later, likely against the same not-yet-indexed data, and that second look
+    /// is the first counted miss, not the second.
+    #[tokio::test]
+    async fn a_miss_whose_update_failed_is_not_counted() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let now = now_secs();
+        let reg = f.registration(now - 900, now + 2700);
+        f.mock.set_error_for_token(
+            &reg.activity_token,
+            FcmError::RetryableInternal(Duration::from_secs(1)),
+        );
+        let activity = f.seed(reg, now).await;
+
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.missing()),
+            ViewsLookup::NotNeeded,
+            now,
+        )
+        .await;
+        assert_eq!(outcome, ProcessOutcome::Deferred(LIVE_ACTIVITY_MIN_RETRY));
+        assert_eq!(
+            f.hget(&activity.id, "absent_checks").await.as_deref(),
+            Some("0")
+        );
+
+        f.mock.clear();
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.missing()),
+            ViewsLookup::NotNeeded,
+            now + 30,
+        )
+        .await;
+        assert_eq!(outcome, ProcessOutcome::Sent);
+        assert_eq!(
+            content(&f.mock.get_live_activity_messages()[0]).phase,
+            Phase::Live
+        );
+        assert_eq!(
+            f.hget(&activity.id, "absent_checks").await.as_deref(),
+            Some("1")
+        );
         f.done().await;
     }
 

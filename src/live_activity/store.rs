@@ -51,7 +51,8 @@ pub struct StoredActivity {
     pub registration: LiveActivityRegistration,
     /// Server time (Unix secs) the activity was first stored; carried over on token rotation.
     pub first_seen_at: u64,
-    /// Consecutive successful stats checks that found none of the post's ids.
+    /// Consecutive successful stats checks that found none of the post's ids,
+    /// each counted once the update showing it was sent.
     pub absent_checks: u32,
     /// Content state of the last successful send, if any.
     pub last_content: Option<serde_json::Value>,
