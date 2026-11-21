@@ -554,7 +554,11 @@ pub async fn tick(
     now: SystemTime,
 ) -> Result<TickReport> {
     let settings = &state.settings.live_activity;
-    let deadline = Instant::now() + Duration::from_secs(settings.tick_deadline_secs);
+    let clock = TickClock {
+        now,
+        started: Instant::now(),
+    };
+    let deadline = clock.started + Duration::from_secs(settings.tick_deadline_secs);
     let since_epoch = now
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ServiceError::Internal(format!("system clock before Unix epoch: {e}")))?;
@@ -638,7 +642,7 @@ pub async fn tick(
             }
             let processed = AssertUnwindSafe(async {
                 let views =
-                    views_fallback(stats, budget, &activity, &result, now, deadline, tally).await;
+                    views_fallback(stats, budget, &activity, &result, clock, deadline, tally).await;
                 process_one(state, &activity, result.as_ref(), views, now_unix).await
             })
             .catch_unwind()
@@ -758,17 +762,33 @@ struct ViewsTally {
     budget_spent: AtomicUsize,
 }
 
+/// The tick's clock: `now` as the tick read it, advanced by the time elapsed
+/// since, so a synthetic `now` in a test moves on as the real clock would.
+#[derive(Debug, Clone, Copy)]
+struct TickClock {
+    now: SystemTime,
+    started: Instant,
+}
+
+impl TickClock {
+    fn read(&self) -> SystemTime {
+        self.now + self.started.elapsed()
+    }
+}
+
 /// The `/views` fallback for one activity, made just before it is processed, so
-/// a slow lookup holds up only its own activity. A lookup still running at the
-/// tick deadline counts as failed. Past the deadline none is started: only
-/// activities past their outage grace are processed then, and they reuse the
-/// last views sent.
+/// a slow lookup holds up only its own activity. Its budget slot is stamped
+/// with the time the request goes out: stamping it with the tick's start would
+/// let a slow tick's slots expire early and a later tick go over the budget. A
+/// lookup still running at the tick deadline counts as failed. Past the
+/// deadline none is started: only activities past their outage grace are
+/// processed then, and they reuse the last views sent.
 async fn views_fallback(
     stats: &StatsClient,
     budget: &ViewsBudget,
     activity: &StoredActivity,
     result: &std::result::Result<BulkStats, StatsError>,
-    now: SystemTime,
+    clock: TickClock,
     deadline: Instant,
     tally: &ViewsTally,
 ) -> ViewsLookup {
@@ -784,7 +804,7 @@ async fn views_fallback(
     if Instant::now() >= deadline {
         return ViewsLookup::BudgetSpent;
     }
-    if !budget.try_take(now) {
+    if !budget.try_take(clock.read()) {
         metrics::live_activity_views_lookup("budget_spent");
         tally.budget_spent.fetch_add(1, Ordering::Relaxed);
         return ViewsLookup::BudgetSpent;
@@ -2831,6 +2851,37 @@ mod tests {
             let report = w.tick(&budget, now + w.cadence()).await;
             assert_eq!((report.views_lookups, report.views_budget_spent), (2, 1));
             assert_eq!(w.stub.conf().views_calls.len(), 4);
+        }
+
+        /// A budget slot counts from when its lookup went out, not from when the
+        /// tick started: after a slow bulk call, a tick a minute later must not
+        /// see the slot as expired and spend it again.
+        #[tokio::test]
+        async fn views_budget_counts_from_when_each_lookup_goes_out() {
+            let Some(w) = World::new(Opts {
+                views_lookups_per_minute: 1,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            w.stub.conf().delay = Duration::from_secs(2);
+            let now = now_secs();
+            let a = w.seed(now - 900, now + 2700, now * 1000, None).await;
+            w.present(&a, None, 1, 0);
+            let budget = w.budget();
+
+            let report = w.tick(&budget, now).await;
+            assert_eq!(report.views_lookups, 1);
+
+            // 60 s after that tick started, but under 60 s after its lookup.
+            w.stub.conf().delay = Duration::ZERO;
+            let b = w.seed(now - 900, now + 2700, (now + 60) * 1000, None).await;
+            w.present(&b, None, 1, 0);
+            let report = w.tick(&budget, now + 60).await;
+            assert_eq!((report.views_lookups, report.views_budget_spent), (0, 1));
+            assert_eq!(w.stub.conf().views_calls.len(), 1);
         }
 
         #[tokio::test]
