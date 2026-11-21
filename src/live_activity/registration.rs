@@ -78,7 +78,12 @@ pub async fn handle(state: &AppState, event: &Event, fcm_token: &str, raw: &Valu
     }
 
     let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-    let first_due_ms = now_ms.saturating_add(settings.cadence_secs.saturating_mul(1000));
+    // Capped at the window's end like every later schedule, so an activity first
+    // seen late in its window (a replay, a late publish) still gets its summary
+    // on time, and a long cadence can never schedule it past its hash's expiry.
+    let first_due_ms = now_ms
+        .saturating_add(settings.cadence_secs.saturating_mul(1000))
+        .min(reg.window_ends_at.saturating_mul(1000));
     let outcome = store::upsert_active(
         &state.redis_pool,
         &owner,

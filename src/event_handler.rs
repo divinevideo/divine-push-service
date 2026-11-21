@@ -3961,6 +3961,34 @@ mod tests {
         f.assert_device_not_registered().await;
     }
 
+    /// An activity first seen less than a cadence before its window ends is first
+    /// due at the window's end, so its summary is not sent a cadence late.
+    #[tokio::test]
+    async fn late_first_registration_is_first_due_at_window_end() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let mut object = la_object(&f.owner(), &token, "active", now);
+        let window_ends_at = now + 30;
+        object["postedAt"] = serde_json::json!(window_ends_at - 3600);
+        object["windowEndsAt"] = serde_json::json!(window_ends_at);
+        let event = f.event(
+            serde_json::json!({
+                "token": f.fcm,
+                "notificationsAuthorized": true,
+                "liveActivity": object,
+            }),
+            now,
+        );
+        handle_registration(&f.state, &event).await.unwrap();
+
+        assert_eq!(
+            la_job_score(&f.pool, &f.owner(), &token).await,
+            Some(window_ends_at * 1000)
+        );
+        f.assert_device_not_registered().await;
+    }
+
     #[tokio::test]
     async fn ended_registration_from_other_pubkey_is_ignored() {
         let victim = LaFixture::new(true).await;
