@@ -6,13 +6,15 @@ use thiserror::Error;
 
 /// Longest window the app may request, in seconds.
 const MAX_WINDOW_SECS: u64 = 3600;
-/// Fewest and most post event ids (an edited post carries several).
+/// Most post event ids a registration may carry (an edited post carries several).
 const MAX_EVENT_IDS: usize = 10;
 
 /// Whether the app wants updates (`active`) or has ended the activity (`ended`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityState {
+    /// The activity is running and wants updates.
     Active,
+    /// The person or the app ended the activity; it never resumes.
     Ended,
 }
 
@@ -23,10 +25,16 @@ pub struct LiveActivityRegistration {
     pub activity_token: String,
     /// `<kind>:<author pubkey hex>:<d-tag>` of the post.
     pub post_coordinate: String,
+    /// Event ids of the post's versions (1 to 10, lowercase hex); their stats
+    /// are combined, and the first is echoed back as `postEventId`.
     pub post_event_ids: Vec<String>,
+    /// Unix seconds the post was published, by the phone's clock.
     pub posted_at: u64,
+    /// Unix seconds the updates stop, at most an hour after `posted_at`.
     pub window_ends_at: u64,
+    /// Echoed back in every content state.
     pub show_first_run_note: bool,
+    /// Whether this registration starts or ends the activity.
     pub state: ActivityState,
 }
 

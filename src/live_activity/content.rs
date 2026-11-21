@@ -16,9 +16,14 @@ pub const SETTLE_SECONDS: u64 = 600;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Phase {
+    /// The post is still publishing. Kept for wire parity with the app, which
+    /// shows it locally; the server never sends it.
     Posting,
+    /// The post is live; the card shows its counts.
     Live,
+    /// The post could not be found; sent with the end event.
     NotFound,
+    /// The window has closed; sent with the end event.
     Summary,
 }
 
