@@ -2156,6 +2156,10 @@ mod tests {
             }
         }
 
+        /// A pool on [`TICK_DB_INDEX`] with an empty schedule. Only
+        /// `live_activity_jobs`, the one global key a tick claims from, is
+        /// cleared: each test seeds its own owners and tokens, and REDIS_URL may
+        /// point at a shared server whose other keys in this database must survive.
         async fn tick_pool() -> Option<RedisPool> {
             let base =
                 std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
@@ -2163,10 +2167,12 @@ mod tests {
             url.set_path(&format!("/{TICK_DB_INDEX}"));
             let pool = redis_store::create_pool(url.as_str(), 10).await.ok()?;
             let mut conn = pool.get().await.ok()?;
-            let flushed: redis::RedisResult<String> =
-                redis::cmd("FLUSHDB").query_async(&mut *conn).await;
+            let cleared: redis::RedisResult<i64> = redis::cmd("DEL")
+                .arg("live_activity_jobs")
+                .query_async(&mut *conn)
+                .await;
             drop(conn);
-            flushed.ok().map(|_| pool)
+            cleared.ok().map(|_| pool)
         }
 
         fn recorder() -> (PrometheusRecorder, PrometheusHandle) {
