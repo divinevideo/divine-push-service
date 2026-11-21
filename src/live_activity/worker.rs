@@ -662,9 +662,11 @@ pub async fn tick(
 
     // The last moment an end send, bounded by LIVE_ACTIVITY_SEND_TIMEOUT, can
     // start and still finish with a second to spare inside the claim's lease.
-    let hard_stop = started
-        + Duration::from_secs(settings.lease_secs)
-            .saturating_sub(LIVE_ACTIVITY_SEND_TIMEOUT + Duration::from_secs(1));
+    // `None` when the lease is too long for an `Instant`: then there is no stop.
+    let hard_stop = started.checked_add(
+        Duration::from_secs(settings.lease_secs)
+            .saturating_sub(LIVE_ACTIVITY_SEND_TIMEOUT + Duration::from_secs(1)),
+    );
     let concurrency = settings.max_concurrency.max(1);
     let tally = ViewsTally::default();
     let tally = &tally;
@@ -674,7 +676,8 @@ pub async fn tick(
             // deadline, since waiting for the next tick could outlive the hash,
             // but never so late that its lease could lapse mid-send.
             let at = Instant::now();
-            if at >= deadline && (at >= hard_stop || !past_outage_grace(&activity, now_unix)) {
+            let past_hard_stop = hard_stop.is_some_and(|stop| at >= stop);
+            if at >= deadline && (past_hard_stop || !past_outage_grace(&activity, now_unix)) {
                 schedule(state, &activity, now_ms).await;
                 return None;
             }
@@ -2746,6 +2749,31 @@ mod tests {
             assert!(w.sent_to(&over).is_empty());
             assert_eq!(w.due_ms(&over.id).await, Some(now * 1000));
             assert!(w.live(&over.id).await);
+        }
+
+        /// A lease too long for an `Instant` (validation accepts any length) means
+        /// there is no hard stop, not a tick that panics before sending anything.
+        #[tokio::test]
+        async fn a_lease_too_long_for_an_instant_still_ends_past_grace_activities() {
+            let Some(w) = World::new(Opts {
+                tick_deadline_secs: 1,
+                request_timeout_secs: 10,
+                lease_secs: u64::MAX,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            w.stub.conf().delay = Duration::from_secs(4);
+            let now = now_secs();
+            let over = w.seed(now - 4300, now - 700, now * 1000, None).await;
+
+            let report = w.tick(&w.budget(), now).await;
+
+            assert_eq!(report.ended, 1);
+            assert_eq!(w.sent_to(&over).len(), 1);
+            assert!(!w.live(&over.id).await);
         }
 
         /// `/views` fallbacks that hang until the deadline hold up only their
