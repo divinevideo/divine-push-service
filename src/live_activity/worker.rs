@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::{Result, ServiceError};
 use crate::fcm_sender::{
     live_activity_send_outcome, token_prefix, FcmError, LiveActivityEvent, LiveActivityMessage,
-    SendOutcome,
+    SendOutcome, LIVE_ACTIVITY_SEND_TIMEOUT,
 };
 use crate::live_activity::content::{
     decide, needs_views_fallback, outage_end, ContentState, Decision,
@@ -566,7 +566,9 @@ fn pause_after(report: &TickReport, poll: Duration) -> Option<Duration> {
 /// lookup that outlasts the deadline puts the whole batch back the same way.
 /// Activities past their outage grace are the exception: they are processed
 /// even after the deadline, without a fallback, and end now, since waiting for
-/// the next tick could outlive the hash. A rate-limited bulk lookup pushes the
+/// the next tick could outlive the hash. They still start only while their send
+/// can finish inside the claim's lease, so no other replica can claim one whose
+/// send is still running. A rate-limited bulk lookup pushes the
 /// claimed set back by Funnelcake's `Retry-After` (60 s by default, at most a
 /// cadence), again except activities past their outage grace, which end now.
 /// Returns an error only when the clock reads before the Unix epoch or the
@@ -655,14 +657,21 @@ pub async fn tick(
         None => work.extend(claimed.into_iter().zip(results)),
     }
 
+    // The last moment an end send, bounded by LIVE_ACTIVITY_SEND_TIMEOUT, can
+    // start and still finish with a second to spare inside the claim's lease.
+    let hard_stop = started
+        + Duration::from_secs(settings.lease_secs)
+            .saturating_sub(LIVE_ACTIVITY_SEND_TIMEOUT + Duration::from_secs(1));
     let concurrency = settings.max_concurrency.max(1);
     let tally = ViewsTally::default();
     let tally = &tally;
     let outcomes: Vec<Option<std::result::Result<ProcessOutcome, ()>>> = stream::iter(work)
         .map(|(activity, result)| async move {
             // Past the outage grace an activity is ended even after the
-            // deadline: waiting for the next tick could outlive the hash.
-            if Instant::now() >= deadline && !past_outage_grace(&activity, now_unix) {
+            // deadline, since waiting for the next tick could outlive the hash,
+            // but never so late that its lease could lapse mid-send.
+            let at = Instant::now();
+            if at >= deadline && (at >= hard_stop || !past_outage_grace(&activity, now_unix)) {
                 schedule(state, &activity, now_ms).await;
                 return None;
             }
@@ -2204,6 +2213,7 @@ mod tests {
             views_lookups_per_minute: u32,
             poll_millis: u64,
             max_concurrency: usize,
+            lease_secs: u64,
             panic_for: Option<String>,
         }
 
@@ -2215,6 +2225,7 @@ mod tests {
                     views_lookups_per_minute: 100,
                     poll_millis: 20,
                     max_concurrency: 8,
+                    lease_secs: 120,
                     panic_for: None,
                 }
             }
@@ -2240,7 +2251,7 @@ mod tests {
                 la.funnelcake_base_url = base_url;
                 la.tick_deadline_secs = opts.tick_deadline_secs;
                 la.request_timeout_secs = opts.request_timeout_secs;
-                la.lease_secs = 120;
+                la.lease_secs = opts.lease_secs;
                 la.views_lookups_per_minute = opts.views_lookups_per_minute;
                 la.poll_millis = opts.poll_millis;
                 la.max_concurrency = opts.max_concurrency;
@@ -2695,6 +2706,34 @@ mod tests {
                 }
             );
             assert!(!w.live(&over.id).await);
+        }
+
+        /// Past the deadline, an activity past its outage grace still starts
+        /// only while its send can finish inside the claim's lease. Here the
+        /// lease leaves no such room, so it is put back like the rest, and no
+        /// other replica can claim it while its end is still being sent.
+        #[tokio::test]
+        async fn past_grace_work_never_starts_where_its_lease_could_lapse() {
+            let Some(w) = World::new(Opts {
+                tick_deadline_secs: 1,
+                request_timeout_secs: 10,
+                lease_secs: 12,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            w.stub.conf().delay = Duration::from_secs(4);
+            let now = now_secs();
+            let over = w.seed(now - 4300, now - 700, now * 1000, None).await;
+
+            let report = w.tick(&w.budget(), now).await;
+
+            assert_eq!((report.ended, report.released), (0, 1));
+            assert!(w.sent_to(&over).is_empty());
+            assert_eq!(w.due_ms(&over.id).await, Some(now * 1000));
+            assert!(w.live(&over.id).await);
         }
 
         /// `/views` fallbacks that hang until the deadline hold up only their
