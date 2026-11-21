@@ -57,8 +57,8 @@ pub enum ViewsLookup {
     /// The fallback failed; treated like a failed stats request.
     Failed,
     /// The last views sent are reused: the per-replica budget is spent, or
-    /// paused because Funnelcake rate limited `/views`, or the tick is past its
-    /// deadline.
+    /// paused because Funnelcake rate limited `/views`, or the tick's deadline
+    /// came before the lookup could start or finish.
     BudgetSpent,
 }
 
@@ -561,8 +561,9 @@ fn pause_after(report: &TickReport, poll: Duration) -> Option<Duration> {
 ///
 /// The tick stops starting work at `tick_deadline_secs`; activities not started
 /// by then are put back as due at `now`. Work already in flight finishes: a
-/// fallback still running at the deadline counts as failed, and the send after
-/// it stays inside the claim's lease, as config validation requires. A bulk
+/// fallback still running at the deadline is abandoned (the last views are
+/// reused), and the send after it stays inside the claim's lease, as config
+/// validation requires. A bulk
 /// lookup that outlasts the deadline puts the whole batch back the same way.
 /// Activities past their outage grace are the exception: they are processed
 /// even after the deadline, without a fallback, and end now, since waiting for
@@ -822,10 +823,11 @@ impl TickClock {
 /// The `/views` fallback for one activity, made just before it is processed, so
 /// a slow lookup holds up only its own activity. Its budget slot is stamped
 /// with the time the request goes out: stamping it with the tick's start would
-/// let a slow tick's slots expire early and a later tick go over the budget. A
-/// lookup still running at the tick deadline counts as failed. Past the
-/// deadline none is started: only activities past their outage grace are
-/// processed then, and they reuse the last views sent.
+/// let a slow tick's slots expire early and a later tick go over the budget.
+/// Past the deadline none is started: only activities past their outage grace
+/// are processed then, and they reuse the last views sent. A lookup still
+/// running at the deadline is abandoned and reuses them too, since the tick cut
+/// it short rather than Funnelcake failing it.
 ///
 /// A rate-limited lookup is Funnelcake asking this replica to slow down, not a
 /// stats outage: the bulk counts are still good, so it reuses the last views
@@ -879,9 +881,11 @@ async fn views_fallback(
             ViewsLookup::Failed
         }
         Err(_) => {
-            debug!(activity_id = %activity.id, "live activity views lookup outlasted the tick deadline");
+            // The tick's own deadline cut it short, not Funnelcake: like a
+            // lookup the deadline kept from starting, it reuses the last views.
+            debug!(activity_id = %activity.id, "live activity views lookup outlasted the tick deadline; reusing the last views");
             metrics::live_activity_views_lookup("failed");
-            ViewsLookup::Failed
+            ViewsLookup::BudgetSpent
         }
     }
 }
@@ -2737,8 +2741,9 @@ mod tests {
         }
 
         /// `/views` fallbacks that hang until the deadline hold up only their
-        /// own activities. The rest of the batch is still sent, the hung lookups
-        /// count as failed, and an activity past its outage grace still ends.
+        /// own activities. The rest of the batch is still sent, the cut lookups
+        /// reuse the last views rather than counting as a Funnelcake failure, and
+        /// an activity past its outage grace still ends with its summary.
         #[tokio::test]
         async fn slow_views_lookups_still_process_the_batch() {
             let Some(w) = World::new(Opts {
@@ -2773,21 +2778,25 @@ mod tests {
                     report.ended,
                     report.released
                 ),
-                (3, 1, 1, 1, 0)
+                (3, 2, 0, 1, 0)
             );
             assert_eq!(report.views_lookups, 2);
             assert_eq!(content(&w.sent_to(&fast)[0]).views, Some(5));
-            assert!(w.sent_to(&slow).is_empty());
-            assert!(in_skip_window(w.due_ms(&slow.id).await, now, w.cadence()));
-            // Its lookup failed, so it ends on its last content, removed at once.
+            // Nothing was sent before, so the reused views stay unknown.
+            let c = content(&w.sent_to(&slow)[0]);
+            assert_eq!((c.views, c.likes), (None, Some(1)));
+            assert_eq!(w.due_ms(&slow.id).await, Some((now + w.cadence()) * 1000));
             let ended = w.sent_to(&over);
             assert_eq!(ended.len(), 1);
             assert_eq!(
                 ended[0].event,
                 LiveActivityEvent::End {
-                    dismissal_unix: now - 1
+                    dismissal_unix: now + 1800
                 }
             );
+            let c = content(&ended[0]);
+            assert_eq!(c.phase, Phase::Summary);
+            assert_eq!((c.views, c.likes), (None, Some(2)));
             assert!(!w.live(&over.id).await);
         }
 
@@ -2830,10 +2839,14 @@ mod tests {
             let c = content(&ended[0]);
             assert_eq!(c.phase, Phase::Summary);
             assert_eq!((c.views, c.likes, c.comments), (None, Some(6), Some(2)));
-            assert!(w.sent_to(&slow).is_empty());
+            // The deadline cut its lookup, so it was sent with the last views.
+            assert_eq!(w.sent_to(&slow).len(), 1);
             assert!(w.sent_to(&later).is_empty());
             assert_eq!(w.due_ms(&later.id).await, Some(now * 1000));
-            assert_eq!((report.skipped, report.ended, report.released), (1, 1, 1));
+            assert_eq!(
+                (report.sent, report.ended, report.released, report.skipped),
+                (1, 1, 1, 0)
+            );
         }
 
         #[tokio::test]
