@@ -179,6 +179,8 @@ pub fn outage_end(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_activity::payload::{ActivityState, LiveActivityRegistration};
+    use crate::live_activity::stats_client::VersionStats;
 
     #[test]
     fn content_state_serializes_exact_keys() {
@@ -218,9 +220,6 @@ mod tests {
         assert!(o["postCoordinate"].is_string());
         assert!(o["postEventId"].is_string());
     }
-
-    use crate::live_activity::payload::{ActivityState, LiveActivityRegistration};
-    use crate::live_activity::stats_client::VersionStats;
 
     const NOW: u64 = 1_800_000_000;
 
