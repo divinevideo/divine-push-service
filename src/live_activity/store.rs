@@ -487,11 +487,20 @@ pub async fn end_by_token(
         .invoke_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
-    Ok(match code {
-        0 => EndOutcome::Ended,
-        1 => EndOutcome::TombstonedUnseen,
-        _ => EndOutcome::Stale,
-    })
+    end_outcome(code)
+}
+
+/// Maps the END script's return code. An unknown code is an error, as in
+/// `upsert_active`, rather than being read as `Stale`.
+fn end_outcome(code: i64) -> Result<EndOutcome> {
+    match code {
+        0 => Ok(EndOutcome::Ended),
+        1 => Ok(EndOutcome::TombstonedUnseen),
+        2 => Ok(EndOutcome::Stale),
+        other => Err(ServiceError::Internal(format!(
+            "live activity end returned unknown code {other}"
+        ))),
+    }
 }
 
 fn field<'a>(h: &'a HashMap<String, String>, name: &str, id: &str) -> Result<&'a str> {
@@ -676,4 +685,27 @@ pub async fn active_count(pool: &RedisPool) -> Result<u64> {
         .query_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_outcome_maps_known_codes() {
+        assert!(matches!(end_outcome(0), Ok(EndOutcome::Ended)));
+        assert!(matches!(end_outcome(1), Ok(EndOutcome::TombstonedUnseen)));
+        assert!(matches!(end_outcome(2), Ok(EndOutcome::Stale)));
+    }
+
+    #[test]
+    fn end_outcome_rejects_unknown_codes() {
+        for code in [-1, 3, 99] {
+            let e = end_outcome(code).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("unknown code {code}")),
+                "{e}"
+            );
+        }
+    }
 }
