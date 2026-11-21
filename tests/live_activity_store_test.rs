@@ -7,7 +7,9 @@
 //! jobs far in the future (`FAR_DUE_MS`) so a claim never reaches them.
 
 use divine_push_service::live_activity::payload::{ActivityState, LiveActivityRegistration};
-use divine_push_service::live_activity::store::{self, EndOutcome, UpsertOutcome};
+use divine_push_service::live_activity::store::{
+    self, DeadTokenOutcome, EndOutcome, UpsertOutcome,
+};
 use divine_push_service::redis_store::{self, RedisPool};
 use nostr_sdk::Keys;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1331,4 +1333,164 @@ async fn rotation_keeps_the_original_window() {
     assert_eq!(h["window_ends_at"], other.window_ends_at.to_string());
 
     store::finish(&pool, &id_of(&other)).await.unwrap();
+}
+
+/// Schedule scores for the dead-token tests: far beyond any claim, and distinct,
+/// so each assertion shows which due time the store applied.
+const RETRY_DUE_MS: u64 = FAR_DUE_MS + 180_000;
+const NOW_MS: u64 = FAR_DUE_MS + 1_000;
+
+fn fcm_hash(fcm: &str) -> String {
+    blake3::hash(fcm.as_bytes()).to_hex().to_string()
+}
+
+#[tokio::test]
+async fn first_dead_token_answer_keeps_the_activity_and_marks_the_token() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let fcm = hex(40);
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+
+    let out = store::record_dead_token(&pool, &id, &fcm, NOW_MS, RETRY_DUE_MS)
+        .await
+        .unwrap();
+
+    assert_eq!(out, DeadTokenOutcome::FirstStrike);
+    assert!(store::is_live(&pool, &id).await.unwrap());
+    assert_eq!(job_score(&pool, &id).await, Some(RETRY_DUE_MS));
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert_eq!(h["dead_fcm_hash"], fcm_hash(&fcm));
+    assert_eq!(h["fcm_token"], fcm);
+    assert_eq!(get(&pool, &device_key(&o, &fcm)).await, Some(id.clone()));
+
+    store::finish(&pool, &id).await.unwrap();
+}
+
+#[tokio::test]
+async fn second_dead_token_answer_for_the_same_token_finishes() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let fcm = hex(40);
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+
+    let out = store::record_dead_token(&pool, &id, &fcm, NOW_MS, RETRY_DUE_MS)
+        .await
+        .unwrap();
+
+    assert_eq!(out, DeadTokenOutcome::Finished);
+    assert!(!store::is_live(&pool, &id).await.unwrap());
+    assert_eq!(job_score(&pool, &id).await, None);
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert_eq!(h["state"], "ended");
+    assert!(!h.contains_key("fcm_token"), "{h:?}");
+    assert!(!h.contains_key("dead_fcm_hash"), "{h:?}");
+    assert_eq!(get(&pool, &device_key(&o, &fcm)).await, None);
+
+    // A late answer for an activity already finished only drops its schedule.
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::NotLive
+    );
+    assert_eq!(job_score(&pool, &id).await, None);
+}
+
+/// The race the second strike exists for: the dead-token answer lands just
+/// before the phone's 3079 with its refreshed Firebase token. The new token has
+/// never failed, so a dead answer for it is a first strike again.
+#[tokio::test]
+async fn a_token_replaced_between_strikes_starts_over() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let (old_fcm, new_fcm) = (hex(40), hex(40));
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &old_fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &old_fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+
+    assert_eq!(
+        upsert(&pool, &o, &new_fcm, &r, 101, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Updated
+    );
+    let out = store::record_dead_token(&pool, &id, &new_fcm, NOW_MS, RETRY_DUE_MS + 1)
+        .await
+        .unwrap();
+
+    assert_eq!(out, DeadTokenOutcome::FirstStrike);
+    assert!(store::is_live(&pool, &id).await.unwrap());
+    assert_eq!(job_score(&pool, &id).await, Some(RETRY_DUE_MS + 1));
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert_eq!(h["dead_fcm_hash"], fcm_hash(&new_fcm));
+
+    // And its second answer finishes.
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &new_fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::Finished
+    );
+    assert!(!store::is_live(&pool, &id).await.unwrap());
+}
+
+/// A dead answer for the token a claim held, after a 3079 has replaced it, says
+/// nothing about the new token: the activity is due now and keeps no marker for it.
+#[tokio::test]
+async fn dead_token_replaced_since_the_claim_is_due_now() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let (old_fcm, new_fcm) = (hex(40), hex(40));
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &old_fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    upsert(&pool, &o, &new_fcm, &r, 101, &ev('1'), FAR_DUE_MS).await;
+
+    // Twice: a replaced token never counts as a strike against the new one.
+    for _ in 0..2 {
+        let out = store::record_dead_token(&pool, &id, &old_fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap();
+        assert_eq!(out, DeadTokenOutcome::TokenReplaced);
+        assert!(store::is_live(&pool, &id).await.unwrap());
+        assert_eq!(job_score(&pool, &id).await, Some(NOW_MS));
+    }
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert!(!h.contains_key("dead_fcm_hash"), "{h:?}");
+
+    // The new token's first dead answer is a first strike, not a finish.
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &new_fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+
+    store::finish(&pool, &id).await.unwrap();
 }

@@ -4,7 +4,8 @@
 //! `/views` fallback if it needs one, to [`process_one`]: decide what to show,
 //! send it through Firebase, then reschedule or finish the activity.
 //! Nothing here touches device registration (`user_tokens:*`,
-//! `token_to_pubkey`): a dead token finishes the activity only.
+//! `token_to_pubkey`): a dead token finishes the activity only, and only on a
+//! second dead-token answer for the same token.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -27,7 +28,7 @@ use crate::live_activity::content::{
     decide, needs_views_fallback, outage_end, ContentState, Decision,
 };
 use crate::live_activity::stats_client::{BulkStats, StatsClient, StatsError};
-use crate::live_activity::store::{self, StoredActivity};
+use crate::live_activity::store::{self, DeadTokenOutcome, StoredActivity};
 use crate::metrics;
 use crate::state::AppState;
 
@@ -342,24 +343,7 @@ async fn after_send_error(
     );
     let cadence = Duration::from_secs(cadence_secs(state));
     let delay = match outcome {
-        SendOutcome::Finish => {
-            // The claim's token is the one that failed. A re-registration may
-            // have replaced it since: that activity is due again now, for its
-            // new token, rather than finished for good.
-            match store::finish_if_token(&state.redis_pool, &activity.id, &activity.fcm_token).await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    debug!(activity_id = %activity.id, "live activity token replaced since the claim; retrying on the new token");
-                    schedule(state, activity, now_unix.saturating_mul(1000)).await;
-                    return ProcessOutcome::Deferred(Duration::ZERO);
-                }
-                Err(e) => {
-                    warn!(activity_id = %activity.id, error = %e, "failed to finish live activity");
-                }
-            }
-            return ProcessOutcome::Finished;
-        }
+        SendOutcome::Finish => return after_dead_token(state, activity, cadence, now_unix).await,
         // Firebase's delay is kept between the floor and one cadence.
         SendOutcome::RetryAfter(delay) => delay.max(LIVE_ACTIVITY_MIN_RETRY).min(cadence),
         SendOutcome::RetryNextCycle => cadence,
@@ -369,6 +353,51 @@ async fn after_send_error(
     let due_ms = cap_due_ms(activity, now_unix, now_ms.saturating_add(delay_ms));
     schedule(state, activity, due_ms).await;
     ProcessOutcome::Deferred(Duration::from_millis(due_ms.saturating_sub(now_ms)))
+}
+
+/// Handles Firebase's dead-token answer for the claim's token. One answer can
+/// race the phone's 3079 with a refreshed token, so only a second answer for the
+/// same token finishes the activity; the first waits a cadence (never past the
+/// outage grace) for the new token. A token already replaced since the claim is
+/// retried at once, for the new token.
+async fn after_dead_token(
+    state: &AppState,
+    activity: &StoredActivity,
+    cadence: Duration,
+    now_unix: u64,
+) -> ProcessOutcome {
+    let now_ms = now_unix.saturating_mul(1000);
+    let cadence_ms = u64::try_from(cadence.as_millis()).unwrap_or(u64::MAX);
+    let retry_due_ms = cap_due_ms(activity, now_unix, now_ms.saturating_add(cadence_ms));
+    match store::record_dead_token(
+        &state.redis_pool,
+        &activity.id,
+        &activity.fcm_token,
+        now_ms,
+        retry_due_ms,
+    )
+    .await
+    {
+        Ok(DeadTokenOutcome::FirstStrike) => {
+            info!(
+                activity_id = %activity.id,
+                owner = %activity.owner,
+                fcm_token = %token_prefix(&activity.fcm_token),
+                activity_token = %token_prefix(&activity.registration.activity_token),
+                "first dead-token answer for this live activity token; waiting a cadence for a refreshed token"
+            );
+            ProcessOutcome::Deferred(Duration::from_millis(retry_due_ms.saturating_sub(now_ms)))
+        }
+        Ok(DeadTokenOutcome::TokenReplaced) => {
+            debug!(activity_id = %activity.id, "live activity token replaced since the claim; retrying on the new token");
+            ProcessOutcome::Deferred(Duration::ZERO)
+        }
+        Ok(DeadTokenOutcome::Finished | DeadTokenOutcome::NotLive) => ProcessOutcome::Finished,
+        Err(e) => {
+            warn!(activity_id = %activity.id, error = %e, "failed to record live activity dead-token answer");
+            ProcessOutcome::Finished
+        }
+    }
 }
 
 async fn schedule(state: &AppState, activity: &StoredActivity, due_ms: u64) {
@@ -1383,8 +1412,11 @@ mod tests {
         f.done().await;
     }
 
+    /// One dead-token answer only marks the token and waits a cadence, so the
+    /// phone has time to register a refreshed one; a second answer for the same
+    /// token finishes the activity.
     #[tokio::test]
-    async fn token_not_registered_finishes() {
+    async fn token_not_registered_finishes_on_the_second_answer() {
         let Some(f) = Fixture::new().await else {
             return;
         };
@@ -1403,9 +1435,122 @@ mod tests {
         )
         .await;
 
+        let cadence = Duration::from_secs(f.cadence());
+        assert_eq!(outcome, ProcessOutcome::Deferred(cadence));
+        assert!(f.live(&activity.id).await);
+        assert_eq!(
+            f.due_ms(&activity.id).await,
+            Some((now + f.cadence()) * 1000)
+        );
+        assert_eq!(f.hget(&activity.id, "last_content").await, None);
+
+        let later = now + f.cadence();
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.stats(Some(5), 2, 1)),
+            ViewsLookup::NotNeeded,
+            later,
+        )
+        .await;
+
         assert_eq!(outcome, ProcessOutcome::Finished);
         assert!(!f.live(&activity.id).await);
         assert_eq!(f.due_ms(&activity.id).await, None);
+        f.done().await;
+    }
+
+    #[tokio::test]
+    async fn first_dead_token_answer_never_passes_the_outage_grace() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let now = now_secs();
+        // The window closed 500 s ago: the latest a retry may run is now + 100.
+        let reg = f.registration(now - 4100, now - 500);
+        f.mock
+            .set_error_for_token(&reg.activity_token, FcmError::TokenNotRegistered);
+        let activity = f.seed(reg, now).await;
+
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.stats(Some(5), 2, 1)),
+            ViewsLookup::NotNeeded,
+            now,
+        )
+        .await;
+
+        assert_eq!(outcome, ProcessOutcome::Deferred(Duration::from_secs(100)));
+        assert_eq!(f.due_ms(&activity.id).await, Some((now + 100) * 1000));
+        assert!(f.live(&activity.id).await);
+        f.done().await;
+    }
+
+    /// The race the second strike exists for: Firebase reports the token dead a
+    /// moment before the phone's 3079 with its refreshed token arrives. The card
+    /// keeps updating on the new token instead of freezing.
+    #[tokio::test]
+    async fn dead_token_answer_racing_a_token_refresh_keeps_the_card() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let now = now_secs();
+        let reg = f.registration(now - 900, now + 2700);
+        f.mock
+            .set_error_for_token(&reg.activity_token, FcmError::TokenNotRegistered);
+        let claimed = f.seed(reg.clone(), now - 10).await;
+
+        let outcome = process_one(
+            &f.state,
+            &claimed,
+            Ok(&f.stats(Some(5), 2, 1)),
+            ViewsLookup::NotNeeded,
+            now,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::Deferred(Duration::from_secs(f.cadence()))
+        );
+
+        let refreshed = format!("fcm-{}", hex(40));
+        let rereg = store::upsert_active(
+            f.pool(),
+            &f.owner,
+            &refreshed,
+            &reg,
+            now,
+            &hex(64),
+            FAR_DUE_MS,
+            5,
+            100_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rereg, store::UpsertOutcome::Updated);
+        assert!(f.live(&claimed.id).await);
+
+        f.mock.clear();
+        let reclaimed = StoredActivity {
+            fcm_token: refreshed.clone(),
+            ..claimed.clone()
+        };
+        let later = now + f.cadence();
+        let outcome = process_one(
+            &f.state,
+            &reclaimed,
+            Ok(&f.stats(Some(9), 3, 1)),
+            ViewsLookup::NotNeeded,
+            later,
+        )
+        .await;
+
+        assert_eq!(outcome, ProcessOutcome::Sent);
+        let sent = f.mock.get_live_activity_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].fcm_token, refreshed);
+        assert!(f.live(&claimed.id).await);
         f.done().await;
     }
 
@@ -1483,16 +1628,29 @@ mod tests {
         f.mock
             .set_error_for_token(&reg.activity_token, FcmError::TokenNotRegistered);
         let activity = f.seed(reg, now).await;
-        let outcome = process_one(
-            &f.state,
-            &activity,
-            Ok(&f.stats(Some(5), 2, 1)),
-            ViewsLookup::NotNeeded,
-            now,
-        )
-        .await;
+        // Both answers: the first only marks the token, the second finishes.
+        let mut outcomes = Vec::new();
+        for at in [now, now + f.cadence()] {
+            outcomes.push(
+                process_one(
+                    &f.state,
+                    &activity,
+                    Ok(&f.stats(Some(5), 2, 1)),
+                    ViewsLookup::NotNeeded,
+                    at,
+                )
+                .await,
+            );
+        }
 
-        assert_eq!(outcome, ProcessOutcome::Finished);
+        assert_eq!(
+            outcomes,
+            vec![
+                ProcessOutcome::Deferred(Duration::from_secs(f.cadence())),
+                ProcessOutcome::Finished
+            ]
+        );
+        assert!(!f.live(&activity.id).await);
         assert_eq!(
             redis_store::get_tokens_for_pubkey(f.pool(), &pubkey)
                 .await
@@ -1957,7 +2115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_not_registered_on_end_finishes() {
+    async fn token_not_registered_on_end_finishes_on_the_second_answer() {
         let Some(f) = Fixture::new().await else {
             return;
         };
@@ -1973,6 +2131,25 @@ mod tests {
             Ok(&f.stats(Some(40), 6, 2)),
             ViewsLookup::NotNeeded,
             now,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ProcessOutcome::Deferred(Duration::from_secs(f.cadence()))
+        );
+        assert!(f.live(&activity.id).await);
+        assert_eq!(
+            f.due_ms(&activity.id).await,
+            Some((now + f.cadence()) * 1000)
+        );
+
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.stats(Some(40), 6, 2)),
+            ViewsLookup::NotNeeded,
+            now + f.cadence(),
         )
         .await;
 

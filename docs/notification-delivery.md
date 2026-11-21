@@ -102,6 +102,15 @@ They are bounded by other limits instead:
   dead-token answer for a token a re-registration has since replaced: that is
   retried at once, for the new token.
 
+A dead-token answer from Firebase ends the activity only when it is the second
+one for the same token. The phone may be about to send a 3079 with a refreshed
+Firebase token, and that 3079 can arrive just after the answer, so the first
+answer marks the token and retries one cadence later (never past the point where
+the activity must end). If a 3079 has replaced the token by then, the next send
+uses the new token, and a dead-token answer for it counts as a first answer
+again. A second answer while the marked token is still the stored one finishes
+the activity. A person's end is never delayed by this.
+
 Each replica runs its own worker, so its Funnelcake load is per replica too. A
 tick makes one bulk stats request per 100 post ids. An edited post carries up to
 10 ids, so a full batch of 100 activities can take up to 10 requests, up to

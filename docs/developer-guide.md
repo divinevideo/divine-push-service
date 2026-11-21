@@ -267,9 +267,13 @@ no `notification` and no `data`, addressed to the activity rather than the app
   At `windowEndsAt` the activity ends with phase `summary`. If stats stay unreachable
   until `windowEndsAt` + 600 s, it ends on the last content sent.
 - The worker never prunes `user_tokens:*` or `token_to_pubkey`, even when Firebase
-  reports the token unregistered; it only finishes the activity. Logs carry full
-  event ids and pubkeys and an 8-character `token_prefix` for FCM and activity
-  tokens, never a whole token.
+  reports the token unregistered; it only finishes the activity, and only on the
+  second dead-token answer for the same Firebase token. The first answer records
+  the token's hash (`dead_fcm_hash`) and retries a cadence later, so a 3079 with a
+  refreshed token that arrives just after the answer keeps the card updating; a
+  dead-token answer for a token a 3079 has replaced counts as a first answer.
+  Logs carry full event ids and pubkeys and an 8-character `token_prefix` for FCM
+  and activity tokens, never a whole token.
 
 ### Live Activity metrics
 
@@ -636,7 +640,7 @@ The canonical registration and removal rules live in the push specification's
 | `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: one member per emitted like/repost notification scored by send time, pruned to `recipient_daily_window_secs` and counted against `recipient_daily_cap` before the bucket is spent |
 | `delivery_budget:{pubkey}`, `delivery_generations:{pubkey}`, `notification_activity:{pubkey}`, `notification_active:{pubkey}`, `notification_activity_session:{pubkey}:{session}`, `notification_work_generation:{pubkey}:{hash}` | Mixed | Shared interruption policy and visit state; see [notification-delivery.md](notification-delivery.md) |
 | `campaign_delivery:{idempotencyKey}` | String | Campaign delivery claim. Taken for the in-flight window (`CLAIM_TTL_SECS`, 600s) while a send is running, extended to `campaign_delivery.dedup_ttl_secs` (7 days by default) once FCM accepts a push, and dropped on the outcomes that send nothing. The key being present does not by itself mean the push was delivered; a TTL beyond the in-flight window does |
-| `live_activity:{blake3(owner:activityToken)}` | Hash | One iOS Live Activity, scoped by owner so one signer can never block or hijack another's activity: owner, FCM and activity tokens, post coordinate and ids, window, order stamp (`last_at` 20-digit `created_at`, `last_id`; among updates the lower id wins a same-second tie, but an `ended` wins a same-second tie against an `active`), `state`, `absent_checks`, `last_content`, `last_sent_at`, `first_seen_at`. Expires at the first registration's `windowEndsAt` + 2100 s: updates and token rotations keep the first `postedAt`/`windowEndsAt`, so the hash and token binding can never be renewed. Ending, finishing or superseding leaves a tombstone (`state = ended`, both tokens dropped) until `windowEndsAt` + 1800 s, so a replayed `active` never restarts it. Kept apart from device registration: never touches `user_tokens:*` or `token_to_pubkey` |
+| `live_activity:{blake3(owner:activityToken)}` | Hash | One iOS Live Activity, scoped by owner so one signer can never block or hijack another's activity: owner, FCM and activity tokens, post coordinate and ids, window, order stamp (`last_at` 20-digit `created_at`, `last_id`; among updates the lower id wins a same-second tie, but an `ended` wins a same-second tie against an `active`), `state`, `absent_checks`, `last_content`, `last_sent_at`, `first_seen_at`, and `dead_fcm_hash` (hash of the Firebase token after its first dead-token answer; a second answer for that token finishes the activity). Expires at the first registration's `windowEndsAt` + 2100 s: updates and token rotations keep the first `postedAt`/`windowEndsAt`, so the hash and token binding can never be renewed. Ending, finishing or superseding leaves a tombstone (`state = ended`, both tokens dropped) until `windowEndsAt` + 1800 s, so a replayed `active` never restarts it. Kept apart from device registration: never touches `user_tokens:*` or `token_to_pubkey` |
 | `live_activity_owner:{owner}` | Set | An owner's live activity ids, for `max_active_per_owner`. TTL extended with each member; expired or ended members are pruned when the cap is checked |
 | `live_activity_device:{owner}:{blake3(fcmToken)}` | String | The device's current activity id. One active activity per owner and device; a newer one supersedes it, carrying its schedule and send state when it is the same post (an Apple token rotation) |
 | `live_activity_jobs` | Sorted Set | Active activity ids scored by due time (Unix ms). A claim leases by rescoring to now + lease and drops members whose hash is gone or tombstoned. `ZCARD` is the active gauge and the `max_active_total` cap |

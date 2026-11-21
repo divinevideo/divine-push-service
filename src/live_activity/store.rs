@@ -93,8 +93,26 @@ pub enum EndOutcome {
     Stale,
 }
 
+/// Result of a dead-token answer from Firebase for an activity's send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadTokenOutcome {
+    /// The first dead-token answer for the stored token: the token is marked and
+    /// the activity rescheduled at the retry due time, still live, so the phone
+    /// can register a refreshed token meanwhile.
+    FirstStrike,
+    /// The second dead-token answer for the same stored token: the activity was
+    /// finished (tombstoned and unscheduled).
+    Finished,
+    /// A re-registration replaced the failed token since the claim: the activity
+    /// is due now, for its new token, and nothing counts against that token.
+    TokenReplaced,
+    /// The activity was already ended or finished; it was only unscheduled.
+    NotLive,
+}
+
 /// Lua shared by every script. `tombstone` keeps owner, order stamp and window,
-/// drops both tokens, unschedules the id and clears its owner and device entries.
+/// drops both tokens (and the dead-token marker), unschedules the id and clears
+/// its owner and device entries.
 const PRELUDE: &str = r#"
 local PREFIX = 'live_activity:'
 local OWNER_PREFIX = 'live_activity_owner:'
@@ -123,7 +141,7 @@ local function tombstone(id, at, eid)
       if redis.call('GET', dkey) == id then redis.call('DEL', dkey) end
     end
   end
-  redis.call('HDEL', key, 'fcm_token', 'activity_token', 'fcm_hash')
+  redis.call('HDEL', key, 'fcm_token', 'activity_token', 'fcm_hash', 'dead_fcm_hash')
   redis.call('HSET', key, 'state', 'ended')
   if at then redis.call('HSET', key, 'last_at', at, 'last_id', eid) end
   if f[3] then redis.call('EXPIREAT', key, tonumber(f[3]) + 1800) end
@@ -341,15 +359,38 @@ static FINISH: LazyLock<Script> = LazyLock::new(|| {
         "{PRELUDE}{}",
         r#"
 if is_live(ARGV[1]) then
-  -- With ARGV[2], only finish while the stored Firebase token is still that one.
-  if ARGV[2] and redis.call('HGET', PREFIX .. ARGV[1], 'fcm_hash') ~= ARGV[2] then
-    return 0
-  end
   tombstone(ARGV[1])
 else
   redis.call('ZREM', JOBS, ARGV[1])
 end
 return 1
+"#
+    ))
+});
+
+static DEAD_TOKEN: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(&format!(
+        "{PRELUDE}{}",
+        r#"
+local id, failed, now_ms, retry_ms = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+if not is_live(id) then
+  redis.call('ZREM', JOBS, id)
+  return 1
+end
+local s = redis.call('HMGET', PREFIX .. id, 'fcm_hash', 'dead_fcm_hash')
+-- A re-registration replaced the failed token: due now, for the new one.
+if s[1] ~= failed then
+  redis.call('ZADD', JOBS, now_ms, id)
+  return 2
+end
+-- The same token already failed once: it is dead for good.
+if s[2] == failed then
+  tombstone(id)
+  return 0
+end
+redis.call('HSET', PREFIX .. id, 'dead_fcm_hash', failed)
+redis.call('ZADD', JOBS, retry_ms, id)
+return 3
 "#
     ))
 });
@@ -663,21 +704,52 @@ pub async fn finish(pool: &RedisPool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Finish an activity after a send to `fcm_token` failed for good, unless a
-/// re-registration has replaced that token since the activity was claimed.
-/// Returns false, and leaves the activity live and scheduled as it was, when the
-/// stored token is another one. Otherwise behaves like [`finish`].
-pub async fn finish_if_token(pool: &RedisPool, id: &str, fcm_token: &str) -> Result<bool> {
+/// Apply Firebase's dead-token answer for a send to `fcm_token`, atomically.
+///
+/// A dead-token answer can race the phone's 3079 carrying its refreshed Firebase
+/// token, so one answer never ends the card:
+/// - the first answer for the stored token marks it (`dead_fcm_hash`) and
+///   reschedules the activity at `retry_due_ms`, giving the phone time to
+///   register a new token;
+/// - a second answer while the stored token is still the marked one finishes
+///   the activity, like [`finish`];
+/// - when a re-registration has replaced `fcm_token` since the claim, the
+///   activity is due at `now_ms` for its new token, and no strike is recorded.
+///
+/// A person's end is unaffected: an ended activity is never revived here.
+pub async fn record_dead_token(
+    pool: &RedisPool,
+    id: &str,
+    fcm_token: &str,
+    now_ms: u64,
+    retry_due_ms: u64,
+) -> Result<DeadTokenOutcome> {
     let mut conn = conn(pool).await?;
-    let finished: i64 = FINISH
+    let code: i64 = DEAD_TOKEN
         .key(format!("{ACTIVITY_PREFIX}{id}"))
         .key(JOBS_ZSET)
         .arg(id)
         .arg(blake3_hex(fcm_token))
+        .arg(now_ms.to_string())
+        .arg(retry_due_ms.to_string())
         .invoke_async(&mut *conn)
         .await
         .map_err(ServiceError::Redis)?;
-    Ok(finished == 1)
+    dead_token_outcome(code)
+}
+
+/// Maps the DEAD_TOKEN script's return code. An unknown code is an error, as in
+/// `upsert_active` and `end_by_token`.
+fn dead_token_outcome(code: i64) -> Result<DeadTokenOutcome> {
+    match code {
+        0 => Ok(DeadTokenOutcome::Finished),
+        1 => Ok(DeadTokenOutcome::NotLive),
+        2 => Ok(DeadTokenOutcome::TokenReplaced),
+        3 => Ok(DeadTokenOutcome::FirstStrike),
+        other => Err(ServiceError::Internal(format!(
+            "live activity dead-token answer returned unknown code {other}"
+        ))),
+    }
 }
 
 /// Age in seconds of the oldest due activity, or `None` when nothing is due.
@@ -718,6 +790,37 @@ mod tests {
         assert!(matches!(end_outcome(0), Ok(EndOutcome::Ended)));
         assert!(matches!(end_outcome(1), Ok(EndOutcome::TombstonedUnseen)));
         assert!(matches!(end_outcome(2), Ok(EndOutcome::Stale)));
+    }
+
+    #[test]
+    fn dead_token_outcome_maps_known_codes() {
+        assert!(matches!(
+            dead_token_outcome(0),
+            Ok(DeadTokenOutcome::Finished)
+        ));
+        assert!(matches!(
+            dead_token_outcome(1),
+            Ok(DeadTokenOutcome::NotLive)
+        ));
+        assert!(matches!(
+            dead_token_outcome(2),
+            Ok(DeadTokenOutcome::TokenReplaced)
+        ));
+        assert!(matches!(
+            dead_token_outcome(3),
+            Ok(DeadTokenOutcome::FirstStrike)
+        ));
+    }
+
+    #[test]
+    fn dead_token_outcome_rejects_unknown_codes() {
+        for code in [-1, 4, 99] {
+            let e = dead_token_outcome(code).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("unknown code {code}")),
+                "{e}"
+            );
+        }
     }
 
     #[test]
