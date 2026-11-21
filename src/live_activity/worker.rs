@@ -436,7 +436,9 @@ impl ViewsBudget {
 /// worker never takes the service down and returns only on shutdown. Only a
 /// tick that claimed a full batch is followed straight by the next; otherwise
 /// it sleeps `poll_millis`, and after a rate-limited tick it waits out
-/// Funnelcake's back-off (see `pause_after`).
+/// Funnelcake's back-off (see `pause_after`). Shutdown cancels a tick
+/// mid-flight; the activities it had claimed come back once their lease
+/// expires, and the update or end that may then be sent again is harmless.
 pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: CancellationToken) {
     let settings = &state.settings.live_activity;
     let budget = ViewsBudget::new(settings.views_lookups_per_minute);
