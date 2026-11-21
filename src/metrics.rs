@@ -347,10 +347,10 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            live_activity_registration("active");
+            live_activity_registration("created");
             live_activity_send("update", "ok");
-            live_activity_stats_failure("timeout");
-            live_activity_skipped("lease_lost");
+            live_activity_stats_failure("request");
+            live_activity_skipped("stats_failed");
             live_activity_views_lookup("budget_spent");
             live_activity_active(3.0);
             live_activity_oldest_due_age(7.0);
@@ -359,10 +359,10 @@ mod tests {
         handle.run_upkeep();
         let rendered = handle.render();
         for expected in [
-            r#"push_live_activity_registrations_total{outcome="active"} 1"#,
+            r#"push_live_activity_registrations_total{outcome="created"} 1"#,
             r#"push_live_activity_sends_total{event="update",result="ok"} 1"#,
-            r#"push_live_activity_stats_failures_total{reason="timeout"} 1"#,
-            r#"push_live_activity_skipped_total{reason="lease_lost"} 1"#,
+            r#"push_live_activity_stats_failures_total{reason="request"} 1"#,
+            r#"push_live_activity_skipped_total{reason="stats_failed"} 1"#,
             r#"push_live_activity_views_lookups_total{result="budget_spent"} 1"#,
             "push_live_activity_active 3",
             "push_live_activity_oldest_due_age_seconds 7",
