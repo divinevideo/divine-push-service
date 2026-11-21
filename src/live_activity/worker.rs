@@ -1,12 +1,13 @@
 //! The Live Activity worker. [`run`] loops over [`tick`], which claims due
-//! activities, fetches their stats in one bulk call plus any `/views` fallback,
-//! and hands each one to [`process_one`]: decide what to show, send it through
-//! Firebase, then reschedule or finish the activity. Nothing here touches device
-//! registration (`user_tokens:*`, `token_to_pubkey`): a dead token finishes the
-//! activity only.
+//! activities, fetches their stats in one bulk call, and hands each one, after
+//! its `/views` fallback if it needs one, to [`process_one`]: decide what to
+//! show, send it through Firebase, then reschedule or finish the activity.
+//! Nothing here touches device registration (`user_tokens:*`,
+//! `token_to_pubkey`): a dead token finishes the activity only.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +55,8 @@ pub enum ViewsLookup {
     Found(Option<u64>),
     /// The fallback failed; treated like a failed stats request.
     Failed,
-    /// The per-replica lookup budget is spent; the last views sent are reused.
+    /// No lookup was made, because the per-replica budget is spent or the tick
+    /// is past its deadline; the last views sent are reused.
     BudgetSpent,
 }
 
@@ -529,16 +531,22 @@ fn pause_after(report: &TickReport, poll: Duration) -> Option<Duration> {
 }
 
 /// One pass: sample the gauges, claim due activities, look up their stats in one
-/// bulk call (plus any `/views` fallbacks), then process each under
-/// `catch_unwind`, at most `max_concurrency` at a time.
+/// bulk call, then process each under `catch_unwind`, at most `max_concurrency`
+/// at a time. An activity's `/views` fallback, when it needs one, is made just
+/// before it is processed (see `views_fallback`).
 ///
 /// The tick stops starting work at `tick_deadline_secs`; activities not started
-/// by then are put back as due at `now`. Work already in flight finishes, which
-/// config validation keeps inside the claim's lease. A rate-limited bulk lookup
-/// pushes the claimed set back by Funnelcake's `Retry-After` (60 s by default,
-/// at most a cadence), except activities already past their outage grace, which
-/// end now. Returns an error only when the clock reads before the Unix epoch
-/// or the claim fails.
+/// by then are put back as due at `now`. Work already in flight finishes: a
+/// fallback still running at the deadline counts as failed, and the send after
+/// it stays inside the claim's lease, as config validation requires. A bulk
+/// lookup that outlasts the deadline puts the whole batch back the same way.
+/// Activities past their outage grace are the exception: they are processed
+/// even after the deadline, without a fallback, and end now, since waiting for
+/// the next tick could outlive the hash. A rate-limited bulk lookup pushes the
+/// claimed set back by Funnelcake's `Retry-After` (60 s by default, at most a
+/// cadence), again except activities past their outage grace, which end now.
+/// Returns an error only when the clock reads before the Unix epoch or the
+/// claim fails.
 pub async fn tick(
     state: &AppState,
     stats: &StatsClient,
@@ -573,16 +581,24 @@ pub async fn tick(
         .iter()
         .map(|a| a.registration.post_event_ids.clone())
         .collect();
-    let Ok(results) = tokio::time::timeout_at(deadline, stats.bulk_grouped(&groups)).await else {
-        warn!(
-            claimed = claimed.len(),
-            "live activity stats lookup outlasted the tick deadline"
-        );
-        report.deadline_hit = true;
-        release(state, &claimed, now_ms, &mut report).await;
-        return Ok(report);
+    let results = match tokio::time::timeout_at(deadline, stats.bulk_grouped(&groups)).await {
+        Ok(results) => {
+            count_stats_failures(&results);
+            results
+        }
+        Err(_) => {
+            warn!(
+                claimed = claimed.len(),
+                "live activity stats lookup outlasted the tick deadline"
+            );
+            report.deadline_hit = true;
+            // Processed below as failed lookups: the deadline has passed, so
+            // every activity is put back except those past their outage grace,
+            // which end on their last content.
+            let timed_out = StatsError::Request("outlasted the tick deadline".to_string());
+            vec![Err(timed_out); claimed.len()]
+        }
     };
-    count_stats_failures(&results);
 
     let mut work: Vec<(StoredActivity, std::result::Result<BulkStats, StatsError>)> =
         Vec::with_capacity(claimed.len());
@@ -609,51 +625,45 @@ pub async fn tick(
         None => work.extend(claimed.into_iter().zip(results)),
     }
 
-    let Some(views) = views_lookups(state, stats, budget, &work, now, deadline, &mut report).await
-    else {
-        warn!("live activity views lookups outlasted the tick deadline");
-        report.deadline_hit = true;
-        let unstarted: Vec<StoredActivity> = work.into_iter().map(|(a, _)| a).collect();
-        release(state, &unstarted, now_ms, &mut report).await;
-        return Ok(report);
-    };
-
     let concurrency = settings.max_concurrency.max(1);
-    let outcomes: Vec<Option<std::result::Result<ProcessOutcome, ()>>> =
-        stream::iter(work.into_iter().zip(views))
-            .map(|((activity, result), views)| async move {
-                if Instant::now() >= deadline {
-                    schedule(state, &activity, now_ms).await;
-                    return None;
-                }
-                let processed = AssertUnwindSafe(process_one(
-                    state,
-                    &activity,
-                    result.as_ref(),
-                    views,
-                    now_unix,
-                ))
-                .catch_unwind()
-                .await;
-                Some(match processed {
-                    Ok(outcome) => Ok(outcome),
-                    Err(_) => {
-                        error!(
-                            activity_id = %activity.id,
-                            owner = %activity.owner,
-                            "live activity processing panicked; retrying next cycle"
-                        );
-                        metrics::live_activity_skipped("panicked");
-                        let next = now_ms.saturating_add(cadence_secs(state).saturating_mul(1000));
-                        schedule(state, &activity, cap_due_ms(&activity, now_unix, next)).await;
-                        Err(())
-                    }
-                })
+    let tally = ViewsTally::default();
+    let tally = &tally;
+    let outcomes: Vec<Option<std::result::Result<ProcessOutcome, ()>>> = stream::iter(work)
+        .map(|(activity, result)| async move {
+            // Past the outage grace an activity is ended even after the
+            // deadline: waiting for the next tick could outlive the hash.
+            if Instant::now() >= deadline && !past_outage_grace(&activity, now_unix) {
+                schedule(state, &activity, now_ms).await;
+                return None;
+            }
+            let processed = AssertUnwindSafe(async {
+                let views =
+                    views_fallback(stats, budget, &activity, &result, now, deadline, tally).await;
+                process_one(state, &activity, result.as_ref(), views, now_unix).await
             })
-            .buffer_unordered(concurrency)
-            .collect()
+            .catch_unwind()
             .await;
+            Some(match processed {
+                Ok(outcome) => Ok(outcome),
+                Err(_) => {
+                    error!(
+                        activity_id = %activity.id,
+                        owner = %activity.owner,
+                        "live activity processing panicked; retrying next cycle"
+                    );
+                    metrics::live_activity_skipped("panicked");
+                    let next = now_ms.saturating_add(cadence_secs(state).saturating_mul(1000));
+                    schedule(state, &activity, cap_due_ms(&activity, now_unix, next)).await;
+                    Err(())
+                }
+            })
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
 
+    report.views_lookups = tally.lookups.load(Ordering::Relaxed);
+    report.views_budget_spent = tally.budget_spent.load(Ordering::Relaxed);
     for outcome in outcomes {
         match outcome {
             None => {
@@ -695,20 +705,6 @@ fn past_outage_grace(activity: &StoredActivity, now_unix: u64) -> bool {
             .registration
             .window_ends_at
             .saturating_add(OUTAGE_GRACE_SECS)
-}
-
-/// Puts unstarted activities back as due at `now_ms`, so the next tick takes
-/// them instead of waiting out the lease.
-async fn release(
-    state: &AppState,
-    activities: &[StoredActivity],
-    now_ms: u64,
-    report: &mut TickReport,
-) {
-    for activity in activities {
-        schedule(state, activity, now_ms).await;
-        report.released += 1;
-    }
 }
 
 fn stats_failure_reason(error: &StatsError) -> &'static str {
@@ -755,63 +751,61 @@ fn rate_limit_backoff(
         })
 }
 
-/// The `/views` fallback for each work item, in order. Lookups run concurrently,
-/// at most `max_concurrency` at a time, against the per-minute budget. Returns
-/// `None` when they outlast the tick deadline.
-async fn views_lookups(
-    state: &AppState,
+/// `/views` fallbacks made and refused for lack of budget during one tick.
+#[derive(Default)]
+struct ViewsTally {
+    lookups: AtomicUsize,
+    budget_spent: AtomicUsize,
+}
+
+/// The `/views` fallback for one activity, made just before it is processed, so
+/// a slow lookup holds up only its own activity. A lookup still running at the
+/// tick deadline counts as failed. Past the deadline none is started: only
+/// activities past their outage grace are processed then, and they reuse the
+/// last views sent.
+async fn views_fallback(
     stats: &StatsClient,
     budget: &ViewsBudget,
-    work: &[(StoredActivity, std::result::Result<BulkStats, StatsError>)],
+    activity: &StoredActivity,
+    result: &std::result::Result<BulkStats, StatsError>,
     now: SystemTime,
     deadline: Instant,
-    report: &mut TickReport,
-) -> Option<Vec<ViewsLookup>> {
-    let mut lookups = vec![ViewsLookup::NotNeeded; work.len()];
-    let mut wanted: Vec<(usize, String)> = Vec::new();
-    for (i, (activity, result)) in work.iter().enumerate() {
-        let Ok(bulk) = result else { continue };
-        if !needs_views_fallback(activity, bulk) {
-            continue;
+    tally: &ViewsTally,
+) -> ViewsLookup {
+    let Ok(bulk) = result else {
+        return ViewsLookup::NotNeeded;
+    };
+    if !needs_views_fallback(activity, bulk) {
+        return ViewsLookup::NotNeeded;
+    }
+    let Some(first_id) = activity.registration.post_event_ids.first() else {
+        return ViewsLookup::NotNeeded;
+    };
+    if Instant::now() >= deadline {
+        return ViewsLookup::BudgetSpent;
+    }
+    if !budget.try_take(now) {
+        metrics::live_activity_views_lookup("budget_spent");
+        tally.budget_spent.fetch_add(1, Ordering::Relaxed);
+        return ViewsLookup::BudgetSpent;
+    }
+    tally.lookups.fetch_add(1, Ordering::Relaxed);
+    match tokio::time::timeout_at(deadline, stats.views(first_id)).await {
+        Ok(Ok(views)) => {
+            metrics::live_activity_views_lookup("ok");
+            ViewsLookup::Found(views)
         }
-        let Some(first_id) = activity.registration.post_event_ids.first() else {
-            continue;
-        };
-        if budget.try_take(now) {
-            wanted.push((i, first_id.clone()));
-        } else {
-            metrics::live_activity_views_lookup("budget_spent");
-            report.views_budget_spent += 1;
-            lookups[i] = ViewsLookup::BudgetSpent;
+        Ok(Err(e)) => {
+            metrics::live_activity_views_lookup("failed");
+            metrics::live_activity_stats_failure(stats_failure_reason(&e));
+            ViewsLookup::Failed
+        }
+        Err(_) => {
+            debug!(activity_id = %activity.id, "live activity views lookup outlasted the tick deadline");
+            metrics::live_activity_views_lookup("failed");
+            ViewsLookup::Failed
         }
     }
-    if wanted.is_empty() {
-        return Some(lookups);
-    }
-    report.views_lookups = wanted.len();
-    let fetched = tokio::time::timeout_at(
-        deadline,
-        stream::iter(wanted)
-            .map(|(i, id)| async move { (i, stats.views(&id).await) })
-            .buffer_unordered(state.settings.live_activity.max_concurrency.max(1))
-            .collect::<Vec<_>>(),
-    )
-    .await
-    .ok()?;
-    for (i, result) in fetched {
-        lookups[i] = match result {
-            Ok(views) => {
-                metrics::live_activity_views_lookup("ok");
-                ViewsLookup::Found(views)
-            }
-            Err(e) => {
-                metrics::live_activity_views_lookup("failed");
-                metrics::live_activity_stats_failure(stats_failure_reason(&e));
-                ViewsLookup::Failed
-            }
-        };
-    }
-    Some(lookups)
 }
 
 #[cfg(test)]
@@ -1974,6 +1968,7 @@ mod tests {
             delay: Duration,
             present: HashMap<String, (Option<u64>, u64, u64)>,
             views: HashMap<String, u64>,
+            views_delay: Duration,
         }
 
         #[derive(Clone, Default)]
@@ -2033,9 +2028,13 @@ mod tests {
             axum::extract::State(stub): axum::extract::State<Stub>,
             axum::extract::Path(id): axum::extract::Path<String>,
         ) -> axum::Json<serde_json::Value> {
-            let mut c = stub.conf();
-            c.views_calls.push(id.clone());
-            let views = c.views.get(&id).copied().unwrap_or(0);
+            let delay = {
+                let mut c = stub.conf();
+                c.views_calls.push(id.clone());
+                c.views_delay
+            };
+            tokio::time::sleep(delay).await;
+            let views = stub.conf().views.get(&id).copied().unwrap_or(0);
             axum::Json(json!({"views": views}))
         }
 
@@ -2117,6 +2116,7 @@ mod tests {
             request_timeout_secs: u64,
             views_lookups_per_minute: u32,
             poll_millis: u64,
+            max_concurrency: usize,
             panic_for: Option<String>,
         }
 
@@ -2127,6 +2127,7 @@ mod tests {
                     request_timeout_secs: 5,
                     views_lookups_per_minute: 100,
                     poll_millis: 20,
+                    max_concurrency: 8,
                     panic_for: None,
                 }
             }
@@ -2155,6 +2156,7 @@ mod tests {
                 la.lease_secs = 120;
                 la.views_lookups_per_minute = opts.views_lookups_per_minute;
                 la.poll_millis = opts.poll_millis;
+                la.max_concurrency = opts.max_concurrency;
                 let stats = StatsClient::new(&settings.live_activity).unwrap();
                 let state = AppState {
                     settings,
@@ -2554,6 +2556,142 @@ mod tests {
                 assert_eq!(w.due_ms(&x.id).await, Some(now * 1000));
                 assert!(w.live(&x.id).await);
             }
+        }
+
+        /// A bulk lookup that outlasts the deadline still ends an activity past
+        /// its outage grace: putting it back for the next tick could outlive the
+        /// hash, and with Funnelcake still slow it would never end.
+        #[tokio::test]
+        async fn slow_stats_still_end_activities_past_their_outage_grace() {
+            let Some(w) = World::new(Opts {
+                tick_deadline_secs: 1,
+                request_timeout_secs: 10,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            w.stub.conf().delay = Duration::from_secs(4);
+            let now = now_secs();
+            let a = w.seed(now - 900, now + 2700, now * 1000, None).await;
+            let over = w.seed(now - 4300, now - 700, now * 1000, None).await;
+
+            let report = w.tick(&w.budget(), now).await;
+
+            assert!(report.deadline_hit);
+            assert_eq!((report.released, report.ended), (1, 1));
+            assert!(w.sent_to(&a).is_empty());
+            assert_eq!(w.due_ms(&a.id).await, Some(now * 1000));
+            let ended = w.sent_to(&over);
+            assert_eq!(ended.len(), 1);
+            assert_eq!(
+                ended[0].event,
+                LiveActivityEvent::End {
+                    dismissal_unix: now - 1
+                }
+            );
+            assert!(!w.live(&over.id).await);
+        }
+
+        /// `/views` fallbacks that hang until the deadline hold up only their
+        /// own activities. The rest of the batch is still sent, the hung lookups
+        /// count as failed, and an activity past its outage grace still ends.
+        #[tokio::test]
+        async fn slow_views_lookups_still_process_the_batch() {
+            let Some(w) = World::new(Opts {
+                tick_deadline_secs: 2,
+                request_timeout_secs: 10,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            w.stub.conf().views_delay = Duration::from_secs(8);
+            let now = now_secs();
+            let fast = w.seed(now - 900, now + 2700, now * 1000, None).await;
+            w.present(&fast, Some(5), 1, 0);
+            // Bulk reports null views for these two, so each needs the fallback.
+            let slow = w.seed(now - 900, now + 2700, now * 1000, None).await;
+            w.present(&slow, None, 1, 0);
+            let over = w.seed(now - 4300, now - 700, now * 1000, None).await;
+            w.present(&over, None, 2, 0);
+
+            let started = std::time::Instant::now();
+            let report = w.tick(&w.budget(), now).await;
+            let took = started.elapsed();
+
+            assert!(took < Duration::from_secs(5), "tick took {took:?}");
+            assert_eq!(
+                (
+                    report.claimed,
+                    report.sent,
+                    report.skipped,
+                    report.ended,
+                    report.released
+                ),
+                (3, 1, 1, 1, 0)
+            );
+            assert_eq!(report.views_lookups, 2);
+            assert_eq!(content(&w.sent_to(&fast)[0]).views, Some(5));
+            assert!(w.sent_to(&slow).is_empty());
+            assert!(in_skip_window(w.due_ms(&slow.id).await, now, w.cadence()));
+            // Its lookup failed, so it ends on its last content, removed at once.
+            let ended = w.sent_to(&over);
+            assert_eq!(ended.len(), 1);
+            assert_eq!(
+                ended[0].event,
+                LiveActivityEvent::End {
+                    dismissal_unix: now - 1
+                }
+            );
+            assert!(!w.live(&over.id).await);
+        }
+
+        /// Past the deadline an activity past its outage grace is still
+        /// processed but starts no `/views` lookup: it reuses the last views sent
+        /// and ends with its summary, filled in by the bulk lookup's counts.
+        #[tokio::test]
+        async fn past_grace_activity_after_the_deadline_ends_without_a_lookup() {
+            let Some(w) = World::new(Opts {
+                tick_deadline_secs: 1,
+                request_timeout_secs: 10,
+                max_concurrency: 1,
+                ..Opts::default()
+            })
+            .await
+            else {
+                return;
+            };
+            w.stub.conf().views_delay = Duration::from_secs(4);
+            let now = now_secs();
+            // Claimed first, its lookup holds the only slot until the deadline.
+            let slow = w.seed(now - 900, now + 2700, (now - 10) * 1000, None).await;
+            w.present(&slow, None, 1, 0);
+            let over = w.seed(now - 4300, now - 700, now * 1000, None).await;
+            w.present(&over, None, 6, 2);
+            let later = w.seed(now - 900, now + 2700, now * 1000, None).await;
+            w.present(&later, Some(3), 0, 0);
+
+            let report = w.tick(&w.budget(), now).await;
+
+            assert_eq!(w.stub.conf().views_calls.len(), 1);
+            let ended = w.sent_to(&over);
+            assert_eq!(ended.len(), 1);
+            assert_eq!(
+                ended[0].event,
+                LiveActivityEvent::End {
+                    dismissal_unix: now + 1800
+                }
+            );
+            let c = content(&ended[0]);
+            assert_eq!(c.phase, Phase::Summary);
+            assert_eq!((c.views, c.likes, c.comments), (None, Some(6), Some(2)));
+            assert!(w.sent_to(&slow).is_empty());
+            assert!(w.sent_to(&later).is_empty());
+            assert_eq!(w.due_ms(&later.id).await, Some(now * 1000));
+            assert_eq!((report.skipped, report.ended, report.released), (1, 1, 1));
         }
 
         #[tokio::test]
