@@ -5,7 +5,7 @@
 //! send it through Firebase, then reschedule or finish the activity.
 //! Nothing here touches device registration (`user_tokens:*`,
 //! `token_to_pubkey`): a dead token finishes the activity only, and only on a
-//! second dead-token answer for the same token.
+//! second dead-token answer in a row for the same token.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -233,6 +233,7 @@ async fn send_update(
             if let Err(e) = store::record_sent(
                 &state.redis_pool,
                 &activity.id,
+                &activity.fcm_token,
                 &content_state.to_string(),
                 now_unix,
             )
@@ -356,10 +357,10 @@ async fn after_send_error(
 }
 
 /// Handles Firebase's dead-token answer for the claim's token. One answer can
-/// race the phone's 3079 with a refreshed token, so only a second answer for the
-/// same token finishes the activity; the first waits a cadence (never past the
-/// outage grace) for the new token. A token already replaced since the claim is
-/// retried at once, for the new token.
+/// race the phone's 3079 with a refreshed token, so only a second answer in a
+/// row for the same token finishes the activity; the first waits a cadence
+/// (never past the outage grace) for the new token. A token already replaced
+/// since the claim is retried at once, for the new token.
 async fn after_dead_token(
     state: &AppState,
     activity: &StoredActivity,
@@ -1551,6 +1552,46 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].fcm_token, refreshed);
         assert!(f.live(&claimed.id).await);
+        assert_eq!(f.hget(&claimed.id, "dead_fcm_hash").await, None);
+        f.done().await;
+    }
+
+    /// Strikes count only when they come in a row: an update Firebase accepted
+    /// for the marked token clears its strike, so the next dead answer for that
+    /// token waits a cadence again instead of ending a card that just delivered.
+    #[tokio::test]
+    async fn a_delivered_update_between_dead_answers_resets_the_strike() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let now = now_secs();
+        let reg = f.registration(now - 900, now + 2700);
+        let activity = f.seed(reg.clone(), now).await;
+        let cadence = Duration::from_secs(f.cadence());
+        let stats = f.stats(Some(5), 2, 1);
+        let dead_then = |at| {
+            f.mock
+                .set_error_for_token(&reg.activity_token, FcmError::TokenNotRegistered);
+            process_one(&f.state, &activity, Ok(&stats), ViewsLookup::NotNeeded, at)
+        };
+
+        assert_eq!(dead_then(now).await, ProcessOutcome::Deferred(cadence));
+
+        f.mock.clear();
+        let outcome = process_one(
+            &f.state,
+            &activity,
+            Ok(&f.stats(Some(6), 2, 1)),
+            ViewsLookup::NotNeeded,
+            now + f.cadence(),
+        )
+        .await;
+        assert_eq!(outcome, ProcessOutcome::Sent);
+        assert_eq!(f.hget(&activity.id, "dead_fcm_hash").await, None);
+
+        let later = now + 2 * f.cadence();
+        assert_eq!(dead_then(later).await, ProcessOutcome::Deferred(cadence));
+        assert!(f.live(&activity.id).await);
         f.done().await;
     }
 
@@ -1718,9 +1759,15 @@ mod tests {
             post_event_id: f.event_id.clone(),
         };
         let last_json = serde_json::to_value(&last).unwrap();
-        store::record_sent(f.pool(), &activity.id, &last_json.to_string(), now - 700)
-            .await
-            .unwrap();
+        store::record_sent(
+            f.pool(),
+            &activity.id,
+            &activity.fcm_token,
+            &last_json.to_string(),
+            now - 700,
+        )
+        .await
+        .unwrap();
         activity.last_content = Some(last_json.clone());
         let failed = StatsError::Request("timeout".into());
 
@@ -3231,7 +3278,7 @@ mod tests {
                 "postCoordinate": a.registration.post_coordinate,
                 "postEventId": a.registration.post_event_ids[0],
             });
-            store::record_sent(w.pool(), &a.id, &last.to_string(), now - 180)
+            store::record_sent(w.pool(), &a.id, &a.fcm_token, &last.to_string(), now - 180)
                 .await
                 .unwrap();
             let b = w.seed(now - 900, now + 2700, now * 1000, None).await;

@@ -108,8 +108,9 @@ Firebase token, and that 3079 can arrive just after the answer, so the first
 answer marks the token and retries one cadence later (never past the point where
 the activity must end). If a 3079 has replaced the token by then, the next send
 uses the new token, and a dead-token answer for it counts as a first answer
-again. A second answer while the marked token is still the stored one finishes
-the activity. A person's end is never delayed by this.
+again. Strikes count only in a row: an update Firebase accepts for the marked
+token clears the mark. A second answer in a row while the marked token is still
+the stored one finishes the activity. A person's end is never delayed by this.
 
 Each replica runs its own worker, so its Funnelcake load is per replica too. A
 tick makes one bulk stats request per 100 post ids. An edited post carries up to

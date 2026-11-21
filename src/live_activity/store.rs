@@ -100,8 +100,8 @@ pub enum DeadTokenOutcome {
     /// the activity rescheduled at the retry due time, still live, so the phone
     /// can register a refreshed token meanwhile.
     FirstStrike,
-    /// The second dead-token answer for the same stored token: the activity was
-    /// finished (tombstoned and unscheduled).
+    /// The second dead-token answer in a row for the same stored token: the
+    /// activity was finished (tombstoned and unscheduled).
     Finished,
     /// A re-registration replaced the failed token since the claim: the activity
     /// is due now, for its new token, and nothing counts against that token.
@@ -209,6 +209,8 @@ if redis.call('EXISTS', key) == 1 then
   if s[5] and s[5] ~= fcm_hash then
     local old = DEVICE_PREFIX .. owner .. ':' .. s[5]
     if redis.call('GET', old) == id then redis.call('DEL', old) end
+    -- A strike belongs to the token it was recorded against.
+    redis.call('HDEL', key, 'dead_fcm_hash')
   end
   redis.call('HSET', key,
     'fcm_token', fcm, 'fcm_hash', fcm_hash,
@@ -349,6 +351,24 @@ if not is_live(ARGV[1]) then return 0 end
 local fields = {}
 for i = 2, #ARGV do fields[#fields + 1] = ARGV[i] end
 redis.call('HSET', PREFIX .. ARGV[1], unpack(fields))
+return 1
+"#
+    ))
+});
+
+static RECORD_SENT: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(&format!(
+        "{PRELUDE}{}",
+        r#"
+local id, sent_hash = ARGV[1], ARGV[2]
+if not is_live(id) then return 0 end
+local key = PREFIX .. id
+redis.call('HSET', key, 'last_content', ARGV[3], 'last_sent_at', ARGV[4])
+-- Firebase accepted the token, so its strikes no longer come in a row. Only
+-- the token that was sent: a slow worker must not clear a newer token's strike.
+if redis.call('HGET', key, 'dead_fcm_hash') == sent_hash then
+  redis.call('HDEL', key, 'dead_fcm_hash')
+end
 return 1
 "#
     ))
@@ -655,22 +675,30 @@ async fn set_if_live(pool: &RedisPool, id: &str, fields: &[(&str, String)]) -> R
     Ok(())
 }
 
-/// Record the content state of a successful send. No-op unless the activity is live.
+/// Record the content state of a successful send to `fcm_token`. No-op unless
+/// the activity is live.
+///
+/// Also clears the dead-token strike when it was recorded against `fcm_token`,
+/// so only dead-token answers that come in a row finish the activity. A strike
+/// against another (newer) token is kept.
 pub async fn record_sent(
     pool: &RedisPool,
     id: &str,
+    fcm_token: &str,
     content_json: &str,
     sent_at: u64,
 ) -> Result<()> {
-    set_if_live(
-        pool,
-        id,
-        &[
-            ("last_content", content_json.to_string()),
-            ("last_sent_at", sent_at.to_string()),
-        ],
-    )
-    .await
+    let mut conn = conn(pool).await?;
+    let _: i64 = RECORD_SENT
+        .key(format!("{ACTIVITY_PREFIX}{id}"))
+        .arg(id)
+        .arg(blake3_hex(fcm_token))
+        .arg(content_json)
+        .arg(sent_at.to_string())
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    Ok(())
 }
 
 /// Store the consecutive-absence count. No-op unless the activity is live.
@@ -707,7 +735,8 @@ pub async fn finish(pool: &RedisPool, id: &str) -> Result<()> {
 /// Apply Firebase's dead-token answer for a send to `fcm_token`, atomically.
 ///
 /// A dead-token answer can race the phone's 3079 carrying its refreshed Firebase
-/// token, so one answer never ends the card:
+/// token, so one answer never ends the card. Strikes count only in a row: a
+/// successful send ([`record_sent`]) or a new token clears the marker.
 /// - the first answer for the stored token marks it (`dead_fcm_hash`) and
 ///   reschedules the activity at `retry_due_ms`, giving the phone time to
 ///   register a new token;

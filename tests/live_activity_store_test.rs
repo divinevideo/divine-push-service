@@ -653,7 +653,9 @@ async fn never_touches_user_tokens() {
     upsert(&pool, &o, &fcm, &b, 102, &ev('1'), 10).await;
     assert_eq!(snapshot(&pool, &o, &fcm).await, before);
     store::claim_due(&pool, 20, 1, 1_000).await.unwrap();
-    store::record_sent(&pool, &id_b, "{}", 5).await.unwrap();
+    store::record_sent(&pool, &id_b, &fcm, "{}", 5)
+        .await
+        .unwrap();
     store::set_absent_checks(&pool, &id_b, 1).await.unwrap();
     store::reschedule(&pool, &id_b, FAR_DUE_MS).await.unwrap();
     assert_eq!(snapshot(&pool, &o, &fcm).await, before);
@@ -773,7 +775,7 @@ async fn record_sent_round_trips_last_content() {
     upsert(&pool, &o, &fcm, &r, 100, &ev('1'), 30_000).await;
 
     let content = serde_json::json!({"phase": "live", "views": 12, "likes": null});
-    store::record_sent(&pool, &id, &content.to_string(), 1_234)
+    store::record_sent(&pool, &id, &fcm, &content.to_string(), 1_234)
         .await
         .unwrap();
     store::set_absent_checks(&pool, &id, 2).await.unwrap();
@@ -787,7 +789,7 @@ async fn record_sent_round_trips_last_content() {
 
     // Writes to a finished or unknown activity never create or alter a hash.
     store::finish(&pool, &id).await.unwrap();
-    store::record_sent(&pool, &id, "{\"x\":1}", 9)
+    store::record_sent(&pool, &id, &fcm, "{\"x\":1}", 9)
         .await
         .unwrap();
     store::set_absent_checks(&pool, &id, 9).await.unwrap();
@@ -795,7 +797,9 @@ async fn record_sent_round_trips_last_content() {
     assert_eq!(h["last_sent_at"], "1234");
     assert_eq!(h["absent_checks"], "2");
     let ghost = hex(64);
-    store::record_sent(&pool, &ghost, "{}", 9).await.unwrap();
+    store::record_sent(&pool, &ghost, &fcm, "{}", 9)
+        .await
+        .unwrap();
     store::set_absent_checks(&pool, &ghost, 1).await.unwrap();
     assert!(hgetall(&pool, &format!("live_activity:{ghost}"))
         .await
@@ -877,7 +881,7 @@ async fn token_rotation_for_same_post_carries_state() {
     let old_id = id_of(&old);
     upsert(&pool, &o, &fcm, &old, 100, &ev('1'), FAR_DUE_MS).await;
     let content = serde_json::json!({"phase": "live", "views": 3});
-    store::record_sent(&pool, &old_id, &content.to_string(), 77)
+    store::record_sent(&pool, &old_id, &fcm, &content.to_string(), 77)
         .await
         .unwrap();
     store::set_absent_checks(&pool, &old_id, 1).await.unwrap();
@@ -1493,4 +1497,121 @@ async fn dead_token_replaced_since_the_claim_is_due_now() {
     );
 
     store::finish(&pool, &id).await.unwrap();
+}
+
+/// A strike belongs to the token it was recorded against. Registering another
+/// token clears it, so switching back to the first token (A, then B, then A)
+/// does not leave an old strike waiting to finish the card on one answer.
+#[tokio::test]
+async fn registering_another_token_clears_the_strike() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let (a, b) = (hex(40), hex(40));
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &a, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &a, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+
+    assert_eq!(
+        upsert(&pool, &o, &b, &r, 101, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Updated
+    );
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert!(!h.contains_key("dead_fcm_hash"), "{h:?}");
+
+    assert_eq!(
+        upsert(&pool, &o, &a, &r, 102, &ev('1'), FAR_DUE_MS).await,
+        UpsertOutcome::Updated
+    );
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &a, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+    assert!(store::is_live(&pool, &id).await.unwrap());
+
+    store::finish(&pool, &id).await.unwrap();
+}
+
+/// Strikes count only when they come in a row: a send that Firebase accepted for
+/// the marked token clears its strike, so dead, sent, dead is a first strike again.
+#[tokio::test]
+async fn a_successful_send_clears_the_strike() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let fcm = hex(40);
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+
+    store::record_sent(&pool, &id, &fcm, "{\"views\":3}", 1_234)
+        .await
+        .unwrap();
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert!(!h.contains_key("dead_fcm_hash"), "{h:?}");
+    assert_eq!(h["last_content"], "{\"views\":3}");
+    assert_eq!(h["last_sent_at"], "1234");
+
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+    assert!(store::is_live(&pool, &id).await.unwrap());
+
+    store::finish(&pool, &id).await.unwrap();
+}
+
+/// A slow worker's send for a token that has since been replaced says nothing
+/// about the new token, so it must not erase a strike recorded against it.
+#[tokio::test]
+async fn a_send_for_a_replaced_token_keeps_the_new_tokens_strike() {
+    let Some(pool) = test_pool().await else {
+        println!("Skipping test: Redis not available");
+        return;
+    };
+    let o = owner();
+    let (old_fcm, new_fcm) = (hex(40), hex(40));
+    let r = reg(&o, "a", &[&ev('a')]);
+    let id = id_of(&r);
+    upsert(&pool, &o, &old_fcm, &r, 100, &ev('1'), FAR_DUE_MS).await;
+    upsert(&pool, &o, &new_fcm, &r, 101, &ev('1'), FAR_DUE_MS).await;
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &new_fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::FirstStrike
+    );
+
+    store::record_sent(&pool, &id, &old_fcm, "{}", 1_234)
+        .await
+        .unwrap();
+    let h = hgetall(&pool, &format!("live_activity:{id}")).await;
+    assert_eq!(h["dead_fcm_hash"], fcm_hash(&new_fcm));
+
+    assert_eq!(
+        store::record_dead_token(&pool, &id, &new_fcm, NOW_MS, RETRY_DUE_MS)
+            .await
+            .unwrap(),
+        DeadTokenOutcome::Finished
+    );
 }

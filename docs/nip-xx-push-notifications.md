@@ -149,10 +149,12 @@ Fields (all `liveActivity` fields are required):
   active activities.
 - The first signer to store an activity for an `activityPushToken` holds that
   token until the activity expires; another signer's `active` for it is refused.
-- When Firebase reports the device's token unregistered, the service keeps the
-  activity for one more update interval before ending it, so a 3079 carrying the
-  refreshed `token` (and the same `activityPushToken`) keeps the card updating.
-  The activity ends on the second such answer for the same token.
+- When Firebase reports the device's token unregistered, the service does not
+  end the activity at once: it retries once more after one update interval, and
+  ends the activity only if that answer is the same dead-token answer for the
+  same token. A 3079 carrying the refreshed `token` (and the same
+  `activityPushToken`) in the meantime keeps the card updating, and a delivered
+  update in between starts the count over.
 - When the feature is off, an `active` registration is ignored; an `ended` one is
   still processed.
 - The service pushes to the activity outside the notification caps, gap, quiet
