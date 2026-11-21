@@ -255,8 +255,10 @@ no `notification` and no `data`, addressed to the activity rather than the app
   `GET /api/videos/{id}/views` for the first id, within the per-replica
   `views_lookups_per_minute` budget; when the budget is spent it reuses the last
   sent views. A rate-limited fallback also reuses them, and no further fallback is
-  made until its `Retry-After` (60 s when absent, at most a cadence) has passed.
-  Any other failed request or fallback skips the cycle.
+  made until its `Retry-After` (60 s when absent, at most a cadence) has passed. A
+  fallback that the tick's deadline cuts short or keeps from starting reuses them
+  too, though one cut short still counts as `failed` in the lookup metric. Any
+  other failed request or fallback skips the cycle.
 - Before the settle point (`max(postedAt, first_seen_at)` + 600 s) a 0 count is sent
   as `null`; from then on a 0 is a confirmed 0. From the settle point, a post none of
   whose ids is found in two consecutive successful checks ends with phase `notFound`.

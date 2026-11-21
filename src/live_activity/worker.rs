@@ -2863,6 +2863,8 @@ mod tests {
 
             let report = w.tick(&w.budget(), now).await;
 
+            // Only the first activity's lookup went out; none starts past the deadline.
+            assert_eq!(report.views_lookups, 1);
             assert_eq!(w.stub.conf().views_calls.len(), 1);
             let ended = w.sent_to(&over);
             assert_eq!(ended.len(), 1);
