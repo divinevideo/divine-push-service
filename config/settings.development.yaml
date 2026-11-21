@@ -117,6 +117,7 @@ live_activity:
   # max_active_per_owner: 5        # Active activities one owner may hold
   # max_active_total: 5000         # Active activities tracked across all owners
   # views_lookups_per_minute: 100  # Budget of /views fallback lookups, PER REPLICA: replicas x
-  #                                #   this, plus each replica's bulk calls (at most one per
+  #                                #   this, plus each replica's bulk requests (one per 100 post
+  #                                #   ids, so up to 10 per tick; at most one tick per
   #                                #   poll_millis unless a tick claims a full batch), must stay
   #                                #   under Funnelcake's rate limits

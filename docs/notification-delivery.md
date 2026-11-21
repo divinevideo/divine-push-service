@@ -101,12 +101,13 @@ They are bounded by other limits instead:
   and never later than the point where the activity must end.
 
 Each replica runs its own worker, so its Funnelcake load is per replica too. A
-tick makes one bulk stats call (one per 100 activities), and the worker waits
-`poll_millis` after any tick that did not claim a full batch, so outside a
-backlog of full batches a replica makes at most about one bulk call per
-`poll_millis`. The `/views` fallback budget, `views_lookups_per_minute`, is **per
-replica**: replicas × that budget, plus every replica's bulk calls, must stay
-under Funnelcake's rate limits.
+tick makes one bulk stats request per 100 post ids. An edited post carries up to
+10 ids, so a full batch of 100 activities can take up to 10 requests, up to
+`max_concurrency` of them at once. The worker waits `poll_millis` after any tick
+that did not claim a full batch, so outside a backlog of full batches a replica
+runs at most one tick's bulk requests per `poll_millis`. The `/views` fallback
+budget, `views_lookups_per_minute`, is **per replica**: replicas × that budget,
+plus every replica's bulk requests, must stay under Funnelcake's rate limits.
 
 A Live Activity 3079 never registers or refreshes a device for notifications, and
 a kind 3080 never ends an activity (ending is a 3079 with `state: "ended"`). The

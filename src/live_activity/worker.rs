@@ -1,7 +1,8 @@
 //! The Live Activity worker. [`run`] loops over [`tick`], which claims due
-//! activities, fetches their stats in one bulk call, and hands each one, after
-//! its `/views` fallback if it needs one, to [`process_one`]: decide what to
-//! show, send it through Firebase, then reschedule or finish the activity.
+//! activities, fetches their stats in bulk (one request per 100 post ids, so up
+//! to 10 for a full batch of edited posts), and hands each one, after its
+//! `/views` fallback if it needs one, to [`process_one`]: decide what to show,
+//! send it through Firebase, then reschedule or finish the activity.
 //! Nothing here touches device registration (`user_tokens:*`,
 //! `token_to_pubkey`): a dead token finishes the activity only.
 
@@ -541,7 +542,8 @@ pub async fn run(state: Arc<AppState>, stats: StatsClient, shutdown: Cancellatio
 ///
 /// A tick that claimed a full batch ([`CLAIM_LIMIT`]) may have left more due
 /// work, so the next tick starts at once. Any other tick is followed by at least
-/// `poll`, so the bulk request rate is bounded by the poll interval rather than
+/// `poll`, so the tick rate, and with it the bulk request rate (one request per
+/// 100 post ids, up to 10 a tick), is bounded by the poll interval rather than
 /// by how fast ticks finish. A rate-limited tick waits out the back-off, and
 /// never less than `poll`.
 fn pause_after(report: &TickReport, poll: Duration) -> Option<Duration> {
@@ -551,10 +553,11 @@ fn pause_after(report: &TickReport, poll: Duration) -> Option<Duration> {
     (report.claimed < CLAIM_LIMIT).then_some(poll)
 }
 
-/// One pass: sample the gauges, claim due activities, look up their stats in one
-/// bulk call, then process each under `catch_unwind`, at most `max_concurrency`
-/// at a time. An activity's `/views` fallback, when it needs one, is made just
-/// before it is processed (see `views_fallback`).
+/// One pass: sample the gauges, claim due activities, look up their stats in
+/// bulk requests of up to 100 post ids, then process each under `catch_unwind`.
+/// Each stage runs at most `max_concurrency` at a time. An activity's `/views`
+/// fallback, when it needs one, is made just before it is processed (see
+/// `views_fallback`).
 ///
 /// The tick stops starting work at `tick_deadline_secs`; activities not started
 /// by then are put back as due at `now`. Work already in flight finishes: a
