@@ -1,6 +1,5 @@
 //! Parsing and validation of the `liveActivity` object in a decrypted kind 3079 payload.
 
-use crate::crypto::TokenPayload;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -95,8 +94,7 @@ fn is_lower_hex(s: &str) -> bool {
 
 /// True when the decrypted JSON carries the `liveActivity` key (even as `null`) or
 /// `notificationsAuthorized`, so routing never lets one fall through to a normal registration.
-pub fn is_live_activity_payload(payload: &TokenPayload, raw_json: &Value) -> bool {
-    let _ = payload;
+pub fn is_live_activity_payload(raw_json: &Value) -> bool {
     raw_json.as_object().is_some_and(|o| {
         o.contains_key("liveActivity") || o.contains_key("notificationsAuthorized")
     })
@@ -407,12 +405,10 @@ mod tests {
         let raw = json!({"token": "fcm", "liveActivity": null});
         let p: TokenPayload = serde_json::from_value(raw.clone()).unwrap();
         assert!(p.live_activity.is_none());
-        assert!(is_live_activity_payload(&p, &raw));
-        let raw = json!({"token": "fcm", "notificationsAuthorized": true});
-        let p: TokenPayload = serde_json::from_value(raw.clone()).unwrap();
-        assert!(is_live_activity_payload(&p, &raw));
-        let raw = json!({"token": "fcm"});
-        let p: TokenPayload = serde_json::from_value(raw.clone()).unwrap();
-        assert!(!is_live_activity_payload(&p, &raw));
+        assert!(is_live_activity_payload(&raw));
+        assert!(is_live_activity_payload(
+            &json!({"token": "fcm", "notificationsAuthorized": true})
+        ));
+        assert!(!is_live_activity_payload(&json!({"token": "fcm"})));
     }
 }

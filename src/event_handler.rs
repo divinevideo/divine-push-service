@@ -316,7 +316,7 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
     // A Live Activity registration never registers the device, whatever the
     // feature flag or `notificationsAuthorized` say: a phone that declined
     // notifications must not land in `user_tokens:*`.
-    if live_activity::payload::is_live_activity_payload(&token_payload, &raw_payload) {
+    if live_activity::payload::is_live_activity_payload(&raw_payload) {
         return live_activity::registration::handle(state, event, fcm_token, &raw_payload).await;
     }
 
