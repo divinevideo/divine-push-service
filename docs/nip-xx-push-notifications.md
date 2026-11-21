@@ -88,6 +88,73 @@ stays in the push service and is removed with the device registration.
   `timezone` (IANA name) or `timezoneOffsetMinutes`. Such a token stays registered and
   receives nothing until the client registers again with timezone data.
 
+#### Live Activity registration (iOS, optional)
+
+An iOS app MAY also send a 3079 that starts, refreshes or ends an iOS Live
+Activity for a post the person just published. The encrypted payload carries a
+top-level `notificationsAuthorized` boolean and a `liveActivity` object beside
+`token`:
+
+```json
+{
+  "token": "<fcm-token>",
+  "notificationsAuthorized": false,
+  "liveActivity": {
+    "activityPushToken": "<lowercase hex ActivityKit push token>",
+    "postCoordinate": "34236:<author-pubkey-hex>:<d-tag>",
+    "postEventIds": ["<64 hex event id>"],
+    "postedAt": 1800000000,
+    "windowEndsAt": 1800003600,
+    "showFirstRunNote": false,
+    "state": "active"
+  }
+}
+```
+
+Fields (all `liveActivity` fields are required):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `activityPushToken` | string | APNs Live Activity push token, 32 to 512 lowercase hex characters |
+| `postCoordinate` | string | `<kind>:<author pubkey hex>:<d-tag>` of the post; kind is decimal digits, the pubkey is 64 lowercase hex, the `d` tag is non-empty |
+| `postEventIds` | string array | 1 to 10 event ids (64 lowercase hex each); an edited post carries several |
+| `postedAt` | integer | Unix seconds the post was published |
+| `windowEndsAt` | integer | Unix seconds the updates stop |
+| `showFirstRunNote` | boolean | Echoed back in every content state |
+| `state` | string | `"active"` or `"ended"` |
+| `notificationsAuthorized` (top level) | boolean | Whether the phone allows notifications |
+
+**Rules:**
+- A payload that carries either `liveActivity` (even as `null`) or
+  `notificationsAuthorized` is a Live Activity registration. It never registers
+  or refreshes the device for notifications, so a phone that declined
+  notifications is never stored as a notification token.
+- The author in `postCoordinate` MUST equal the event signer. An invalid object
+  is dropped without a response.
+- A Live Activity registration whose `created_at` is outside the service's
+  accepted time window (more than 300 seconds in the future, or older than the
+  seven-day replay horizon) is dropped without a response, counted as
+  `out_of_window`.
+- `windowEndsAt` MUST be after `postedAt` by at most 3600 seconds, and no more
+  than an hour plus 300 seconds of allowed clock skew after the service's
+  current time (the app computes it from the phone's clock).
+- Ending is a 3079 with `state: "ended"`, matched by `activityPushToken` and the
+  signer's pubkey. It is never a 3080: a kind 3080 deregistration does not end
+  an activity. An `ended` registration for an activity the service has never
+  seen is remembered until `windowEndsAt` + 1800 seconds, so a later or replayed
+  `active` for it never starts. Among events with the same `created_at`, an `ended`
+  wins over an `active`.
+- One active activity per signer and Firebase token: a newer one supersedes the
+  previous one, which stops being updated. A signer holds a bounded number of
+  active activities.
+- The first signer to store an activity for an `activityPushToken` holds that
+  token until the activity expires; another signer's `active` for it is refused.
+- When the feature is off, an `active` registration is ignored; an `ended` one is
+  still processed.
+- The service pushes to the activity outside the notification caps, gap, quiet
+  hours, presence checks and kind 3083 preferences; see
+  [notification-delivery.md](notification-delivery.md#live-activity-updates).
+
 ### Deregistration (kind 3080)
 
 Uses the same encrypted token payload and required `p` and `app` tags as 3079.
@@ -261,6 +328,40 @@ const event = {
   )
 };
 await relay.publish(await signEvent(event, myPriv));
+```
+
+### Start and end a Live Activity (JS sketch)
+
+```javascript
+const now = Math.floor(Date.now() / 1000);
+const liveActivity = {
+  activityPushToken: activityTokenHex,        // lowercase hex from ActivityKit
+  postCoordinate: `34236:${myPub}:${dTag}`,   // the author must be the signer
+  postEventIds: [postEventId],
+  postedAt: now,
+  windowEndsAt: now + 3600,                    // at most one hour after postedAt
+  showFirstRunNote: false,
+  state: "active"
+};
+
+const event = {
+  kind: 3079,
+  pubkey: myPub,
+  created_at: now,
+  tags: [
+    ["p", pushServicePubkey],
+    ["app", "my-nostr-app"]
+  ],
+  content: await nip44.encrypt(
+    pushServicePubkey,
+    myPriv,
+    JSON.stringify({ token: fcmToken, notificationsAuthorized: true, liveActivity })
+  )
+};
+await relay.publish(await signEvent(event, myPriv));
+
+// To end it, publish another 3079 with the same activityPushToken and
+// state: "ended". A 3080 does not end a Live Activity.
 ```
 
 ### Update preferences

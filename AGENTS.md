@@ -212,6 +212,11 @@ results influence work.
 - `notification_activity_sessions:{pubkey}` - Expiring admission index capped at 128 retained sessions; excess new sessions get HTTP 429 without resetting visit state
 - `notification_work_generation:{pubkey}:{hash}` - Visit generation a notification was first attempted under, so a retry cannot adopt a later visit
 - `campaign_delivery:{idempotencyKey}` - Campaign delivery claim with TTL
+- `live_activity:{blake3(owner:activityToken)}` - One iOS Live Activity (hash), scoped by owner so one signer can never block or hijack another's activity: owner, FCM and activity tokens, post coordinate and ids, window, order stamp (`last_at` 20-digit `created_at`, `last_id`; the lower id wins a tie among updates, an `ended` wins a same-second tie against an `active`), `state`, `absent_checks`, `last_content`, `last_sent_at`, `first_seen_at`. Expires at the first registration's `windowEndsAt` + 2100 s: updates and token rotations keep the first `postedAt`/`windowEndsAt`, so the hash and token binding can never be renewed. Ending, finishing or superseding leaves a tombstone (`state = ended`, both tokens dropped) until `windowEndsAt` + 1800 s, so a replayed `active` never restarts it. Never touches `user_tokens:*` or `token_to_pubkey`
+- `live_activity_owner:{owner}` - Set of an owner's live activity ids, for `max_active_per_owner`; expired or ended members are pruned when the cap is checked
+- `live_activity_device:{owner}:{blake3(fcmToken)}` - The device's current activity id: one active activity per owner and device, a newer one supersedes it
+- `live_activity_jobs` - Sorted set of active activity ids scored by due time (Unix ms); a claim leases by rescoring to now + lease. `ZCARD` is the active count and the `max_active_total` cap
+- `live_activity_token_owner:{blake3(activityToken)}` - Owner pubkey an activity token is bound to: set by the first owner to store an activity for it and refreshed with that activity's hash (expires at `windowEndsAt` + 2100 s, outliving a tombstone). Any other owner's `active` for the token is refused (`token_owned_elsewhere`), so someone who learns a token cannot attach their counts to another person's card
 
 ### Notification Types
 | Type | Trigger Kind | Description |
@@ -223,6 +228,7 @@ results influence work.
 | NewPost | 34236 | A belled creator published a video (recipients from `notify_watchers`, not `p` tags) |
 | Campaign | n/a | Approved campaign notifications collected from the campaign tool. Not triggered by a Nostr event; off by default. |
 | activityDigest | 7, 16 | One push summarizing buffered likes and reposts across posts (default) |
+| Live Activity update | 3079 (`liveActivity`) | Not a notification and not a delivery class. An iOS Live Activity for a just-published post is registered by a 3079 carrying `liveActivity` (ended by a 3079 with `state: "ended"`, never a 3080), updated through Firebase every 180 s until its window ends. Outside the caps, gap, quiet hours, app-active refusal and kind 3083 preferences; off by default (`live_activity.enabled`). See `docs/notification-delivery.md` |
 
 Preference category `1` controls Comment and Mention delivery for these supported trigger kinds. The service does not subscribe to kind-1 text notes. Like and Repost are coalesced into account digests by default (see `docs/plans/like-repost-coalescing.md`); Comment, Mention, and NewPost are not, because collapsing them can lose a notification with no durable inbox row. Nonurgent pushes share the visit-based interruption policy in `docs/notification-delivery.md`, with a rolling two-per-day allowance before activity reporting. Direct messages bypass that allowance and the six-hour gap, while retaining shared hourly/daily caps, presence, quiet hours, preferences, and visit fencing.
 

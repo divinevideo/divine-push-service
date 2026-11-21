@@ -72,8 +72,10 @@ pub async fn social_tokens(
 }
 
 /// Atomically reserve one recipient-wide delivery slot across replicas and all
-/// categories. Retries with the same identity consume no additional slot. Failed
-/// or ambiguous provider attempts conservatively retain their reservation.
+/// notification categories (Live Activity updates are deliberately outside it;
+/// see `src/live_activity/`). Retries with the same identity consume no
+/// additional slot. Failed or ambiguous provider attempts conservatively retain
+/// their reservation.
 pub async fn reserve_budget(
     pool: &RedisPool,
     recipient: &PublicKey,

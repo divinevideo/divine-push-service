@@ -27,7 +27,7 @@ pub enum CryptoError {
     InvalidToken(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenPayload {
     #[serde(rename = "timezone", default)]
     pub timezone: Option<String>,
@@ -55,6 +55,34 @@ pub struct TokenPayload {
         deserialize_with = "optional_device_string"
     )]
     pub app_version: Option<String>,
+    /// Whether the device allows notifications (sent with Live Activity registrations).
+    #[serde(rename = "notificationsAuthorized", default)]
+    pub notifications_authorized: Option<bool>,
+    /// Raw Live Activity object, validated in `live_activity::payload` so a present but
+    /// invalid object stays distinguishable from an absent one.
+    #[serde(rename = "liveActivity", default)]
+    pub live_activity: Option<serde_json::Value>,
+}
+
+/// Hand-written so the FCM token and the raw Live Activity object (which holds the activity
+/// push token) never reach logs through `{:?}`.
+impl std::fmt::Debug for TokenPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenPayload")
+            .field("timezone", &self.timezone)
+            .field("token", &"<redacted>")
+            .field("timezone_offset_minutes", &self.timezone_offset_minutes)
+            .field("campaign_target_types", &self.campaign_target_types)
+            .field("platform", &self.platform)
+            .field("install_channel", &self.install_channel)
+            .field("app_version", &self.app_version)
+            .field("notifications_authorized", &self.notifications_authorized)
+            .field(
+                "live_activity",
+                &self.live_activity.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 // Invalid optional metadata must clear stale eligibility without dropping the token.
@@ -204,19 +232,29 @@ impl CryptoService {
         encrypted_content: &str,
         sender_pubkey: &PublicKey,
     ) -> Result<TokenPayload, CryptoError> {
+        self.decrypt_token_payload_json(encrypted_content, sender_pubkey)
+            .map(|(payload, _)| payload)
+    }
+
+    /// Like [`Self::decrypt_token_payload`], also returning the decrypted JSON as a
+    /// `Value`, so a caller can tell a key that is present (even as `null`) from an
+    /// absent one. The plaintext is parsed twice so `TokenPayload` validation is
+    /// unchanged.
+    pub fn decrypt_token_payload_json(
+        &self,
+        encrypted_content: &str,
+        sender_pubkey: &PublicKey,
+    ) -> Result<(TokenPayload, serde_json::Value), CryptoError> {
         let decrypted = self.decrypt_nip44(encrypted_content, sender_pubkey)?;
-
-        // Parse JSON payload
         let payload: TokenPayload = serde_json::from_str(&decrypted)?;
-
         // Validate token is not empty
         if payload.token.is_empty() {
             return Err(CryptoError::InvalidToken(
                 "Token cannot be empty".to_string(),
             ));
         }
-
-        Ok(payload)
+        let raw: serde_json::Value = serde_json::from_str(&decrypted)?;
+        Ok((payload, raw))
     }
 
     /// Decrypt and parse filter upsert payload from NIP-44 encrypted content
@@ -284,6 +322,22 @@ impl CryptoService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_tokens() {
+        let fcm = "fcmtokenfcmtokenfcmtokenfcmtoken1234567890";
+        let act = "ab".repeat(32);
+        let p: TokenPayload = serde_json::from_value(serde_json::json!({
+            "token": fcm,
+            "notificationsAuthorized": true,
+            "liveActivity": {"activityPushToken": act, "state": "active"}
+        }))
+        .unwrap();
+        let text = format!("{p:?}");
+        assert!(!text.contains(fcm), "{text}");
+        assert!(!text.contains(&act), "{text}");
+        assert!(text.contains("notifications_authorized"), "{text}");
+    }
 
     #[test]
     fn test_is_nip44_encrypted() {

@@ -198,6 +198,94 @@ Headers: `apns-push-type: alert`, `apns-priority: 10`.
 
 A *silent/background* push — a data message with neither `title` nor `body` — instead uses `aps.content-available: 1`, push-type `background`, priority 5. The current notification types always carry `title`/`body`, so this background shape is not emitted today.
 
+### iOS Live Activity shape
+
+Live Activity updates are not notifications. They go to Firebase as a message with
+no `notification` and no `data`, addressed to the activity rather than the app
+(`live_activity_body` in `src/fcm_sender.rs`):
+
+```json
+{
+  "token": "<fcm-token>",
+  "apns": {
+    "live_activity_token": "<activityPushToken>",
+    "headers": {
+      "apns-priority": "5",
+      "apns-expiration": "<stale-date>"
+    },
+    "payload": {
+      "aps": {
+        "timestamp": 1800000180,
+        "event": "update",
+        "content-state": {
+          "phase": "live",
+          "views": 12,
+          "likes": 3,
+          "comments": null,
+          "updatedAt": 1800000180,
+          "showFirstRunNote": false,
+          "postCoordinate": "34236:<author-pubkey-hex>:<d-tag>",
+          "postEventId": "<64 hex event id>"
+        },
+        "stale-date": 1800000780
+      }
+    }
+  }
+}
+```
+
+- `event` is `update` (`apns-priority` `5`) or `end` (`apns-priority` `10`). An `end`
+  also carries `aps.dismissal-date`. A summary or "can't find" end uses the send
+  time + 1800 s; an end sent after stats stayed unreachable past the window uses a
+  time just before the send, so the frozen numbers leave the Lock Screen at once.
+- `stale-date` is the send time + 600 s, and an update's `apns-expiration` carries
+  the same value as a string, so APNs drops a late update rather than delivering it
+  stale. An `end` has no `apns-expiration`: the activity is finished once Firebase
+  accepts it, so APNs must keep it until a phone that was offline reconnects.
+- `content-state` keys are a contract with the app: `phase` (`posting`, `live`,
+  `notFound` or `summary`), `views`, `likes`, `comments` (integer or `null` when
+  unknown), `updatedAt`, `showFirstRunNote`, `postCoordinate`, and `postEventId`
+  (the first of the registered `postEventIds`). `updatedAt` is Unix seconds as an
+  integer, and the widget decodes it that way. Every content state echoes
+  `postCoordinate`, `postEventId` and `showFirstRunNote`.
+- Counts come from `POST /api/videos/stats/bulk` on `live_activity.funnelcake_base_url`
+  (`views` to `views`, `reactions` to `likes`, `comments` to `comments`), taking each
+  counter's maximum across an edited post's ids. When at least one of the post's ids
+  is present and every present id reports `views: null`, the worker falls back to
+  `GET /api/videos/{id}/views` for the first id, within the per-replica
+  `views_lookups_per_minute` budget; when the budget is spent it reuses the last
+  sent views. A rate-limited fallback also reuses them, and no further fallback is
+  made until its `Retry-After` (60 s when absent, at most a cadence) has passed. A
+  fallback that the tick's deadline cuts short or keeps from starting reuses them
+  too, though one cut short still counts as `failed` in the lookup metric. Any
+  other failed request or fallback skips the cycle.
+- Before the settle point (`max(postedAt, first_seen_at)` + 600 s) a 0 count is sent
+  as `null`; from then on a 0 is a confirmed 0. From the settle point, a post none of
+  whose ids is found in two consecutive successful checks ends with phase `notFound`.
+  A miss counts once the update showing it has been sent, so the two checks are at
+  least a cadence apart even when a send fails and is retried sooner.
+  At `windowEndsAt` the activity ends with phase `summary`. If stats stay unreachable
+  until `windowEndsAt` + 600 s, it ends on the last content sent.
+- The worker never prunes `user_tokens:*` or `token_to_pubkey`, even when Firebase
+  reports the token unregistered; it only finishes the activity. Logs carry full
+  event ids and pubkeys and an 8-character `token_prefix` for FCM and activity
+  tokens, never a whole token.
+
+### Live Activity metrics
+
+All use the shared `push_` prefix and are separate from the `fcm_send_*` metrics.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `push_live_activity_registrations_total` | `outcome`: `created`, `updated`, `superseded`, `stale`, `tombstoned`, `over_owner_cap`, `over_total_cap`, `token_owned_elsewhere`, `ended`, `tombstoned_unseen`, `disabled`, `expired`, `invalid`, `out_of_window` | Handling of each Live Activity 3079 |
+| `push_live_activity_sends_total` | `event` (`update`, `end`), `result` (`ok`, or the Firebase failure reason such as `token_not_registered`, `retryable_internal`) | Firebase sends |
+| `push_live_activity_stats_failures_total` | `reason`: `request`, `status`, `rate_limited`, `decode` | Failed Funnelcake stats or views requests |
+| `push_live_activity_skipped_total` | `reason`: `stats_failed`, `views_failed`, `store_failed`, `tick_failed`, `tick_panicked`, `panicked` | Cycles that sent nothing |
+| `push_live_activity_views_lookups_total` | `result`: `ok`, `failed`, `budget_spent` | `/views` fallback lookups |
+| `push_live_activity_active` | none (gauge) | Active activities, read from `ZCARD live_activity_jobs`, so identical on every replica |
+| `push_live_activity_oldest_due_age_seconds` | none (gauge) | Age of the oldest overdue activity (compare `push_coalesce_oldest_due_age_seconds`). Written by the worker, so it freezes rather than rises when the worker stalls |
+| `push_live_activity_last_tick_unix` | none (gauge) | Unix seconds of this replica's last finished worker pass, whatever its outcome. The stall signal: alert when it stops advancing while `live_activity.enabled` is on |
+
 ### Avoiding duplicate banners
 
 `content-available: 1` is intentionally **absent** from alert pushes. It is iOS's background-update flag: it wakes the app's background isolate, which would build a **second, local** banner on top of the OS-presented `aps.alert` — the duplicate-banner bug ([divine-push-service#20](https://github.com/divinevideo/divine-push-service/issues/20)). An `aps.alert` push is delivered reliably to **terminated** iOS apps *without* `content-available` (that flag matters only for *silent* pushes, which iOS throttles when the app is terminated), so omitting it costs no delivery reliability.
@@ -548,3 +636,8 @@ The canonical registration and removal rules live in the push specification's
 | `coalesce:emitted:{owner}` | Sorted Set | Per-recipient rolling emission window: one member per emitted like/repost notification scored by send time, pruned to `recipient_daily_window_secs` and counted against `recipient_daily_cap` before the bucket is spent |
 | `delivery_budget:{pubkey}`, `delivery_generations:{pubkey}`, `notification_activity:{pubkey}`, `notification_active:{pubkey}`, `notification_activity_session:{pubkey}:{session}`, `notification_work_generation:{pubkey}:{hash}` | Mixed | Shared interruption policy and visit state; see [notification-delivery.md](notification-delivery.md) |
 | `campaign_delivery:{idempotencyKey}` | String | Campaign delivery claim. Taken for the in-flight window (`CLAIM_TTL_SECS`, 600s) while a send is running, extended to `campaign_delivery.dedup_ttl_secs` (7 days by default) once FCM accepts a push, and dropped on the outcomes that send nothing. The key being present does not by itself mean the push was delivered; a TTL beyond the in-flight window does |
+| `live_activity:{blake3(owner:activityToken)}` | Hash | One iOS Live Activity, scoped by owner so one signer can never block or hijack another's activity: owner, FCM and activity tokens, post coordinate and ids, window, order stamp (`last_at` 20-digit `created_at`, `last_id`; among updates the lower id wins a same-second tie, but an `ended` wins a same-second tie against an `active`), `state`, `absent_checks`, `last_content`, `last_sent_at`, `first_seen_at`. Expires at the first registration's `windowEndsAt` + 2100 s: updates and token rotations keep the first `postedAt`/`windowEndsAt`, so the hash and token binding can never be renewed. Ending, finishing or superseding leaves a tombstone (`state = ended`, both tokens dropped) until `windowEndsAt` + 1800 s, so a replayed `active` never restarts it. Kept apart from device registration: never touches `user_tokens:*` or `token_to_pubkey` |
+| `live_activity_owner:{owner}` | Set | An owner's live activity ids, for `max_active_per_owner`. TTL extended with each member; expired or ended members are pruned when the cap is checked |
+| `live_activity_device:{owner}:{blake3(fcmToken)}` | String | The device's current activity id. One active activity per owner and device; a newer one supersedes it, carrying its schedule and send state when it is the same post (an Apple token rotation) |
+| `live_activity_jobs` | Sorted Set | Active activity ids scored by due time (Unix ms). A claim leases by rescoring to now + lease and drops members whose hash is gone or tombstoned. `ZCARD` is the active gauge and the `max_active_total` cap |
+| `live_activity_token_owner:{blake3(activityToken)}` | String | Owner pubkey an activity token is bound to. Set by the first owner to store an activity for the token and refreshed with that activity's hash, expiring at `windowEndsAt` + 2100 s so it outlives a tombstone. Another owner's `active` for the token is refused and counted as `token_owned_elsewhere`; ends need no binding because they only ever touch the signer's own records |
