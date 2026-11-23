@@ -17,7 +17,7 @@ and device tokens:
 - No push while any of the account's devices is in the foreground. Presence
   lapses 180 seconds after a session's last foreground report, so a crashed
   app cannot suppress pushes indefinitely.
-- All categories, including DMs, share the older rolling bounds of five per hour
+- All notification categories, including DMs, share the older rolling bounds of five per hour
   and twenty per day. DM preferences, timezone/quiet-hour checks, replay
   deduplication, visit fencing, and final provider preflight still apply.
 
@@ -79,6 +79,53 @@ thumbnails in the same disk cache used by the app. Foreground receipt warms targ
 metadata through the existing video repository, profiles through the profile
 repository, and thumbnails. Both paths are bounded, tolerate failure, skip private
 messages and campaigns, and do not delay navigation or fetch video files.
+
+## Live Activity updates
+
+iOS Live Activity updates for a just-published post are deliberately **not** a
+delivery class. They are not notifications: they update a card on the Lock Screen
+that the person started by publishing, and they use their own worker and store
+(`src/live_activity/`) outside everything above. The hourly and daily caps, the
+six-hour gap, the visit allowance, the app-active refusal, quiet hours, the
+timezone requirement and kind 3083 preferences do not apply, and a Live Activity
+send neither spends nor advances any of that budget.
+
+They are bounded by other limits instead:
+
+- the registered window (`windowEndsAt`, at most one hour after `postedAt`), after
+  which the activity ends;
+- the update cadence, `live_activity.cadence_secs` (180 s by default), per activity;
+- the per-owner ceiling (`max_active_per_owner`, 5) and the service-wide ceiling
+  (`max_active_total`, 5000) on active activities, past which a new one is refused;
+- retries after a failed send, which wait at least 30 s and at most one cadence,
+  and never later than the point where the activity must end. The exception is a
+  dead-token answer for a token a re-registration has since replaced: that is
+  retried at once, for the new token.
+
+A dead-token answer from Firebase ends the activity only when it is the second
+one for the same token. The phone may be about to send a 3079 with a refreshed
+Firebase token, and that 3079 can arrive just after the answer, so the first
+answer marks the token and retries one cadence later (never past the point where
+the activity must end). If a 3079 has replaced the token by then, the next send
+uses the new token, and a dead-token answer for it counts as a first answer
+again. Strikes count only in a row: an update Firebase accepts for the marked
+token clears the mark. A second answer in a row while the marked token is still
+the stored one finishes the activity. A person's end is never delayed by this.
+
+Each replica runs its own worker, so its Funnelcake load is per replica too. A
+tick makes one bulk stats request per 100 post ids. An edited post carries up to
+10 ids, so a full batch of 100 activities can take up to 10 requests, up to
+`max_concurrency` of them at once. The worker waits `poll_millis` after any tick
+that did not claim a full batch, so outside a backlog of full batches a replica
+runs at most one tick's bulk requests per `poll_millis`. The `/views` fallback
+budget, `views_lookups_per_minute`, is **per replica**: replicas × that budget,
+plus every replica's bulk requests, must stay under Funnelcake's rate limits.
+
+A Live Activity 3079 never registers or refreshes a device for notifications, and
+a kind 3080 never ends an activity (ending is a 3079 with `state: "ended"`). The
+feature is off by default (`live_activity.enabled`). The registration shape is in
+[nip-xx-push-notifications.md](nip-xx-push-notifications.md), the Firebase message
+and metrics in the [developer guide](developer-guide.md#ios-live-activity-shape).
 
 ## Rollout and validation
 

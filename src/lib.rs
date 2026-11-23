@@ -11,6 +11,7 @@ pub mod error;
 pub mod event_handler;
 pub mod fcm_sender;
 pub mod health;
+pub mod live_activity;
 pub mod metrics;
 pub mod models;
 pub mod nostr_listener;

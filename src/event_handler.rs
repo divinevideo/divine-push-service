@@ -10,7 +10,7 @@ use crate::{
     coalesce,
     crypto::CryptoService,
     error::Result,
-    fcm_sender,
+    fcm_sender, live_activity,
     models::FcmPayload,
     preferences::{self, NotificationType, UserPreferences},
     redis_store,
@@ -292,16 +292,17 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
     };
 
     // Decrypt the NIP-44 content
-    let token_payload = match crypto_service.decrypt_token_payload(&event.content, &event.pubkey) {
-        Ok(payload) => payload,
-        Err(e) => {
-            error!(
-                event_id = %event.id, pubkey = %event.pubkey, error = %e,
-                "Failed to decrypt registration token"
-            );
-            return Ok(()); // Don't fail the whole handler for decryption errors
-        }
-    };
+    let (token_payload, route) =
+        match crypto_service.decrypt_registration_payload(&event.content, &event.pubkey) {
+            Ok(decrypted) => decrypted,
+            Err(e) => {
+                error!(
+                    event_id = %event.id, pubkey = %event.pubkey, error = %e,
+                    "Failed to decrypt registration token"
+                );
+                return Ok(()); // Don't fail the whole handler for decryption errors
+            }
+        };
 
     let fcm_token = token_payload.token.trim();
     if fcm_token.is_empty() {
@@ -310,6 +311,19 @@ async fn handle_registration(state: &AppState, event: &Event) -> Result<()> {
             "Received registration event with empty token after decryption"
         );
         return Ok(());
+    }
+
+    // A Live Activity registration never registers the device, whatever the
+    // feature flag or `notificationsAuthorized` say: a phone that declined
+    // notifications must not land in `user_tokens:*`.
+    if route.is_live_activity() {
+        return live_activity::registration::handle(
+            state,
+            event,
+            fcm_token,
+            route.activity.as_ref(),
+        )
+        .await;
     }
 
     // An invalid optional timezone must not drop the registration. Legacy
@@ -2657,6 +2671,7 @@ mod tests {
     use super::*;
     use crate::fcm_sender::{FcmClient, FcmError, MockFcmSender};
     use nostr_sdk::prelude::{Keys, SecretKey};
+    use std::collections::HashMap;
     use std::sync::OnceLock;
 
     fn fanout_test_lock() -> &'static tokio::sync::Mutex<()> {
@@ -3731,6 +3746,545 @@ mod tests {
         redis_store::remove_token(&pool, &user.public_key(), &token)
             .await
             .unwrap();
+    }
+
+    /// A Live Activity test world: its own signer, service key and FCM token.
+    struct LaFixture {
+        pool: redis_store::RedisPool,
+        state: AppState,
+        user: Keys,
+        service: Keys,
+        fcm: String,
+    }
+
+    impl LaFixture {
+        async fn new(enabled: bool) -> Self {
+            let pool = test_redis_pool().await.expect("Redis required");
+            let user = Keys::generate();
+            let service = Keys::generate();
+            let mut settings = crate::config::Settings::new().unwrap();
+            settings.live_activity.enabled = enabled;
+            let mut state = test_app_state(
+                settings,
+                pool.clone(),
+                FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+            );
+            state.crypto_service = Some(CryptoService::new(service.clone()));
+            let fcm = format!("synthetic-la-fcm-{}", user.public_key().to_hex());
+            Self {
+                pool,
+                state,
+                user,
+                service,
+                fcm,
+            }
+        }
+
+        fn owner(&self) -> String {
+            self.user.public_key().to_hex()
+        }
+
+        /// A signed, NIP-44-encrypted 3079 created at `at`.
+        fn event(&self, payload: serde_json::Value, at: u64) -> Event {
+            let encrypted = nostr_sdk::nips::nip44::encrypt(
+                self.user.secret_key(),
+                &self.service.public_key(),
+                payload.to_string(),
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+                .custom_created_at(Timestamp::from(at))
+                .tag(Tag::public_key(self.service.public_key()))
+                .sign_with_keys(&self.user)
+                .unwrap()
+        }
+
+        /// A 3079 carrying a valid `liveActivity` for this signer's post.
+        fn la_event(&self, activity_token: &str, la_state: &str, at: u64) -> Event {
+            let now = Timestamp::now().as_secs();
+            self.event(
+                serde_json::json!({
+                    "token": self.fcm,
+                    "notificationsAuthorized": true,
+                    "liveActivity": la_object(&self.owner(), activity_token, la_state, now),
+                }),
+                at,
+            )
+        }
+
+        async fn activity(&self, activity_token: &str) -> HashMap<String, String> {
+            la_hash(&self.pool, &self.owner(), activity_token).await
+        }
+
+        async fn assert_device_not_registered(&self) {
+            assert!(
+                redis_store::get_tokens_for_pubkey(&self.pool, &self.user.public_key())
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a Live Activity registration must never reach user_tokens"
+            );
+            let mut conn = self.pool.get().await.unwrap();
+            let owner: Option<String> = redis::cmd("HGET")
+                .arg("token_to_pubkey")
+                .arg(&self.fcm)
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(owner, None, "token_to_pubkey must stay untouched");
+            let order: bool = redis::cmd("EXISTS")
+                .arg(order_key(&self.fcm))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert!(!order, "no device registration order stamp may be written");
+        }
+    }
+
+    fn random_hex64() -> String {
+        Keys::generate().public_key().to_hex()
+    }
+
+    fn la_object(
+        owner_hex: &str,
+        activity_token: &str,
+        la_state: &str,
+        now: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "activityPushToken": activity_token,
+            "postCoordinate": format!("34236:{owner_hex}:post-{}", &activity_token[..8]),
+            "postEventIds": [random_hex64()],
+            "postedAt": now - 60,
+            "windowEndsAt": now - 60 + 3600,
+            "showFirstRunNote": false,
+            "state": la_state,
+        })
+    }
+
+    async fn la_hash(
+        pool: &redis_store::RedisPool,
+        owner: &str,
+        activity_token: &str,
+    ) -> HashMap<String, String> {
+        let id = crate::live_activity::store::activity_id(owner, activity_token);
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("HGETALL")
+            .arg(format!("live_activity:{id}"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    async fn la_job_score(pool: &redis_store::RedisPool, owner: &str, token: &str) -> Option<u64> {
+        let id = crate::live_activity::store::activity_id(owner, token);
+        let mut conn = pool.get().await.unwrap();
+        redis::cmd("ZSCORE")
+            .arg("live_activity_jobs")
+            .arg(id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    #[tokio::test]
+    async fn live_activity_payload_never_registers_token_when_disabled() {
+        for authorized in [false, true] {
+            let f = LaFixture::new(false).await;
+            let token = random_hex64();
+            let now = Timestamp::now().as_secs();
+            let event = f.event(
+                serde_json::json!({
+                    "token": f.fcm,
+                    "notificationsAuthorized": authorized,
+                    "liveActivity": la_object(&f.owner(), &token, "active", now),
+                }),
+                now,
+            );
+            handle_registration(&f.state, &event).await.unwrap();
+            f.assert_device_not_registered().await;
+            assert!(
+                f.activity(&token).await.is_empty(),
+                "flag off stores no active activity (authorized={authorized})"
+            );
+            assert_eq!(la_job_score(&f.pool, &f.owner(), &token).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_activity_payload_never_registers_token_when_enabled() {
+        for authorized in [false, true] {
+            let f = LaFixture::new(true).await;
+            let token = random_hex64();
+            let now = Timestamp::now().as_secs();
+            let event = f.event(
+                serde_json::json!({
+                    "token": f.fcm,
+                    "notificationsAuthorized": authorized,
+                    "liveActivity": la_object(&f.owner(), &token, "active", now),
+                }),
+                now,
+            );
+            handle_registration(&f.state, &event).await.unwrap();
+            f.assert_device_not_registered().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn active_registration_stores_and_schedules() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let cadence_ms = f.state.settings.live_activity.cadence_secs * 1000;
+        let before = now_ms();
+        handle_registration(&f.state, &f.la_event(&token, "active", now))
+            .await
+            .unwrap();
+        let after = now_ms();
+
+        let stored = f.activity(&token).await;
+        assert_eq!(stored.get("state").map(String::as_str), Some("active"));
+        assert_eq!(stored.get("owner"), Some(&f.owner()));
+        assert_eq!(stored.get("fcm_token"), Some(&f.fcm));
+        assert_eq!(stored.get("activity_token"), Some(&token));
+        let due = la_job_score(&f.pool, &f.owner(), &token)
+            .await
+            .expect("an active activity is scheduled");
+        assert!(
+            (before + cadence_ms..=after + cadence_ms).contains(&due),
+            "first update is due one cadence after registration: {due} not in [{}, {}]",
+            before + cadence_ms,
+            after + cadence_ms
+        );
+        f.assert_device_not_registered().await;
+    }
+
+    /// An activity first seen less than a cadence before its window ends is first
+    /// due at the window's end, so its summary is not sent a cadence late.
+    #[tokio::test]
+    async fn late_first_registration_is_first_due_at_window_end() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let mut object = la_object(&f.owner(), &token, "active", now);
+        let window_ends_at = now + 30;
+        object["postedAt"] = serde_json::json!(window_ends_at - 3600);
+        object["windowEndsAt"] = serde_json::json!(window_ends_at);
+        let event = f.event(
+            serde_json::json!({
+                "token": f.fcm,
+                "notificationsAuthorized": true,
+                "liveActivity": object,
+            }),
+            now,
+        );
+        handle_registration(&f.state, &event).await.unwrap();
+
+        assert_eq!(
+            la_job_score(&f.pool, &f.owner(), &token).await,
+            Some(window_ends_at * 1000)
+        );
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn ended_registration_from_other_pubkey_is_ignored() {
+        let victim = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        handle_registration(&victim.state, &victim.la_event(&token, "active", now - 10))
+            .await
+            .unwrap();
+
+        // The attacker knows the activity token and signs an `ended` for its own post.
+        let attacker = Keys::generate();
+        let attacker_event = {
+            let payload = serde_json::json!({
+                "token": victim.fcm,
+                "notificationsAuthorized": true,
+                "liveActivity": la_object(&attacker.public_key().to_hex(), &token, "ended", now),
+            });
+            let encrypted = nostr_sdk::nips::nip44::encrypt(
+                attacker.secret_key(),
+                &victim.service.public_key(),
+                payload.to_string(),
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+                .custom_created_at(Timestamp::from(now))
+                .sign_with_keys(&attacker)
+                .unwrap()
+        };
+        handle_registration(&victim.state, &attacker_event)
+            .await
+            .unwrap();
+
+        let stored = victim.activity(&token).await;
+        assert_eq!(stored.get("state").map(String::as_str), Some("active"));
+        assert!(la_job_score(&victim.pool, &victim.owner(), &token)
+            .await
+            .is_some());
+        assert!(
+            redis_store::get_tokens_for_pubkey(&victim.pool, &attacker.public_key())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the attacker's ended message must not register the token either"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_from_other_pubkey_for_a_live_token_is_refused() {
+        let victim = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        handle_registration(&victim.state, &victim.la_event(&token, "active", now - 10))
+            .await
+            .unwrap();
+
+        // The attacker learned the activity token and signs an `active` for its own post.
+        let attacker = Keys::generate();
+        let attacker_hex = attacker.public_key().to_hex();
+        let attacker_event = {
+            let payload = serde_json::json!({
+                "token": format!("synthetic-la-fcm-{attacker_hex}"),
+                "notificationsAuthorized": true,
+                "liveActivity": la_object(&attacker_hex, &token, "active", now),
+            });
+            let encrypted = nostr_sdk::nips::nip44::encrypt(
+                attacker.secret_key(),
+                &victim.service.public_key(),
+                payload.to_string(),
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_REGISTRATION), encrypted)
+                .custom_created_at(Timestamp::from(now))
+                .sign_with_keys(&attacker)
+                .unwrap()
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            handle_registration(&victim.state, &attacker_event)
+                .await
+                .unwrap();
+        }
+        handle.run_upkeep();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                r#"push_live_activity_registrations_total{outcome="token_owned_elsewhere"} 1"#
+            ),
+            "{rendered}"
+        );
+
+        assert!(la_hash(&victim.pool, &attacker_hex, &token)
+            .await
+            .is_empty());
+        assert_eq!(
+            la_job_score(&victim.pool, &attacker_hex, &token).await,
+            None
+        );
+        let stored = victim.activity(&token).await;
+        assert_eq!(stored.get("state").map(String::as_str), Some("active"));
+        assert_eq!(stored.get("fcm_token"), Some(&victim.fcm));
+        assert!(la_job_score(&victim.pool, &victim.owner(), &token)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn invalid_live_activity_is_dropped_not_registered() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let mut obj = la_object(&f.owner(), &token, "active", now);
+        obj["postEventIds"] = serde_json::json!([]);
+        let event = f.event(
+            serde_json::json!({"token": f.fcm, "notificationsAuthorized": true, "liveActivity": obj}),
+            now,
+        );
+        handle_registration(&f.state, &event).await.unwrap();
+        f.assert_device_not_registered().await;
+        assert!(f.activity(&token).await.is_empty());
+
+        // A notificationsAuthorized flag without any liveActivity object is dropped too.
+        let event = f.event(
+            serde_json::json!({"token": f.fcm, "notificationsAuthorized": false}),
+            now,
+        );
+        handle_registration(&f.state, &event).await.unwrap();
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn replayed_active_after_ended_is_ignored() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let active = f.la_event(&token, "active", now - 20);
+        handle_registration(&f.state, &active).await.unwrap();
+        handle_registration(&f.state, &f.la_event(&token, "ended", now - 10))
+            .await
+            .unwrap();
+        assert_eq!(
+            f.activity(&token).await.get("state").map(String::as_str),
+            Some("ended")
+        );
+
+        // Startup replay delivers the original active again.
+        handle_registration(&f.state, &active).await.unwrap();
+        let stored = f.activity(&token).await;
+        assert_eq!(stored.get("state").map(String::as_str), Some("ended"));
+        assert_eq!(stored.get("fcm_token"), None, "a tombstone holds no token");
+        assert_eq!(la_job_score(&f.pool, &f.owner(), &token).await, None);
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn expired_window_is_ignored() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let mut obj = la_object(&f.owner(), &token, "active", now);
+        obj["postedAt"] = serde_json::json!(now - 4000);
+        obj["windowEndsAt"] = serde_json::json!(now - 400);
+        let event = f.event(
+            serde_json::json!({"token": f.fcm, "notificationsAuthorized": true, "liveActivity": obj}),
+            now,
+        );
+        handle_registration(&f.state, &event).await.unwrap();
+        assert!(f.activity(&token).await.is_empty());
+        assert_eq!(la_job_score(&f.pool, &f.owner(), &token).await, None);
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn out_of_window_event_is_ignored() {
+        let f = LaFixture::new(true).await;
+        let now = Timestamp::now().as_secs();
+        for at in [
+            now - REPLAY_HORIZON_SECS - 10,
+            now + CONTROL_EVENT_FUTURE_SKEW_SECS + 10,
+        ] {
+            let token = random_hex64();
+            handle_registration(&f.state, &f.la_event(&token, "ended", at))
+                .await
+                .unwrap();
+            assert!(
+                f.activity(&token).await.is_empty(),
+                "an event at {at} is outside the accepted window"
+            );
+        }
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn plain_registration_unchanged() {
+        for enabled in [false, true] {
+            let f = LaFixture::new(enabled).await;
+            let now = Timestamp::now().as_secs();
+            handle_registration(&f.state, &f.event(serde_json::json!({"token": f.fcm}), now))
+                .await
+                .unwrap();
+            assert_eq!(
+                redis_store::get_tokens_for_pubkey(&f.pool, &f.user.public_key())
+                    .await
+                    .unwrap(),
+                vec![f.fcm.clone()]
+            );
+            redis_store::remove_token(&f.pool, &f.user.public_key(), &f.fcm)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn null_live_activity_never_registers_token() {
+        for enabled in [false, true] {
+            let f = LaFixture::new(enabled).await;
+            let now = Timestamp::now().as_secs();
+            let event = f.event(
+                serde_json::json!({"token": f.fcm, "liveActivity": null}),
+                now,
+            );
+            handle_registration(&f.state, &event).await.unwrap();
+            f.assert_device_not_registered().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ended_is_processed_while_disabled() {
+        let mut f = LaFixture::new(false).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        handle_registration(&f.state, &f.la_event(&token, "ended", now - 10))
+            .await
+            .unwrap();
+        let stored = f.activity(&token).await;
+        assert_eq!(
+            stored.get("state").map(String::as_str),
+            Some("ended"),
+            "an ended registration is tombstoned even with the flag off"
+        );
+
+        // Re-enabling never resumes the activity the person ended.
+        f.state.settings.live_activity.enabled = true;
+        handle_registration(&f.state, &f.la_event(&token, "active", now - 5))
+            .await
+            .unwrap();
+        assert_eq!(
+            f.activity(&token).await.get("state").map(String::as_str),
+            Some("ended")
+        );
+        assert_eq!(la_job_score(&f.pool, &f.owner(), &token).await, None);
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn coordinate_of_another_author_is_dropped() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let other = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let event = f.event(
+            serde_json::json!({
+                "token": f.fcm,
+                "notificationsAuthorized": true,
+                "liveActivity": la_object(&other, &token, "active", now),
+            }),
+            now,
+        );
+        handle_registration(&f.state, &event).await.unwrap();
+        assert!(f.activity(&token).await.is_empty());
+        assert!(la_hash(&f.pool, &other, &token).await.is_empty());
+        f.assert_device_not_registered().await;
+    }
+
+    #[tokio::test]
+    async fn ended_before_active_from_relay_never_starts() {
+        let f = LaFixture::new(true).await;
+        let token = random_hex64();
+        let now = Timestamp::now().as_secs();
+        let active = f.la_event(&token, "active", now - 20);
+        let ended = f.la_event(&token, "ended", now - 10);
+        handle_registration(&f.state, &ended).await.unwrap();
+        handle_registration(&f.state, &active).await.unwrap();
+        let stored = f.activity(&token).await;
+        assert_eq!(stored.get("state").map(String::as_str), Some("ended"));
+        assert_eq!(la_job_score(&f.pool, &f.owner(), &token).await, None);
+        f.assert_device_not_registered().await;
     }
 
     #[test]

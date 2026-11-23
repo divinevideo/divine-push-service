@@ -27,7 +27,7 @@ pub enum CryptoError {
     InvalidToken(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenPayload {
     #[serde(rename = "timezone", default)]
     pub timezone: Option<String>,
@@ -55,6 +55,21 @@ pub struct TokenPayload {
         deserialize_with = "optional_device_string"
     )]
     pub app_version: Option<String>,
+}
+
+/// Hand-written so the FCM token never reaches logs through `{:?}`.
+impl std::fmt::Debug for TokenPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenPayload")
+            .field("timezone", &self.timezone)
+            .field("token", &"<redacted>")
+            .field("timezone_offset_minutes", &self.timezone_offset_minutes)
+            .field("campaign_target_types", &self.campaign_target_types)
+            .field("platform", &self.platform)
+            .field("install_channel", &self.install_channel)
+            .field("app_version", &self.app_version)
+            .finish()
+    }
 }
 
 // Invalid optional metadata must clear stale eligibility without dropping the token.
@@ -205,18 +220,23 @@ impl CryptoService {
         sender_pubkey: &PublicKey,
     ) -> Result<TokenPayload, CryptoError> {
         let decrypted = self.decrypt_nip44(encrypted_content, sender_pubkey)?;
+        parse_token_payload(&decrypted)
+    }
 
-        // Parse JSON payload
-        let payload: TokenPayload = serde_json::from_str(&decrypted)?;
-
-        // Validate token is not empty
-        if payload.token.is_empty() {
-            return Err(CryptoError::InvalidToken(
-                "Token cannot be empty".to_string(),
-            ));
-        }
-
-        Ok(payload)
+    /// Decrypt a registration and read its Live Activity routing fields.
+    pub(crate) fn decrypt_registration_payload(
+        &self,
+        encrypted_content: &str,
+        sender_pubkey: &PublicKey,
+    ) -> Result<
+        (
+            TokenPayload,
+            crate::live_activity::payload::RegistrationRoute,
+        ),
+        CryptoError,
+    > {
+        let decrypted = self.decrypt_nip44(encrypted_content, sender_pubkey)?;
+        parse_registration_payload(&decrypted)
     }
 
     /// Decrypt and parse filter upsert payload from NIP-44 encrypted content
@@ -281,9 +301,68 @@ impl CryptoService {
     }
 }
 
+fn parse_token_payload(decrypted: &str) -> Result<TokenPayload, CryptoError> {
+    let payload: TokenPayload = serde_json::from_str(decrypted)?;
+    if payload.token.is_empty() {
+        return Err(CryptoError::InvalidToken(
+            "Token cannot be empty".to_string(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn parse_registration_payload(
+    decrypted: &str,
+) -> Result<
+    (
+        TokenPayload,
+        crate::live_activity::payload::RegistrationRoute,
+    ),
+    CryptoError,
+> {
+    Ok((
+        parse_token_payload(decrypted)?,
+        serde_json::from_str(decrypted)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_tokens() {
+        let fcm = "fcmtokenfcmtokenfcmtokenfcmtoken1234567890";
+        let act = "ab".repeat(32);
+        let p: TokenPayload = serde_json::from_value(serde_json::json!({
+            "token": fcm,
+            "notificationsAuthorized": true,
+            "liveActivity": {"activityPushToken": act, "state": "active"}
+        }))
+        .unwrap();
+        let text = format!("{p:?}");
+        assert!(!text.contains(fcm), "{text}");
+        assert!(!text.contains(&act), "{text}");
+    }
+
+    #[test]
+    fn deregistration_ignores_live_activity_metadata() {
+        let p = parse_token_payload(
+            r#"{"token":"synthetic","notificationsAuthorized":"unknown","liveActivity":1e400}"#,
+        )
+        .unwrap();
+        assert_eq!(p.token, "synthetic");
+    }
+
+    #[test]
+    fn registration_ignores_unknown_metadata_without_losing_route() {
+        let (p, route) = parse_registration_payload(
+            r#"{"token":"synthetic","futureExtension":1e400,"liveActivity":null}"#,
+        )
+        .unwrap();
+        assert_eq!(p.token, "synthetic");
+        assert!(route.is_live_activity());
+    }
 
     #[test]
     fn test_is_nip44_encrypted() {

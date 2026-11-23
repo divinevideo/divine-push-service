@@ -17,6 +17,14 @@ pub const THROTTLED_RECIPIENTS_TOTAL: &str = "push_throttled_recipients_total";
 pub const COALESCE_SKIPPED_TOTAL: &str = "push_coalesce_skipped_total";
 pub const COALESCE_DEFERRED_TOTAL: &str = "push_coalesce_deferred_total";
 pub const COALESCE_FLUSH_FAILURES_TOTAL: &str = "push_coalesce_flush_failures_total";
+pub const LIVE_ACTIVITY_REGISTRATIONS_TOTAL: &str = "push_live_activity_registrations_total";
+pub const LIVE_ACTIVITY_SENDS_TOTAL: &str = "push_live_activity_sends_total";
+pub const LIVE_ACTIVITY_STATS_FAILURES_TOTAL: &str = "push_live_activity_stats_failures_total";
+pub const LIVE_ACTIVITY_SKIPPED_TOTAL: &str = "push_live_activity_skipped_total";
+pub const LIVE_ACTIVITY_VIEWS_LOOKUPS_TOTAL: &str = "push_live_activity_views_lookups_total";
+pub const LIVE_ACTIVITY_ACTIVE: &str = "push_live_activity_active";
+pub const LIVE_ACTIVITY_OLDEST_DUE_AGE_SECONDS: &str = "push_live_activity_oldest_due_age_seconds";
+pub const LIVE_ACTIVITY_LAST_TICK_UNIX: &str = "push_live_activity_last_tick_unix";
 pub const LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS: &str =
     "push_last_event_processed_timestamp_seconds";
 
@@ -81,6 +89,38 @@ pub fn init() -> PrometheusHandle {
     metrics::describe_counter!(
         COALESCE_FLUSH_FAILURES_TOTAL,
         "Coalescing flushes that failed before a terminal outcome, counted by bounded reason"
+    );
+    metrics::describe_counter!(
+        LIVE_ACTIVITY_REGISTRATIONS_TOTAL,
+        "Live Activity registrations (kind 3079), counted by bounded outcome"
+    );
+    metrics::describe_counter!(
+        LIVE_ACTIVITY_SENDS_TOTAL,
+        "Live Activity pushes, counted by event (update|end) and result"
+    );
+    metrics::describe_counter!(
+        LIVE_ACTIVITY_STATS_FAILURES_TOTAL,
+        "Failed Funnelcake stats requests made for Live Activities, counted by bounded reason"
+    );
+    metrics::describe_counter!(
+        LIVE_ACTIVITY_SKIPPED_TOTAL,
+        "Live Activity updates skipped, counted by bounded reason"
+    );
+    metrics::describe_counter!(
+        LIVE_ACTIVITY_VIEWS_LOOKUPS_TOTAL,
+        "Funnelcake /views fallback lookups for Live Activities, counted by result"
+    );
+    metrics::describe_gauge!(
+        LIVE_ACTIVITY_ACTIVE,
+        "Active Live Activities, read from the Redis live_activity_jobs ZCARD"
+    );
+    metrics::describe_gauge!(
+        LIVE_ACTIVITY_OLDEST_DUE_AGE_SECONDS,
+        "Age in seconds of the oldest due Live Activity job, sampled on every worker pass"
+    );
+    metrics::describe_gauge!(
+        LIVE_ACTIVITY_LAST_TICK_UNIX,
+        "Unix timestamp of the last finished Live Activity worker pass on this replica"
     );
     metrics::describe_gauge!(
         LAST_EVENT_PROCESSED_TIMESTAMP_SECONDS,
@@ -152,6 +192,38 @@ pub fn coalesce_deferred(reason: &'static str, count: u64) {
 
 pub fn coalesce_flush_failure(reason: &'static str, count: u64) {
     metrics::counter!(COALESCE_FLUSH_FAILURES_TOTAL, "reason" => reason).increment(count);
+}
+
+pub fn live_activity_registration(outcome: &'static str) {
+    metrics::counter!(LIVE_ACTIVITY_REGISTRATIONS_TOTAL, "outcome" => outcome).increment(1);
+}
+
+pub fn live_activity_send(event: &'static str, result: &'static str) {
+    metrics::counter!(LIVE_ACTIVITY_SENDS_TOTAL, "event" => event, "result" => result).increment(1);
+}
+
+pub fn live_activity_stats_failure(reason: &'static str) {
+    metrics::counter!(LIVE_ACTIVITY_STATS_FAILURES_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn live_activity_skipped(reason: &'static str) {
+    metrics::counter!(LIVE_ACTIVITY_SKIPPED_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn live_activity_views_lookup(result: &'static str) {
+    metrics::counter!(LIVE_ACTIVITY_VIEWS_LOOKUPS_TOTAL, "result" => result).increment(1);
+}
+
+pub fn live_activity_active(count: f64) {
+    metrics::gauge!(LIVE_ACTIVITY_ACTIVE).set(count);
+}
+
+pub fn live_activity_oldest_due_age(age_seconds: f64) {
+    metrics::gauge!(LIVE_ACTIVITY_OLDEST_DUE_AGE_SECONDS).set(age_seconds);
+}
+
+pub fn live_activity_last_tick(unix_secs: f64) {
+    metrics::gauge!(LIVE_ACTIVITY_LAST_TICK_UNIX).set(unix_secs);
 }
 
 fn set_last_event_processed_timestamp(timestamp: f64) {
@@ -268,5 +340,35 @@ mod tests {
             rendered.contains("push_last_event_processed_timestamp_seconds"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn live_activity_metrics_render() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            live_activity_registration("created");
+            live_activity_send("update", "ok");
+            live_activity_stats_failure("request");
+            live_activity_skipped("stats_failed");
+            live_activity_views_lookup("budget_spent");
+            live_activity_active(3.0);
+            live_activity_oldest_due_age(7.0);
+            live_activity_last_tick(1_800_000_000.0);
+        });
+        handle.run_upkeep();
+        let rendered = handle.render();
+        for expected in [
+            r#"push_live_activity_registrations_total{outcome="created"} 1"#,
+            r#"push_live_activity_sends_total{event="update",result="ok"} 1"#,
+            r#"push_live_activity_stats_failures_total{reason="request"} 1"#,
+            r#"push_live_activity_skipped_total{reason="stats_failed"} 1"#,
+            r#"push_live_activity_views_lookups_total{result="budget_spent"} 1"#,
+            "push_live_activity_active 3",
+            "push_live_activity_oldest_due_age_seconds 7",
+            "push_live_activity_last_tick_unix 1800000000",
+        ] {
+            assert!(rendered.contains(expected), "{expected}\n{rendered}");
+        }
     }
 }
