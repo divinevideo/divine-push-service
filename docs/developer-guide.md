@@ -172,7 +172,9 @@ mobile upgrade must register again even when its FCM token is unchanged.
 Publish 1059 only after explicit opt-in. If a legacy client later publishes a
 kind list without 1059, alerts stop on every device until an opted-in client
 restores the preference. Signing out removes the device registration; a new
-owner must register their own capability and have their own consent.
+owner must register their own capability and have their own consent. Replaying
+older preferences from a relay preserves the account’s latest signed choice.
+Equal timestamps prefer the lower event ID.
 
 A `204` means the request was processed, not that FCM reached a device. Missing
 tokens, disabled preferences, an existing delivery claim, and terminal FCM

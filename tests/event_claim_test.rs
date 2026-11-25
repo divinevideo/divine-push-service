@@ -78,8 +78,8 @@ fn test_content_events_use_recipient_claims_instead_of_event_claims() {
 }
 
 #[test]
-fn test_control_events_keep_the_event_claim() {
-    for kind in [3079u16, 3080, 3083] {
+fn test_device_controls_keep_the_event_claim() {
+    for kind in [3079u16, 3080] {
         let event = EventBuilder::new(Kind::from(kind), "ciphertext")
             .sign_with_keys(&Keys::generate())
             .unwrap();

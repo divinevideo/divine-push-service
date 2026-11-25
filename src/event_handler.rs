@@ -79,16 +79,14 @@ pub fn is_beyond_replay_horizon(event: &Event) -> bool {
 
 /// Whether the handler loop should claim this event before routing it.
 ///
-/// Control events mutate one event-scoped record and retain the coarse claim.
+/// Device events retain the coarse claim. Preference events order replacements
+/// and persist them atomically, so a failed update must remain retryable.
 /// Content delivery instead claims `(event_id, recipient)` immediately before
 /// FCM, so a failed or interrupted recipient cannot consume every recipient
 /// behind it. Notify lists remain idempotent through their atomic replacement
 /// script, and unrelated event kinds do no work here.
 pub fn requires_event_claim(event: &Event) -> bool {
-    matches!(
-        event.kind.as_u16(),
-        KIND_REGISTRATION | KIND_DEREGISTRATION | KIND_PREFERENCES_UPDATE
-    )
+    matches!(event.kind.as_u16(), KIND_REGISTRATION | KIND_DEREGISTRATION)
 }
 
 /// Check if event is targeted to this service via p tag
@@ -151,9 +149,8 @@ pub async fn run(
                 }
 
                 // Atomically claim the event to prevent duplicate processing across
-                // replicas. Notify lists are exempt: the claim prevents nothing for
-                // them and turns a transient Redis error into days of lost
-                // subscriptions. See `requires_event_claim`.
+                // replicas. Notify lists and account preferences apply their own
+                // atomic replacement, so a storage failure is safe to replay.
                 if requires_event_claim(&event) {
                     let claimed = tokio::select! {
                         biased;
@@ -515,17 +512,26 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
         kinds: payload.kinds,
     };
 
-    // Store preferences
-    let pubkey_hex = event.pubkey.to_hex();
-    preferences::set_user_preferences_with_campaign_consent(
+    // As with other device controls, a far-future timestamp cannot pin the
+    // version forever and prevent the owner from withdrawing consent.
+    if event.created_at.as_secs()
+        > Timestamp::now()
+            .as_secs()
+            .saturating_add(CONTROL_EVENT_FUTURE_SKEW_SECS)
+    {
+        return Ok(());
+    }
+
+    if preferences::apply_preference_event(
         &state.redis_pool,
-        &pubkey_hex,
+        event,
         &prefs,
         payload.campaigns_enabled,
     )
-    .await?;
-
-    info!(event_id = %event.id, pubkey = %event.pubkey, prefs = ?prefs, "Updated user preferences");
+    .await?
+    {
+        info!(event_id = %event.id, pubkey = %event.pubkey, "Updated user preferences");
+    }
 
     Ok(())
 }
@@ -4983,6 +4989,149 @@ mod tests {
         ] {
             assert!(!data.contains_key(omitted), "{omitted} must stay omitted");
         }
+    }
+
+    struct PreferenceIngress {
+        state: Arc<AppState>,
+        owner: Keys,
+        service: Keys,
+    }
+
+    impl PreferenceIngress {
+        async fn new() -> Self {
+            let service = Keys::generate();
+            let mut state = test_app_state(
+                crate::config::Settings::new().unwrap(),
+                test_redis_pool().await.expect("Redis required"),
+                FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+            );
+            state.service_keys = Some(service.clone());
+            state.crypto_service = Some(CryptoService::new(service.clone()));
+            Self {
+                state: Arc::new(state),
+                owner: Keys::generate(),
+                service,
+            }
+        }
+
+        fn preference(&self, at: u64, enabled: bool) -> Event {
+            let payload = serde_json::json!({
+                "kinds": if enabled { vec![7, 1059] } else { vec![7] },
+                "campaignsEnabled": enabled,
+            });
+            let ciphertext = nostr_sdk::nips::nip44::encrypt(
+                self.owner.secret_key(),
+                &self.service.public_key(),
+                payload.to_string(),
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_PREFERENCES_UPDATE), ciphertext)
+                .custom_created_at(Timestamp::from_secs(at))
+                .tag(Tag::public_key(self.service.public_key()))
+                .sign_with_keys(&self.owner)
+                .unwrap()
+        }
+
+        async fn ingest(&self, events: Vec<(Event, EventContext)>) {
+            let (tx, rx) = tokio::sync::mpsc::channel(events.len());
+            for (event, context) in events {
+                tx.send((Box::new(event), context)).await.unwrap();
+            }
+            drop(tx);
+            run(self.state.clone(), rx, CancellationToken::new())
+                .await
+                .unwrap();
+        }
+
+        async fn assert_choice(&self, enabled: bool) {
+            let owner = self.owner.public_key().to_hex();
+            let mut conn = self.state.redis_pool.get().await.unwrap();
+            let raw: Option<String> = redis::cmd("GET")
+                .arg(preferences::build_preferences_key(&owner))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(preferences::explicit_dm_consent(raw.as_deref()), enabled);
+            assert_eq!(
+                preferences::campaign_consent_enabled(&self.state.redis_pool, &owner)
+                    .await
+                    .unwrap(),
+                enabled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preference_ingress_preserves_the_newest_opt_out_and_breaks_timestamp_ties() {
+        use EventContext::{Historical, Live};
+        let fixture = PreferenceIngress::new().await;
+        let now = Timestamp::now().as_secs();
+        fixture
+            .ingest(vec![(
+                fixture.preference(now + CONTROL_EVENT_FUTURE_SKEW_SECS + 3_600, true),
+                Live,
+            )])
+            .await;
+        fixture.assert_choice(false).await;
+        fixture
+            .ingest(vec![
+                (fixture.preference(now - 1, false), Live),
+                (fixture.preference(now - 2, true), Historical),
+            ])
+            .await;
+        fixture.assert_choice(false).await;
+
+        let allow = fixture.preference(now, true);
+        let deny = fixture.preference(now, false);
+        let allow_wins = allow.id < deny.id;
+        let (winner, loser) = if allow_wins {
+            (allow, deny)
+        } else {
+            (deny, allow)
+        };
+        fixture
+            .ingest(vec![(loser.clone(), Live), (winner.clone(), Historical)])
+            .await;
+        fixture.assert_choice(allow_wins).await;
+        fixture
+            .ingest(vec![(winner, Historical), (loser, Historical)])
+            .await;
+        fixture.assert_choice(allow_wins).await;
+    }
+
+    #[tokio::test]
+    async fn preference_ingress_retries_the_same_id_after_a_storage_failure() {
+        use EventContext::{Historical, Live};
+        let fixture = PreferenceIngress::new().await;
+        let pool = &fixture.state.redis_pool;
+        let owner = fixture.owner.public_key().to_hex();
+        let preference = fixture.preference(Timestamp::now().as_secs(), true);
+        let version = format!("user_preference_version:{owner}");
+        let mut conn = pool.get().await.unwrap();
+        // Wrong-type version state makes the atomic Redis write fail before it can commit.
+        let _: () = redis::cmd("LPUSH")
+            .arg(&version)
+            .arg("invalid")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        fixture.ingest(vec![(preference.clone(), Live)]).await;
+        fixture.assert_choice(false).await;
+        let _: () = redis::cmd("DEL")
+            .arg(version)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        // Previous releases could have left this marker before their preference write failed.
+        let _: () = redis::cmd("SET")
+            .arg(format!("dedup:{}", preference.id.to_hex()))
+            .arg("1")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        fixture.ingest(vec![(preference, Historical)]).await;
+        fixture.assert_choice(true).await;
     }
 
     #[tokio::test]
