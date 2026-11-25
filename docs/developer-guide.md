@@ -158,12 +158,21 @@ This initial contract covers automated moderation notices and report outcomes.
 Manual moderator replies and automated community warnings remain outside the
 classified hook until their message classes are added to both services.
 
-Do not configure callers until Divine Mobile can publish kind 1059 in its
-notification preferences, has bumped its published-kinds schema version, and
-routes `directMessage` notification taps to the message inbox. Older clients
-replace the server's stored kind list without 1059, which leaves direct-message
-pushes disabled for that user. The mobile schema bump marks existing preferences
-dirty and republishes the expanded list during rollout.
+Both message types require explicit account opt-in and a capable device.
+The recipient's stored kind-3083 preference list must include kind `1059`. Each receiving
+device must advertise the boolean `"directMessageRouting": true` in its
+encrypted kind-3079 registration alongside `token`. The service checks both
+before claiming delivery and again before reserving a notification slot.
+Absent or unreadable preferences suppress delivery, including when the server
+defaults contain 1059. A device that omits the capability stays silent even when
+another device for the same account can receive the alert.
+
+Deploy the service gate before releasing the mobile DM setting. A capable
+mobile upgrade must register again even when its FCM token is unchanged.
+Publish 1059 only after explicit opt-in. If a legacy client later publishes a
+kind list without 1059, alerts stop on every device until an opted-in client
+restores the preference. Signing out removes the device registration; a new
+owner must register their own capability and have their own consent.
 
 A `204` means the request was processed, not that FCM reached a device. Missing
 tokens, disabled preferences, an existing delivery claim, and terminal FCM

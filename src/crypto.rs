@@ -32,6 +32,13 @@ pub struct TokenPayload {
     #[serde(rename = "timezone", default)]
     pub timezone: Option<String>,
     pub token: String,
+    /// A native install that can route a direct-message push to Messages.
+    #[serde(
+        rename = "directMessageRouting",
+        default,
+        deserialize_with = "optional_device_bool"
+    )]
+    pub direct_message_routing: Option<bool>,
     #[serde(rename = "timezoneOffsetMinutes", default)]
     pub timezone_offset_minutes: Option<i32>,
     /// Optional device support, independent of the account's campaign consent.
@@ -63,6 +70,7 @@ impl std::fmt::Debug for TokenPayload {
         f.debug_struct("TokenPayload")
             .field("timezone", &self.timezone)
             .field("token", &"<redacted>")
+            .field("direct_message_routing", &self.direct_message_routing)
             .field("timezone_offset_minutes", &self.timezone_offset_minutes)
             .field("campaign_target_types", &self.campaign_target_types)
             .field("platform", &self.platform)
@@ -73,6 +81,12 @@ impl std::fmt::Debug for TokenPayload {
 }
 
 // Invalid optional metadata must clear stale eligibility without dropping the token.
+fn optional_device_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool())
+}
+
 fn optional_device_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {

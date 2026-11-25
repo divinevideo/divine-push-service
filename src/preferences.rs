@@ -128,6 +128,13 @@ fn build_campaign_consent_key(pubkey: &str) -> String {
     format!("{}{}", CAMPAIGN_CONSENT_KEY_PREFIX, pubkey)
 }
 
+/// Only an account's stored kind list can grant consent for a DM alert.
+pub(crate) fn explicit_dm_consent(stored: Option<&str>) -> bool {
+    stored
+        .and_then(|value| serde_json::from_str::<UserPreferences>(value).ok())
+        .is_some_and(|prefs| NotificationType::DirectMessage.is_enabled(&prefs))
+}
+
 /// Returns true only for an explicit campaign opt-in.
 pub async fn campaign_consent_enabled(pool: &RedisPool, pubkey: &str) -> Result<bool> {
     use redis::AsyncCommands;
