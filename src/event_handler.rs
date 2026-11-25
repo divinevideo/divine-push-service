@@ -5304,6 +5304,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dm_preflight_rechecks_consent_after_the_claim_before_charging_budget() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let owner = user.public_key();
+        let device = format!("synthetic-dm-gate-{}", owner.to_hex());
+        register_dm_test_device(&pool, &user, &device, Some(awake_test_offset()))
+            .await
+            .unwrap();
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let event = test_event_id(10594);
+        let copy = LazyEventCopy::for_targets(&[]);
+        // Hold payload resolution at the await between acquiring the claim and
+        // rechecking budget eligibility. No timing-based gap is needed.
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        let preparing = copy.cell.get_or_init(|| async {
+            wait.await.unwrap();
+            EventScopedCopy {
+                sender_name: String::new(),
+                formatted_content: None,
+            }
+        });
+        tokio::pin!(preparing);
+        assert!(futures::poll!(preparing.as_mut()).is_pending());
+        let deliver = send_notification_trigger_to_user(
+            &state,
+            DeliveryTrigger::DirectMessage(event),
+            &owner,
+            NotificationType::DirectMessage,
+            &copy,
+            CancellationToken::new(),
+        );
+        let revoke = async {
+            let mut conn = pool.get().await.unwrap();
+            let claim = format!("dedup:{event}:{}", owner.to_hex());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !redis::cmd("EXISTS")
+                    .arg(&claim)
+                    .query_async::<bool>(&mut *conn)
+                    .await
+                    .unwrap()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("delivery reached its claim");
+            preferences::set_user_preferences(
+                &pool,
+                &owner.to_hex(),
+                &UserPreferences { kinds: vec![7] },
+            )
+            .await
+            .unwrap();
+            resume.send(()).unwrap();
+        };
+        let (delivered, (), _) = tokio::join!(deliver, revoke, preparing);
+        delivered.unwrap();
+        assert!(mock.get_sent_messages().is_empty());
+        let mut conn = pool.get().await.unwrap();
+        let reservations: u64 = redis::cmd("ZCARD")
+            .arg(format!("delivery_dm_budget:{}", owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_reregistration_and_removal_clear_capability_even_for_a_stale_device_list() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let owner = user.public_key();
+        let token = format!("synthetic-dm-cleanup-{}", owner.to_hex());
+        for remove in [false, true] {
+            register_dm_test_device(&pool, &user, &token, Some(awake_test_offset()))
+                .await
+                .unwrap();
+            let selected = redis_store::direct_message_tokens(&pool, &owner, vec![token.clone()])
+                .await
+                .unwrap();
+            assert_eq!(selected.as_slice(), std::slice::from_ref(&token));
+            if remove {
+                assert!(redis_store::remove_token(&pool, &owner, &token)
+                    .await
+                    .unwrap());
+            } else {
+                add_awake_test_token(&pool, &owner, &token).await.unwrap();
+            }
+            assert!(redis_store::direct_message_tokens(&pool, &owner, selected)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn direct_message_delivery_uses_preferences_and_recipient_dedup() {
         let Some(pool) = test_redis_pool().await else {
             return;
