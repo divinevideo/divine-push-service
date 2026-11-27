@@ -128,6 +128,13 @@ fn build_campaign_consent_key(pubkey: &str) -> String {
     format!("{}{}", CAMPAIGN_CONSENT_KEY_PREFIX, pubkey)
 }
 
+/// Only an account's stored kind list can grant consent for a DM alert.
+pub(crate) fn explicit_dm_consent(stored: Option<&str>) -> bool {
+    stored
+        .and_then(|value| serde_json::from_str::<UserPreferences>(value).ok())
+        .is_some_and(|prefs| NotificationType::DirectMessage.is_enabled(&prefs))
+}
+
 /// Returns true only for an explicit campaign opt-in.
 pub async fn campaign_consent_enabled(pool: &RedisPool, pubkey: &str) -> Result<bool> {
     use redis::AsyncCommands;
@@ -141,6 +148,51 @@ pub async fn campaign_consent_enabled(pool: &RedisPool, pubkey: &str) -> Result<
         .await
         .map_err(ServiceError::Redis)?;
     Ok(value.unwrap_or(false))
+}
+
+/// Apply one signed preference snapshot. The event order and both kinds of
+/// consent advance in one write, across both live and bootstrap consumers.
+pub(crate) async fn apply_preference_event(
+    pool: &RedisPool,
+    event: &nostr_sdk::Event,
+    prefs: &UserPreferences,
+    campaigns_enabled: bool,
+) -> Result<bool> {
+    // The first 20 characters sort as an unsigned timestamp without Lua's
+    // f64 rounding. Among events at the same second the lower event id wins.
+    static REPLACE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+        redis::Script::new(
+            r#"
+            local old = redis.call('GET', KEYS[1])
+            if old then
+                local old_at = old:sub(1, 20)
+                if old_at > ARGV[1] or (old_at == ARGV[1] and old:sub(21) <= ARGV[2]) then
+                    return 0
+                end
+            end
+            redis.call('MSET', KEYS[1], ARGV[1] .. ARGV[2], KEYS[2], ARGV[3], KEYS[3], ARGV[4])
+            return 1
+        "#,
+        )
+    });
+    let owner = event.pubkey.to_hex();
+    let json = serde_json::to_string(prefs)
+        .map_err(|e| ServiceError::Internal(format!("Failed to serialize preferences: {e}")))?;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    REPLACE
+        .key(format!("user_preference_version:{owner}"))
+        .key(build_preferences_key(&owner))
+        .key(build_campaign_consent_key(&owner))
+        .arg(format!("{:020}", event.created_at.as_secs()))
+        .arg(event.id.to_hex())
+        .arg(json)
+        .arg(campaigns_enabled)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)
 }
 
 /// Stores notification kinds and campaign consent as one atomic preference update.

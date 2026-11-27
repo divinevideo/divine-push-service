@@ -792,16 +792,22 @@ mod tests {
             activity_pool: None,
             direct_message_delivery: delivery.clone(),
         };
-        let response = router(state)
-            .oneshot(direct_message_request(
-                Some("test-token"),
-                r#"{"eventId":"1111111111111111111111111111111111111111111111111111111111111111","recipientPubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","messageType":"moderation_notice"}"#,
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(delivery.calls.load(Ordering::Relaxed), 1);
+        for message_type in ["moderation_notice", "report_outcome"] {
+            let request = serde_json::json!({
+                "eventId": "1".repeat(64),
+                "recipientPubkey": nostr_sdk::Keys::generate().public_key().to_hex(),
+                "messageType": message_type
+            });
+            let response = router(state.clone())
+                .oneshot(direct_message_request(
+                    Some("test-token"),
+                    &request.to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        assert_eq!(delivery.calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

@@ -27,6 +27,9 @@ const TOKEN_TO_PUBKEY_HASH: &str = "token_to_pubkey";
 const TOKEN_TIMEZONE_NAMES_HASH: &str = "token_timezone_names";
 const TOKEN_TIMEZONE_OFFSETS_HASH: &str = "token_timezone_offsets";
 const TOKEN_CAMPAIGN_TARGET_TYPES_HASH: &str = "token_campaign_target_types";
+// Store the capable registration's owner as the capability value so a
+// device moving accounts during preflight cannot be selected for its old owner.
+const TOKEN_DM_ROUTING_OWNERS_HASH: &str = "token_dm_routing_owners";
 const TOKEN_RELEASE_METADATA_HASH: &str = "token_release_metadata";
 const NEW_POST_FANOUT_JOBS_ZSET: &str = "new_post_fanout_jobs";
 const USER_TOKENS_PREFIX: &str = "user_tokens:";
@@ -163,6 +166,40 @@ pub async fn all_registered_pubkeys(pool: &RedisPool) -> Result<Vec<String>> {
     }
 
     Ok(pubkeys.into_iter().collect())
+}
+
+/// Filter awake devices against the current account choice and the owner
+/// of each device's routing capability in the same Redis snapshot.
+pub(crate) async fn direct_message_tokens(
+    pool: &RedisPool,
+    recipient: &PublicKey,
+    awake: Vec<String>,
+) -> Result<Vec<String>> {
+    if awake.is_empty() {
+        return Ok(awake);
+    }
+    let owner = recipient.to_hex();
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to get Redis connection: {e}")))?;
+    let (prefs, routing_owners): (Option<String>, Vec<Option<String>>) = redis::pipe()
+        .atomic()
+        .get(crate::preferences::build_preferences_key(&owner))
+        .cmd("HMGET")
+        .arg(TOKEN_DM_ROUTING_OWNERS_HASH)
+        .arg(&awake)
+        .query_async(&mut *conn)
+        .await
+        .map_err(ServiceError::Redis)?;
+    if !crate::preferences::explicit_dm_consent(prefs.as_deref()) {
+        return Ok(Vec::new());
+    }
+    Ok(awake
+        .into_iter()
+        .zip(routing_owners)
+        .filter_map(|(token, bound)| (bound.as_ref() == Some(&owner)).then_some(token))
+        .collect())
 }
 
 /// Following campaigns are supported by legacy devices. Other destinations
@@ -316,7 +353,8 @@ pub async fn add_or_update_token_with_timezone_name(
         }
     }
 
-    pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
+    pipe.hdel(TOKEN_DM_ROUTING_OWNERS_HASH, token)
+        .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
         .hdel(TOKEN_RELEASE_METADATA_HASH, token);
 
     let _result = pipe
@@ -339,6 +377,7 @@ pub(crate) async fn apply_device_registration(
     release: Option<&crate::release_eligibility::DeviceReleaseMetadata>,
 ) -> Result<DeviceControlOutcome> {
     let metadata = serde_json::json!({
+        "dm_routing_owner": (payload.direct_message_routing == Some(true)).then(|| event.pubkey.to_hex()),
         "offset": payload.timezone_offset_minutes.filter(|offset| (-720..=840).contains(offset)),
         "timezone": payload.timezone.as_deref().filter(|name| name.parse::<chrono_tz::Tz>().is_ok()),
         "targets": payload.campaign_target_types.as_ref().map(serde_json::to_string).transpose()
@@ -405,13 +444,13 @@ static DEVICE_CONTROL: LazyLock<Script> = LazyLock::new(|| {
         end
         redis.call('HDEL', KEYS[2], token)
         redis.call('ZREM', KEYS[3], token)
-        for i = 4, 7 do redis.call('HDEL', KEYS[i], token) end
+        for i = 4, #KEYS do redis.call('HDEL', KEYS[i], token) end
         if incoming.metadata ~= cjson.null then
             local metadata = incoming.metadata
             redis.call('SADD', ARGV[3] .. incoming.owner, token)
             redis.call('HSET', KEYS[2], token, incoming.owner)
             redis.call('ZADD', KEYS[3], incoming.now, token)
-            local fields = {'offset', 'timezone', 'targets', 'release'}
+            local fields = {'offset', 'timezone', 'targets', 'release', 'dm_routing_owner'}
             for i, field in ipairs(fields) do
                 if metadata[field] ~= cjson.null then
                     redis.call('HSET', KEYS[i + 3], token, metadata[field])
@@ -458,6 +497,7 @@ async fn apply_ordered_device_control(
         .key(TOKEN_TIMEZONE_NAMES_HASH)
         .key(TOKEN_CAMPAIGN_TARGET_TYPES_HASH)
         .key(TOKEN_RELEASE_METADATA_HASH)
+        .key(TOKEN_DM_ROUTING_OWNERS_HASH)
         .arg(incoming.to_string())
         .arg(token)
         .arg(USER_TOKENS_PREFIX)
@@ -506,7 +546,8 @@ pub async fn remove_token(pool: &RedisPool, pubkey: &PublicKey, token: &str) -> 
                 .hdel(TOKEN_TIMEZONE_OFFSETS_HASH, token)
                 .hdel(TOKEN_TIMEZONE_NAMES_HASH, token)
                 .hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, token)
-                .hdel(TOKEN_RELEASE_METADATA_HASH, token);
+                .hdel(TOKEN_RELEASE_METADATA_HASH, token)
+                .hdel(TOKEN_DM_ROUTING_OWNERS_HASH, token);
 
             let _result: RedisResult<Value> = pipe.query_async(&mut *conn).await;
             _result.map(|_| ()).map_err(ServiceError::Redis)?;
@@ -757,6 +798,7 @@ pub async fn cleanup_stale_tokens(pool: &RedisPool, max_age_seconds: i64) -> Res
     pipe.hdel(TOKEN_TIMEZONE_NAMES_HASH, &stale_tokens);
     pipe.hdel(TOKEN_CAMPAIGN_TARGET_TYPES_HASH, &stale_tokens);
     pipe.hdel(TOKEN_RELEASE_METADATA_HASH, &stale_tokens);
+    pipe.hdel(TOKEN_DM_ROUTING_OWNERS_HASH, &stale_tokens);
 
     // 3c. Remove tokens from individual user sets
     let mut actual_removed_count = 0;

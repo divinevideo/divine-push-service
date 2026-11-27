@@ -79,16 +79,14 @@ pub fn is_beyond_replay_horizon(event: &Event) -> bool {
 
 /// Whether the handler loop should claim this event before routing it.
 ///
-/// Control events mutate one event-scoped record and retain the coarse claim.
+/// Device events retain the coarse claim. Preference events order replacements
+/// and persist them atomically, so a failed update must remain retryable.
 /// Content delivery instead claims `(event_id, recipient)` immediately before
 /// FCM, so a failed or interrupted recipient cannot consume every recipient
 /// behind it. Notify lists remain idempotent through their atomic replacement
 /// script, and unrelated event kinds do no work here.
 pub fn requires_event_claim(event: &Event) -> bool {
-    matches!(
-        event.kind.as_u16(),
-        KIND_REGISTRATION | KIND_DEREGISTRATION | KIND_PREFERENCES_UPDATE
-    )
+    matches!(event.kind.as_u16(), KIND_REGISTRATION | KIND_DEREGISTRATION)
 }
 
 /// Check if event is targeted to this service via p tag
@@ -151,9 +149,8 @@ pub async fn run(
                 }
 
                 // Atomically claim the event to prevent duplicate processing across
-                // replicas. Notify lists are exempt: the claim prevents nothing for
-                // them and turns a transient Redis error into days of lost
-                // subscriptions. See `requires_event_claim`.
+                // replicas. Notify lists and account preferences apply their own
+                // atomic replacement, so a storage failure is safe to replay.
                 if requires_event_claim(&event) {
                     let claimed = tokio::select! {
                         biased;
@@ -515,17 +512,26 @@ async fn handle_preferences_update(state: &AppState, event: &Event) -> Result<()
         kinds: payload.kinds,
     };
 
-    // Store preferences
-    let pubkey_hex = event.pubkey.to_hex();
-    preferences::set_user_preferences_with_campaign_consent(
+    // As with other device controls, a far-future timestamp cannot pin the
+    // version forever and prevent the owner from withdrawing consent.
+    if event.created_at.as_secs()
+        > Timestamp::now()
+            .as_secs()
+            .saturating_add(CONTROL_EVENT_FUTURE_SKEW_SECS)
+    {
+        return Ok(());
+    }
+
+    if preferences::apply_preference_event(
         &state.redis_pool,
-        &pubkey_hex,
+        event,
         &prefs,
         payload.campaigns_enabled,
     )
-    .await?;
-
-    info!(event_id = %event.id, pubkey = %event.pubkey, prefs = ?prefs, "Updated user preferences");
+    .await?
+    {
+        info!(event_id = %event.id, pubkey = %event.pubkey, "Updated user preferences");
+    }
 
     Ok(())
 }
@@ -1745,6 +1751,24 @@ pub async fn send_direct_message_notification(
     .await
 }
 
+async fn delivery_tokens(
+    state: &AppState,
+    recipient: &PublicKey,
+    notification_type: NotificationType,
+) -> Result<Vec<String>> {
+    let awake = crate::notification_delivery::social_tokens(
+        &state.redis_pool,
+        recipient,
+        &state.settings.service.delivery,
+    )
+    .await?;
+    if notification_type == NotificationType::DirectMessage {
+        redis_store::direct_message_tokens(&state.redis_pool, recipient, awake).await
+    } else {
+        Ok(awake)
+    }
+}
+
 async fn send_notification_trigger_to_user(
     state: &AppState,
     trigger: DeliveryTrigger<'_>,
@@ -1812,9 +1836,7 @@ async fn send_notification_trigger_to_user(
             info!(event_id = %event_id, target_pubkey = %target_pubkey, "Cancelled while fetching tokens.");
             return Err(crate::error::ServiceError::Cancelled);
         }
-        res = crate::notification_delivery::social_tokens(
-            &state.redis_pool, target_pubkey, &state.settings.service.delivery,
-        ) => {
+        res = delivery_tokens(state, target_pubkey, notification_type) => {
             res?
         }
     };
@@ -1828,16 +1850,23 @@ async fn send_notification_trigger_to_user(
         return Ok(());
     }
 
-    // Check user preferences
-    let prefs = preferences::get_user_preferences(
-        &state.redis_pool,
-        &pubkey_hex,
-        &state.settings.notification.default_preferences,
-    )
-    .await?;
+    // A DM's explicit account preference was read alongside its device
+    // capabilities. Other notification types retain configurable defaults.
+    let prefs = if notification_type == NotificationType::DirectMessage {
+        None
+    } else {
+        Some(
+            preferences::get_user_preferences(
+                &state.redis_pool,
+                &pubkey_hex,
+                &state.settings.notification.default_preferences,
+            )
+            .await?,
+        )
+    };
 
     let mut delivery_type = notification_type;
-    if !delivery_type.is_enabled(&prefs) {
+    if let Some(prefs) = prefs.filter(|prefs| !delivery_type.is_enabled(prefs)) {
         let can_fall_back_to_bell = if trigger.kind().as_u16() == KIND_VIDEO
             && delivery_type == NotificationType::Mention
             && NotificationType::NewPost.is_enabled(&prefs)
@@ -2074,12 +2103,7 @@ async fn send_notification_trigger_to_user(
         crate::notification_delivery::DeliveryClass::Nonurgent
     };
     let preflight = async {
-        let awake = crate::notification_delivery::social_tokens(
-            &state.redis_pool,
-            target_pubkey,
-            &state.settings.service.delivery,
-        )
-        .await?;
+        let awake = delivery_tokens(state, target_pubkey, delivery_type).await?;
         let eligible: Vec<String> = tokens
             .into_iter()
             .filter(|token| awake.contains(token))
@@ -2731,13 +2755,17 @@ mod tests {
         }
     }
 
+    fn awake_test_offset() -> i32 {
+        let hour = (chrono::Utc::now().timestamp().rem_euclid(86400) / 3600) as i32;
+        ((12 - hour + 12).rem_euclid(24) - 12) * 60
+    }
+
     async fn add_awake_test_token(
         pool: &redis_store::RedisPool,
         recipient: &PublicKey,
         token: &str,
     ) -> Result<()> {
-        let hour = (chrono::Utc::now().timestamp().rem_euclid(86400) / 3600) as i32;
-        let offset = ((12 - hour + 12).rem_euclid(24) - 12) * 60;
+        let offset = awake_test_offset();
         redis_store::add_or_update_token_with_timezone(pool, recipient, token, Some(offset)).await
     }
 
@@ -4963,15 +4991,429 @@ mod tests {
         }
     }
 
+    struct PreferenceIngress {
+        state: Arc<AppState>,
+        owner: Keys,
+        service: Keys,
+    }
+
+    impl PreferenceIngress {
+        async fn new() -> Self {
+            let service = Keys::generate();
+            let mut state = test_app_state(
+                crate::config::Settings::new().unwrap(),
+                test_redis_pool().await.expect("Redis required"),
+                FcmClient::new_with_impl(Box::new(MockFcmSender::new())),
+            );
+            state.service_keys = Some(service.clone());
+            state.crypto_service = Some(CryptoService::new(service.clone()));
+            Self {
+                state: Arc::new(state),
+                owner: Keys::generate(),
+                service,
+            }
+        }
+
+        fn preference(&self, at: u64, enabled: bool) -> Event {
+            let payload = serde_json::json!({
+                "kinds": if enabled { vec![7, 1059] } else { vec![7] },
+                "campaignsEnabled": enabled,
+            });
+            let ciphertext = nostr_sdk::nips::nip44::encrypt(
+                self.owner.secret_key(),
+                &self.service.public_key(),
+                payload.to_string(),
+                nostr_sdk::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::from(KIND_PREFERENCES_UPDATE), ciphertext)
+                .custom_created_at(Timestamp::from_secs(at))
+                .tag(Tag::public_key(self.service.public_key()))
+                .sign_with_keys(&self.owner)
+                .unwrap()
+        }
+
+        async fn ingest(&self, events: Vec<(Event, EventContext)>) {
+            let (tx, rx) = tokio::sync::mpsc::channel(events.len());
+            for (event, context) in events {
+                tx.send((Box::new(event), context)).await.unwrap();
+            }
+            drop(tx);
+            run(self.state.clone(), rx, CancellationToken::new())
+                .await
+                .unwrap();
+        }
+
+        async fn assert_choice(&self, enabled: bool) {
+            let owner = self.owner.public_key().to_hex();
+            let mut conn = self.state.redis_pool.get().await.unwrap();
+            let raw: Option<String> = redis::cmd("GET")
+                .arg(preferences::build_preferences_key(&owner))
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(preferences::explicit_dm_consent(raw.as_deref()), enabled);
+            assert_eq!(
+                preferences::campaign_consent_enabled(&self.state.redis_pool, &owner)
+                    .await
+                    .unwrap(),
+                enabled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preference_ingress_preserves_the_newest_opt_out_and_breaks_timestamp_ties() {
+        use EventContext::{Historical, Live};
+        let fixture = PreferenceIngress::new().await;
+        let now = Timestamp::now().as_secs();
+        fixture
+            .ingest(vec![(
+                fixture.preference(now + CONTROL_EVENT_FUTURE_SKEW_SECS + 3_600, true),
+                Live,
+            )])
+            .await;
+        fixture.assert_choice(false).await;
+        fixture
+            .ingest(vec![
+                (fixture.preference(now - 1, false), Live),
+                (fixture.preference(now - 2, true), Historical),
+            ])
+            .await;
+        fixture.assert_choice(false).await;
+
+        let allow = fixture.preference(now, true);
+        let deny = fixture.preference(now, false);
+        let allow_wins = allow.id < deny.id;
+        let (winner, loser) = if allow_wins {
+            (allow, deny)
+        } else {
+            (deny, allow)
+        };
+        fixture
+            .ingest(vec![(loser.clone(), Live), (winner.clone(), Historical)])
+            .await;
+        fixture.assert_choice(allow_wins).await;
+        fixture
+            .ingest(vec![(winner, Historical), (loser, Historical)])
+            .await;
+        fixture.assert_choice(allow_wins).await;
+    }
+
+    #[tokio::test]
+    async fn preference_ingress_retries_the_same_id_after_a_storage_failure() {
+        use EventContext::{Historical, Live};
+        let fixture = PreferenceIngress::new().await;
+        let pool = &fixture.state.redis_pool;
+        let owner = fixture.owner.public_key().to_hex();
+        let preference = fixture.preference(Timestamp::now().as_secs(), true);
+        let version = format!("user_preference_version:{owner}");
+        let mut conn = pool.get().await.unwrap();
+        // Wrong-type version state makes the atomic Redis write fail before it can commit.
+        let _: () = redis::cmd("LPUSH")
+            .arg(&version)
+            .arg("invalid")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        fixture.ingest(vec![(preference.clone(), Live)]).await;
+        fixture.assert_choice(false).await;
+        let _: () = redis::cmd("DEL")
+            .arg(version)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        // Previous releases could have left this marker before their preference write failed.
+        let _: () = redis::cmd("SET")
+            .arg(format!("dedup:{}", preference.id.to_hex()))
+            .arg("1")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        fixture.ingest(vec![(preference, Historical)]).await;
+        fixture.assert_choice(true).await;
+    }
+
+    #[tokio::test]
+    async fn direct_message_requires_current_account_consent_and_capable_registration() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let other = Keys::generate();
+        let service = Keys::generate();
+        let owner = user.public_key();
+        let first = format!("dm-one-{}", owner.to_hex());
+        let second = format!("dm-two-{}", owner.to_hex());
+        let mock = MockFcmSender::new();
+        let mut state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        state.crypto_service = Some(CryptoService::new(service.clone()));
+        let offset = awake_test_offset();
+        let register = async |keys: &Keys, device: &str, advertised: serde_json::Value| {
+            let mut payload = serde_json::json!({"token": device, "timezoneOffsetMinutes": offset});
+            if !advertised.is_null() {
+                payload["directMessageRouting"] = advertised;
+            }
+            let event = encrypted_registration_event(keys, &service, payload);
+            handle_registration(&state, &event).await.unwrap();
+            event
+        };
+        let send = async |id: u64, recipient: &PublicKey| {
+            send_direct_message_notification(
+                &state,
+                test_event_id(id),
+                recipient,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        };
+        let choose = async |recipient: &PublicKey, kinds: Vec<u16>| {
+            preferences::set_user_preferences(
+                &pool,
+                &recipient.to_hex(),
+                &UserPreferences { kinds },
+            )
+            .await
+            .unwrap();
+        };
+
+        let initial = register(&user, &first, true.into()).await;
+        register(&user, &second, serde_json::Value::Null).await;
+        let event = 10451;
+        send(event, &owner).await;
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "server defaults cannot opt an account in"
+        );
+
+        let mut override_settings = crate::config::Settings::new().unwrap();
+        override_settings.notification.default_preferences.kinds = vec![1059];
+        let override_state = test_app_state(
+            override_settings,
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        send_direct_message_notification(
+            &override_state,
+            test_event_id(event),
+            &owner,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "configured defaults cannot grant consent"
+        );
+
+        let mut conn = pool.get().await.unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(preferences::build_preferences_key(&owner.to_hex()))
+            .arg("malformed")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        send(event, &owner).await;
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "corrupt preferences cannot grant consent"
+        );
+
+        choose(&owner, vec![1059]).await;
+        let stale = register(&user, &first, false.into()).await;
+        send(event, &owner).await;
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "no current capable device"
+        );
+        handle_registration(&state, &initial).await.unwrap();
+        send(event, &owner).await;
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "stale registration cannot regain capability"
+        );
+        let claim: bool = redis::cmd("EXISTS")
+            .arg(format!("dedup:{}:{}", test_event_id(event), owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            !claim,
+            "ineligible attempts must not consume the delivery claim"
+        );
+
+        let reservations: u64 = redis::cmd("ZCARD")
+            .arg(format!("delivery_dm_budget:{}", owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            reservations, 0,
+            "ineligible attempts must not spend the DM budget"
+        );
+
+        register(&user, &first, true.into()).await;
+        handle_registration(&state, &stale).await.unwrap();
+        send(event, &owner).await;
+        let messages = mock.get_sent_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, first, "the older device must stay silent");
+        mock.clear();
+
+        choose(&owner, vec![7]).await;
+        send(event + 1, &owner).await;
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "a legacy preference overwrite revokes consent"
+        );
+
+        register(&other, &first, serde_json::Value::String("true".into())).await;
+        choose(&other.public_key(), vec![1059]).await;
+        send(event + 2, &other.public_key()).await;
+        choose(&owner, vec![1059]).await;
+        send(event + 3, &owner).await;
+        assert!(
+            mock.get_sent_messages().is_empty(),
+            "a new owner cannot inherit capability"
+        );
+    }
+
+    async fn register_dm_test_device(
+        pool: &redis_store::RedisPool,
+        user: &Keys,
+        token: &str,
+        timezone_offset_minutes: Option<i32>,
+    ) -> Result<()> {
+        let registration = EventBuilder::new(Kind::from(KIND_REGISTRATION), "")
+            .custom_created_at(next_device_control_timestamp())
+            .sign_with_keys(user)
+            .unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "token": token, "timezoneOffsetMinutes": timezone_offset_minutes, "directMessageRouting": true
+        })).unwrap();
+        redis_store::apply_device_registration(pool, &registration, &payload, None).await?;
+        preferences::set_user_preferences(
+            pool,
+            &user.public_key().to_hex(),
+            &UserPreferences { kinds: vec![1059] },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn dm_preflight_rechecks_consent_after_the_claim_before_charging_budget() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let owner = user.public_key();
+        let device = format!("synthetic-dm-gate-{}", owner.to_hex());
+        register_dm_test_device(&pool, &user, &device, Some(awake_test_offset()))
+            .await
+            .unwrap();
+        let mock = MockFcmSender::new();
+        let state = test_app_state(
+            crate::config::Settings::new().unwrap(),
+            pool.clone(),
+            FcmClient::new_with_impl(Box::new(mock.clone())),
+        );
+        let event = test_event_id(10594);
+        let copy = LazyEventCopy::for_targets(&[]);
+        // Hold payload resolution at the await between acquiring the claim and
+        // rechecking budget eligibility. No timing-based gap is needed.
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        let preparing = copy.cell.get_or_init(|| async {
+            wait.await.unwrap();
+            EventScopedCopy {
+                sender_name: String::new(),
+                formatted_content: None,
+            }
+        });
+        tokio::pin!(preparing);
+        assert!(futures::poll!(preparing.as_mut()).is_pending());
+        let deliver = send_notification_trigger_to_user(
+            &state,
+            DeliveryTrigger::DirectMessage(event),
+            &owner,
+            NotificationType::DirectMessage,
+            &copy,
+            CancellationToken::new(),
+        );
+        let revoke = async {
+            let mut conn = pool.get().await.unwrap();
+            let claim = format!("dedup:{event}:{}", owner.to_hex());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !redis::cmd("EXISTS")
+                    .arg(&claim)
+                    .query_async::<bool>(&mut *conn)
+                    .await
+                    .unwrap()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("delivery reached its claim");
+            preferences::set_user_preferences(
+                &pool,
+                &owner.to_hex(),
+                &UserPreferences { kinds: vec![7] },
+            )
+            .await
+            .unwrap();
+            resume.send(()).unwrap();
+        };
+        let (delivered, (), _) = tokio::join!(deliver, revoke, preparing);
+        delivered.unwrap();
+        assert!(mock.get_sent_messages().is_empty());
+        let mut conn = pool.get().await.unwrap();
+        let reservations: u64 = redis::cmd("ZCARD")
+            .arg(format!("delivery_dm_budget:{}", owner.to_hex()))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_reregistration_and_removal_clear_capability_even_for_a_stale_device_list() {
+        let pool = test_redis_pool().await.expect("Redis required");
+        let user = Keys::generate();
+        let owner = user.public_key();
+        let token = format!("synthetic-dm-cleanup-{}", owner.to_hex());
+        for remove in [false, true] {
+            register_dm_test_device(&pool, &user, &token, Some(awake_test_offset()))
+                .await
+                .unwrap();
+            let selected = redis_store::direct_message_tokens(&pool, &owner, vec![token.clone()])
+                .await
+                .unwrap();
+            assert_eq!(selected.as_slice(), std::slice::from_ref(&token));
+            if remove {
+                assert!(redis_store::remove_token(&pool, &owner, &token)
+                    .await
+                    .unwrap());
+            } else {
+                add_awake_test_token(&pool, &owner, &token).await.unwrap();
+            }
+            assert!(redis_store::direct_message_tokens(&pool, &owner, selected)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn direct_message_delivery_uses_preferences_and_recipient_dedup() {
         let Some(pool) = test_redis_pool().await else {
             return;
         };
-        let recipient = Keys::generate().public_key();
+        let user = Keys::generate();
+        let recipient = user.public_key();
         let event_id = test_event_id(10_591);
         let fcm_token = format!("direct-message-{}", recipient.to_hex());
-        add_awake_test_token(&pool, &recipient, &fcm_token)
+        register_dm_test_device(&pool, &user, &fcm_token, Some(awake_test_offset()))
             .await
             .unwrap();
 
@@ -5024,11 +5466,13 @@ mod tests {
     #[tokio::test]
     async fn direct_messages_bypass_a_spent_absence_allowance_and_recent_nonurgent_send() {
         let pool = test_redis_pool().await.expect("Redis required");
-        let recipient = Keys::generate().public_key();
-        add_awake_test_token(
+        let user = Keys::generate();
+        let recipient = user.public_key();
+        register_dm_test_device(
             &pool,
-            &recipient,
+            &user,
             &format!("synthetic-dm-exempt-{}", recipient.to_hex()),
+            Some(awake_test_offset()),
         )
         .await
         .unwrap();
@@ -5105,11 +5549,13 @@ mod tests {
     #[tokio::test]
     async fn direct_messages_do_not_delay_or_spend_the_next_nonurgent_push() {
         let pool = test_redis_pool().await.expect("Redis required");
-        let recipient = Keys::generate().public_key();
-        add_awake_test_token(
+        let user = Keys::generate();
+        let recipient = user.public_key();
+        register_dm_test_device(
             &pool,
-            &recipient,
+            &user,
             &format!("synthetic-dm-gap-{}", recipient.to_hex()),
+            Some(awake_test_offset()),
         )
         .await
         .unwrap();
@@ -5152,27 +5598,23 @@ mod tests {
     async fn direct_messages_still_respect_active_quiet_and_unknown_timezone_devices() {
         let pool = test_redis_pool().await.expect("Redis required");
         for reason in ["active", "quiet", "unknown"] {
-            let recipient = Keys::generate().public_key();
+            let user = Keys::generate();
+            let recipient = user.public_key();
             let token = format!("synthetic-dm-{reason}-{}", recipient.to_hex());
             let session_id = uuid::Uuid::new_v4();
             match reason {
-                "unknown" => redis_store::add_or_update_token(&pool, &recipient, &token)
+                "unknown" => register_dm_test_device(&pool, &user, &token, None)
                     .await
                     .unwrap(),
                 "quiet" => {
                     let hour = (chrono::Utc::now().timestamp().rem_euclid(86400) / 3600) as i32;
                     let offset = ((23 - hour + 12).rem_euclid(24) - 12) * 60;
-                    redis_store::add_or_update_token_with_timezone(
-                        &pool,
-                        &recipient,
-                        &token,
-                        Some(offset),
-                    )
-                    .await
-                    .unwrap();
+                    register_dm_test_device(&pool, &user, &token, Some(offset))
+                        .await
+                        .unwrap();
                 }
                 _ => {
-                    add_awake_test_token(&pool, &recipient, &token)
+                    register_dm_test_device(&pool, &user, &token, Some(awake_test_offset()))
                         .await
                         .unwrap();
                     crate::activity::record_activity(
@@ -5222,7 +5664,7 @@ mod tests {
                 .await
                 .unwrap();
             } else {
-                add_awake_test_token(&pool, &recipient, &token)
+                register_dm_test_device(&pool, &user, &token, Some(awake_test_offset()))
                     .await
                     .unwrap();
             }
@@ -5247,10 +5689,11 @@ mod tests {
         let Some(pool) = test_redis_pool().await else {
             return;
         };
-        let recipient = Keys::generate().public_key();
+        let user = Keys::generate();
+        let recipient = user.public_key();
         let event_id = test_event_id(10_592);
         let fcm_token = format!("direct-message-disabled-{}", recipient.to_hex());
-        add_awake_test_token(&pool, &recipient, &fcm_token)
+        register_dm_test_device(&pool, &user, &fcm_token, Some(awake_test_offset()))
             .await
             .unwrap();
         preferences::set_user_preferences(
@@ -5285,7 +5728,15 @@ mod tests {
         let Some(pool) = test_redis_pool().await else {
             return;
         };
-        let recipient = Keys::generate().public_key();
+        let user = Keys::generate();
+        let recipient = user.public_key();
+        preferences::set_user_preferences(
+            &pool,
+            &recipient.to_hex(),
+            &UserPreferences { kinds: vec![1059] },
+        )
+        .await
+        .unwrap();
         let mock_sender = MockFcmSender::new();
         let state = test_app_state(
             crate::config::Settings::new().unwrap(),
@@ -5310,10 +5761,11 @@ mod tests {
         let Some(pool) = test_redis_pool().await else {
             return;
         };
-        let recipient = Keys::generate().public_key();
+        let user = Keys::generate();
+        let recipient = user.public_key();
         let event_id = test_event_id(10_593);
         let fcm_token = format!("direct-message-retry-{}", recipient.to_hex());
-        add_awake_test_token(&pool, &recipient, &fcm_token)
+        register_dm_test_device(&pool, &user, &fcm_token, Some(awake_test_offset()))
             .await
             .unwrap();
 
